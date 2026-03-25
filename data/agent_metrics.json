@@ -1,0 +1,621 @@
+[
+  {
+    "timestamp": "2026-03-25T15:21:04",
+    "repo_name": "crest-be",
+    "ticket_id": "MANUAL-8bc23532",
+    "status": "escalated",
+    "verdict": "CHANGES_REQUESTED",
+    "confidence": 0.82,
+    "iterations": 3,
+    "patches": 1,
+    "localization_confidence": 0.82,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 3 iterations. Last review: This patch has several concrete issues that need to be addressed before approval:\n\n1. **Incomplete fix**: The explanation states patches are needed for `date",
+    "rejection_reasons": [
+      "localization_error",
+      "pattern_violation",
+      "localization_error"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T17:25:00",
+    "repo_name": "crest-be",
+    "ticket_id": "CREST-999",
+    "status": "escalated",
+    "verdict": "ESCALATE",
+    "confidence": 0.0,
+    "iterations": 1,
+    "patches": 0,
+    "localization_confidence": 0.95,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 1 iterations. Last review: Repair produced no patches: The fix adds `return_exceptions=True` to the `asyncio.gather()` call in `get_family_members_for_user`, then iterates over the res",
+    "rejection_reasons": [
+      "localization_error"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T17:39:39",
+    "repo_name": "crest-be",
+    "ticket_id": "CREST-999",
+    "status": "escalated",
+    "verdict": "CHANGES_REQUESTED",
+    "confidence": 0.9,
+    "iterations": 3,
+    "patches": 2,
+    "localization_confidence": 0.95,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 3 iterations. Last review: The proposed patches are **incomplete** and would not compile/run as-is. Specific issues:\n\n1. **Missing core fix in family_service.py**: The patch only shows",
+    "rejection_reasons": [
+      "localization_error"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T17:51:05",
+    "repo_name": "crest-be",
+    "ticket_id": "CREST-999",
+    "status": "escalated",
+    "verdict": "ESCALATE",
+    "confidence": 0.0,
+    "iterations": 1,
+    "patches": 0,
+    "localization_confidence": 0.97,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 1 iterations. Last review: Repair produced no patches: The fix adds `return_exceptions=True` to the `asyncio.gather()` call inside `get_family_members_for_user` in `family_service.py`.",
+    "rejection_reasons": [
+      "localization_error"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T17:53:49",
+    "repo_name": "crest-be",
+    "ticket_id": "CREST-999",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.92,
+    "iterations": 1,
+    "patches": 1,
+    "localization_confidence": 0.98,
+    "test_result": "failed: no patches could be applied",
+    "pr_url": "branch://fix/crest-999-3aebc8",
+    "error": "No patches could be applied to the source code.",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:04:52",
+    "repo_name": "crest-be",
+    "ticket_id": "CREST-999",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.93,
+    "iterations": 1,
+    "patches": 1,
+    "localization_confidence": 0.97,
+    "test_result": "failed: syntax errors in patched files\napp/service/family_service.py: Traceback (most recent call la",
+    "pr_url": "branch://fix/crest-999-ee9b76",
+    "error": "Patches introduced syntax errors: app/service/family_service.py: Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import ast; ast.parse(open('/tmp/agent_sandbox_CREST-999_",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:10:21",
+    "repo_name": "crest-be",
+    "ticket_id": "CREST-999",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.92,
+    "iterations": 2,
+    "patches": 2,
+    "localization_confidence": 0.97,
+    "test_result": "failed (exit code 1)\n/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest",
+    "pr_url": "branch://fix/crest-999-cc59a3 (PR creation failed: To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n)",
+    "error": "",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:16:50",
+    "repo_name": "",
+    "ticket_id": "MANUAL-18edc968",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.05,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:16:50",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-6323b160",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.0,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:16:51",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-2fdcf6e5",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.05,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:16:52",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-8124ed58",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.0,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:16:52",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-2225072a",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.0,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:16:52",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-0b64d44d",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.05,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:17:39",
+    "repo_name": "crest-be",
+    "ticket_id": "MANUAL-9d49b9e1",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.88,
+    "iterations": 1,
+    "patches": 1,
+    "localization_confidence": 0.72,
+    "test_result": "failed (exit code 1)\n/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest",
+    "pr_url": "branch://fix/manual-9d49b9e1-a47c64 (PR creation failed: To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n)",
+    "error": "",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:17:52",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-8d262cbb",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.92,
+    "iterations": 1,
+    "patches": 5,
+    "localization_confidence": 0.52,
+    "test_result": "skipped: no repo path",
+    "pr_url": "",
+    "error": "No sandbox available for PR creation.",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:17:54",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-7a4ed5d7",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.75,
+    "iterations": 1,
+    "patches": 3,
+    "localization_confidence": 0.42,
+    "test_result": "skipped: no repo path",
+    "pr_url": "",
+    "error": "No sandbox available for PR creation.",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:17:57",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-da10c363",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.82,
+    "iterations": 1,
+    "patches": 5,
+    "localization_confidence": 0.62,
+    "test_result": "skipped: no repo path",
+    "pr_url": "",
+    "error": "No sandbox available for PR creation.",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:18:08",
+    "repo_name": "crest-be",
+    "ticket_id": "MANUAL-3ac45876",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.72,
+    "iterations": 1,
+    "patches": 4,
+    "localization_confidence": 0.62,
+    "test_result": "failed (exit code 1)\n/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest",
+    "pr_url": "branch://fix/manual-3ac45876-f94241 (PR creation failed: To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n)",
+    "error": "",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:18:11",
+    "repo_name": "crest-be",
+    "ticket_id": "MANUAL-44df0681",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.78,
+    "iterations": 1,
+    "patches": 4,
+    "localization_confidence": 0.62,
+    "test_result": "failed (exit code 1)\n/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest",
+    "pr_url": "branch://fix/manual-44df0681-4b54d0 (PR creation failed: To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n)",
+    "error": "",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:18:17",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-2c5206a3",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.93,
+    "iterations": 2,
+    "patches": 3,
+    "localization_confidence": 0.72,
+    "test_result": "skipped: no repo path",
+    "pr_url": "",
+    "error": "No sandbox available for PR creation.",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:18:19",
+    "repo_name": "crest-be",
+    "ticket_id": "MANUAL-399bc869",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.91,
+    "iterations": 1,
+    "patches": 5,
+    "localization_confidence": 0.62,
+    "test_result": "failed (exit code 1)\n/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest",
+    "pr_url": "branch://fix/manual-399bc869-5741b6 (PR creation failed: To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n)",
+    "error": "",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:18:27",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-2113f901",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.7,
+    "iterations": 2,
+    "patches": 3,
+    "localization_confidence": 0.62,
+    "test_result": "skipped: no repo path",
+    "pr_url": "",
+    "error": "No sandbox available for PR creation.",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:18:28",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-13dc7626",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.72,
+    "iterations": 2,
+    "patches": 5,
+    "localization_confidence": 0.55,
+    "test_result": "skipped: no repo path",
+    "pr_url": "",
+    "error": "No sandbox available for PR creation.",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:18:37",
+    "repo_name": "crest-be",
+    "ticket_id": "MANUAL-393e330b",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.78,
+    "iterations": 2,
+    "patches": 3,
+    "localization_confidence": 0.91,
+    "test_result": "failed (exit code 1)\n/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest",
+    "pr_url": "branch://fix/manual-393e330b-a88b30 (PR creation failed: To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n)",
+    "error": "",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:19:17",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-afe37a3d",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.72,
+    "iterations": 3,
+    "patches": 3,
+    "localization_confidence": 0.35,
+    "test_result": "skipped: no repo path",
+    "pr_url": "",
+    "error": "No sandbox available for PR creation.",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:19:38",
+    "repo_name": "crest-be",
+    "ticket_id": "PROJ-999",
+    "status": "done",
+    "verdict": "APPROVE",
+    "confidence": 0.78,
+    "iterations": 1,
+    "patches": 10,
+    "localization_confidence": 0.78,
+    "test_result": "failed (exit code 1)\n/opt/homebrew/opt/python@3.14/bin/python3.14: No module named pytest",
+    "pr_url": "branch://fix/proj-999-ee0416 (PR creation failed: To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n)",
+    "error": "",
+    "rejection_reasons": []
+  },
+  {
+    "timestamp": "2026-03-25T18:20:17",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-e346e4f4",
+    "status": "escalated",
+    "verdict": "CHANGES_REQUESTED",
+    "confidence": 0.78,
+    "iterations": 3,
+    "patches": 5,
+    "localization_confidence": 0.52,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 3 iterations. Last review: Two concrete issues need to be addressed before this can be approved:\n\n1. **stdlib shadowing \u2014 `threading.py` filename**: The project has a local file named ",
+    "rejection_reasons": [
+      "pattern_violation",
+      "localization_error"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:20:22",
+    "repo_name": "crest-be",
+    "ticket_id": "MANUAL-b0dfbfb6",
+    "status": "escalated",
+    "verdict": "CHANGES_REQUESTED",
+    "confidence": 0.92,
+    "iterations": 3,
+    "patches": 2,
+    "localization_confidence": 0.62,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 3 iterations. Last review: The patch set is critically incomplete. The fix explanation explicitly states 4 patches are needed, but only 2 of the 4 are provided:\n\n**Missing patch 1: `re",
+    "rejection_reasons": [
+      "localization_error",
+      "localization_error"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:22:29",
+    "repo_name": "crest-be",
+    "ticket_id": "MANUAL-273ae9df",
+    "status": "escalated",
+    "verdict": "CHANGES_REQUESTED",
+    "confidence": 0.82,
+    "iterations": 3,
+    "patches": 3,
+    "localization_confidence": 0.93,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 3 iterations. Last review: The patch has two concrete issues that need to be resolved:\n\n1. **Dead code: `serialize_user()` is defined but never called.** The function is added in `user",
+    "rejection_reasons": [
+      "localization_error"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:23:01",
+    "repo_name": "crest-be",
+    "ticket_id": "MANUAL-7a2c33f3",
+    "status": "escalated",
+    "verdict": "CHANGES_REQUESTED",
+    "confidence": 0.88,
+    "iterations": 3,
+    "patches": 4,
+    "localization_confidence": 0.32,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 3 iterations. Last review: This patch has fundamental problems:\n\n1. **The bug doesn't exist in the current codebase.** The fix explanation openly acknowledges: \"there is NO existing `r",
+    "rejection_reasons": [
+      "localization_error",
+      "localization_error"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:26:19",
+    "repo_name": "",
+    "ticket_id": "MANUAL-d5293650",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.05,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:26:20",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-7c23f1a5",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.0,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:26:20",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-6e70905d",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.0,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:26:22",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-b54244fd",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.0,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:26:22",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-c693c192",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.0,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:26:23",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-03d199ee",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.05,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:26:24",
+    "repo_name": "t",
+    "ticket_id": "MANUAL-f5d3b293",
+    "status": "escalated",
+    "verdict": "",
+    "confidence": 0,
+    "iterations": 0,
+    "patches": 0,
+    "localization_confidence": 0.05,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 0 iterations. Last review: no feedback",
+    "rejection_reasons": [
+      "unknown"
+    ]
+  },
+  {
+    "timestamp": "2026-03-25T18:26:31",
+    "repo_name": "test",
+    "ticket_id": "MANUAL-443edc3d",
+    "status": "escalated",
+    "verdict": "ESCALATE",
+    "confidence": 0.0,
+    "iterations": 1,
+    "patches": 0,
+    "localization_confidence": 0.62,
+    "test_result": "",
+    "pr_url": "",
+    "error": "Escalated after 1 iterations. Last review: Repair produced no patches: Since no source code was provided in the context, I need to request the relevant files to produce accurate patches. The bug spans",
+    "rejection_reasons": [
+      "localization_error"
+    ]
+  }
+]

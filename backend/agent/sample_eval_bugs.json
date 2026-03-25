@@ -1,0 +1,23 @@
+[
+  {
+    "ticket_id": "EVAL-001",
+    "title": "NullPointerException in user profile endpoint",
+    "description": "When a user with no avatar set visits /api/profile, the server returns a 500 error. Expected behavior: return a default avatar URL instead of crashing.",
+    "expected_files": ["api/profile.py", "models/user.py"],
+    "expected_root_cause": "missing null check avatar field default value"
+  },
+  {
+    "ticket_id": "EVAL-002",
+    "title": "Discount calculation off by one cent on orders over $100",
+    "description": "Customers report that a 10% discount on a $100.00 order yields $89.99 instead of $90.00. The rounding logic in the pricing module truncates instead of rounding half-up.",
+    "expected_files": ["services/pricing.py", "utils/currency.py"],
+    "expected_root_cause": "rounding truncation float precision discount calculation"
+  },
+  {
+    "ticket_id": "EVAL-003",
+    "title": "Email notifications not sent after password reset",
+    "description": "After a successful password reset via /auth/reset, the confirmation email is never delivered. Logs show the email task is enqueued but the template lookup fails silently.",
+    "expected_files": ["auth/reset.py", "notifications/email.py", "templates/email_templates.py"],
+    "expected_root_cause": "template lookup silent failure email notification password reset"
+  }
+]

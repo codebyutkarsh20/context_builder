@@ -1,0 +1,27 @@
+[
+  {
+    "id": "async-consistency",
+    "pattern": "\\brequests\\.(get|post|put|delete)\\b",
+    "file_pattern": "\\.py$",
+    "context_pattern": "async\\s+def",
+    "message": "This codebase uses async/await (FastAPI). Don't use synchronous requests inside async functions.",
+    "severity": "error",
+    "fix_hint": "Use `httpx.AsyncClient` or `aiohttp.ClientSession` instead of `requests`."
+  },
+  {
+    "id": "no-raw-sql",
+    "pattern": "(?:execute|text)\\s*\\(\\s*[\"\\'](?:SELECT|INSERT|UPDATE|DELETE)",
+    "file_pattern": "\\.py$",
+    "message": "Raw SQL detected. This codebase uses SQLAlchemy ORM. Use model queries instead.",
+    "severity": "warning",
+    "fix_hint": "Replace raw SQL with SQLAlchemy model.query() or session.execute(select(Model))."
+  },
+  {
+    "id": "redis-key-prefix",
+    "pattern": "\\.set\\(\\s*[\"\\'][a-z]",
+    "file_pattern": "\\.py$",
+    "message": "Redis key without namespace prefix. Use 'app:module:key' format to avoid collisions.",
+    "severity": "warning",
+    "fix_hint": "Prefix Redis keys with the module name: f'{MODULE_PREFIX}:{key}'."
+  }
+]

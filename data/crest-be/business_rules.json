@@ -1,0 +1,50 @@
+[
+  {
+    "id": "rule_3ad0f21c",
+    "description": "This status check in app/api/api_v1/endpoints/families.py::create_family controls a business workflow. The AI needs to understand the rules governing when this transition is valid. \u2014 The 32-byte key length is required by AES-256 encryption standard. This is a security requirement.",
+    "rule_type": "legal",
+    "severity": "critical",
+    "source": "utkarsh",
+    "function_id": "app/api/api_v1/endpoints/families.py::create_family",
+    "file": "app/api/api_v1/endpoints/families.py",
+    "constraint": "exc.status_code == status.HTTP_409_CONFLICT",
+    "created_at": "2026-03-25T15:04:40",
+    "question_id": "app/api/api_v1/endpoints/families.py::create_family::L37"
+  },
+  {
+    "id": "rule_12ba90d4",
+    "description": "This condition in app/api/api_v1/endpoints/test.py::_get_field_encryption_key uses a numeric threshold or constant. The AI agent needs to know whether changing this value could violate a contract or regulation. \u2014 SEBI regulation requires 30-day cooling period for systematic withdrawal. This is a legal compliance requirement that cannot be overridden.",
+    "rule_type": "legal",
+    "severity": "critical",
+    "source": "audit_test",
+    "function_id": "app/api/api_v1/endpoints/test.py::_get_field_encryption_key",
+    "file": "app/api/api_v1/endpoints/test.py",
+    "constraint": "len(key_bytes) != 32",
+    "created_at": "2026-03-25T16:40:30",
+    "question_id": "app/api/api_v1/endpoints/test.py::_get_field_encryption_key::L60"
+  },
+  {
+    "id": "rule_3e9cefa7",
+    "description": "This condition in app/api/api_v1/endpoints/test.py::_filter_simultaneous_buy_sell uses a numeric threshold or constant. The AI agent needs to know whether changing this value could violate a contract or regulation. \u2014 Negative holdings should be displayed as 0 to avoid confusing users. This is a product decision, not a calculation error.",
+    "rule_type": "policy",
+    "severity": "high",
+    "source": "audit_test",
+    "function_id": "app/api/api_v1/endpoints/test.py::_filter_simultaneous_buy_sell",
+    "file": "app/api/api_v1/endpoints/test.py",
+    "constraint": "len(buys) > 0 and len(sells) > 0 and len(buys) == len(sells)",
+    "created_at": "2026-03-25T16:40:31",
+    "question_id": "app/api/api_v1/endpoints/test.py::_filter_simultaneous_buy_sell::L770"
+  },
+  {
+    "id": "rule_94ad0acb",
+    "description": "This status check in app/api/api_v1/endpoints/reports.py::download_report controls a business workflow. The AI needs to understand the rules governing when this transition is valid. \u2014 Sort by absolute value descending so the largest positions appear first. This matches user expectations from the mobile app.",
+    "rule_type": "architectural",
+    "severity": "medium",
+    "source": "audit_test",
+    "function_id": "app/api/api_v1/endpoints/reports.py::download_report",
+    "file": "app/api/api_v1/endpoints/reports.py",
+    "constraint": "report.status != \"completed\" or not report.file_path",
+    "created_at": "2026-03-25T16:40:31",
+    "question_id": "app/api/api_v1/endpoints/reports.py::download_report::L90"
+  }
+]

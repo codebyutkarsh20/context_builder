@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Environment — never commit secrets
+.env
+.env.local
+.env.*.local
+
+# Node
+node_modules/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Local context output
+/tmp/context_builder/
+
+# Docker volumes
+neo4j_data/
