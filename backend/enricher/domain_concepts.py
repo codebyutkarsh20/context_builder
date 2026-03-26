@@ -81,14 +81,19 @@ def extract_domain_concepts(parsed_files: list[dict]) -> list[dict]:
     # Collect all class names and their files
     class_info: list[dict] = []
     for pf in parsed_files:
-        rel = pf["path"]
+        rel = pf.get("path")
+        if not rel:
+            continue
         for cls in pf.get("classes", []):
+            cls_name = cls.get("name")
+            if not cls_name:
+                continue
             class_info.append({
-                "name": cls["name"],
+                "name": cls_name,
                 "file": rel,
                 "docstring": cls.get("docstring", ""),
                 "bases": cls.get("bases", []),
-                "methods": [m["name"] for m in cls.get("methods", [])],
+                "methods": [m.get("name") for m in cls.get("methods", []) if m.get("name")],
             })
 
     # Extract concept candidates from class names
@@ -128,7 +133,10 @@ def extract_domain_concepts(parsed_files: list[dict]) -> list[dict]:
     # Also extract from module/directory names
     module_concepts: Counter = Counter()
     for pf in parsed_files:
-        parts = PurePosixPath(pf["path"]).parts
+        path = pf.get("path")
+        if not path:
+            continue
+        parts = PurePosixPath(path).parts
         for part in parts:
             name = part.replace(".py", "").replace("_", " ").title().replace(" ", "")
             if name.lower() not in _NOISE_WORDS and len(name) >= 3:

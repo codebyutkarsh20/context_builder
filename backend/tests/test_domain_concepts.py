@@ -199,3 +199,144 @@ class TestExtractDomainConcepts:
         user = next((c for c in concepts if c["name"] == "User"), None)
         if user:
             assert user["description"] is None
+
+
+"""Tests for extract_domain_concepts robustness against malformed input."""
+import sys
+import os
+
+# Ensure the backend package root is on sys.path so the import works whether
+# pytest is invoked from the repo root or from inside backend/.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_BACKEND_ROOT = os.path.dirname(_HERE)  # …/backend
+_REPO_ROOT = os.path.dirname(_BACKEND_ROOT)  # one level above backend
+for _p in (_BACKEND_ROOT, _REPO_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+try:
+    from enricher.domain_concepts import extract_domain_concepts
+except ModuleNotFoundError:
+    from backend.enricher.domain_concepts import extract_domain_concepts
+
+
+# ---------------------------------------------------------------------------
+# Helper builders
+# ---------------------------------------------------------------------------
+
+def _valid_pf(path: str, class_names=()):
+    """Build a well-formed parsed-file dict."""
+    return {
+        "path": path,
+        "classes": [{"name": n, "methods": [], "bases": []} for n in class_names],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tests: missing 'path' key
+# ---------------------------------------------------------------------------
+
+def test_missing_path_key_does_not_raise():
+    """A parsed-file record with no 'path' key must not raise KeyError."""
+    parsed_files = [{"classes": [{"name": "OrderService"}]}]  # no 'path'
+    # Should complete without raising
+    result = extract_domain_concepts(parsed_files)
+    assert isinstance(result, list)
+
+
+def test_missing_path_key_record_is_skipped():
+    """The malformed record (no 'path') is skipped; valid records are processed."""
+    parsed_files = [
+        {"classes": [{"name": "OrderService"}]},  # malformed — no 'path'
+        _valid_pf("app/invoice_service.py", ["InvoiceService", "InvoiceRepository"]),
+        _valid_pf("app/invoice_model.py", ["InvoiceModel"]),
+    ]
+    result = extract_domain_concepts(parsed_files)
+    # The 'Invoice' concept comes from the valid records and should be present
+    names = {c["name"] for c in result}
+    assert "Invoice" in names, f"Expected 'Invoice' in {names}"
+
+
+# ---------------------------------------------------------------------------
+# Tests: missing 'name' key on a class record
+# ---------------------------------------------------------------------------
+
+def test_missing_class_name_does_not_raise():
+    """A class record with no 'name' key must not raise KeyError."""
+    parsed_files = [
+        {
+            "path": "app/foo.py",
+            "classes": [
+                {"docstring": "no name here"},  # malformed class — no 'name'
+            ],
+        }
+    ]
+    result = extract_domain_concepts(parsed_files)
+    assert isinstance(result, list)
+
+
+def test_missing_class_name_record_is_skipped():
+    """The malformed class (no 'name') is skipped; sibling classes are processed."""
+    parsed_files = [
+        {
+            "path": "app/payment_service.py",
+            "classes": [
+                {"docstring": "broken"},  # no 'name'
+                {"name": "PaymentService"},
+                {"name": "PaymentRepository"},
+            ],
+        },
+        _valid_pf("app/payment_model.py", ["PaymentModel"]),
+    ]
+    result = extract_domain_concepts(parsed_files)
+    names = {c["name"] for c in result}
+    assert "Payment" in names, f"Expected 'Payment' in {names}"
+
+
+# ---------------------------------------------------------------------------
+# Tests: mixed malformed + valid records — valid ones still processed
+# ---------------------------------------------------------------------------
+
+def test_mixed_malformed_and_valid_records():
+    """Valid records are processed successfully even when malformed records are present."""
+    parsed_files = [
+        # malformed: missing 'path'
+        {"classes": [{"name": "GhostClass"}]},
+        # malformed: class missing 'name'
+        {"path": "app/broken.py", "classes": [{"docstring": "oops"}]},
+        # valid
+        _valid_pf("app/user_service.py", ["UserService", "UserRepository"]),
+        _valid_pf("app/user_model.py", ["UserModel"]),
+    ]
+    result = extract_domain_concepts(parsed_files)
+    assert isinstance(result, list)
+    names = {c["name"] for c in result}
+    assert "User" in names, f"Expected 'User' in {names}"
+
+
+def test_all_malformed_returns_empty_list():
+    """When every record is malformed the function returns an empty list without crashing."""
+    parsed_files = [
+        {"classes": [{"name": "X"}]},        # no 'path'
+        {"path": "a.py", "classes": [{}]},   # class has no 'name'
+        {},                                   # completely empty
+    ]
+    result = extract_domain_concepts(parsed_files)
+    assert result == []
+
+
+def test_completely_valid_input_still_works():
+    """Regression: normal valid input continues to produce correct output."""
+    parsed_files = [
+        _valid_pf("app/order_service.py", ["OrderService", "OrderRepository"]),
+        _valid_pf("app/order_model.py", ["OrderModel"]),
+    ]
+    result = extract_domain_concepts(parsed_files)
+    names = {c["name"] for c in result}
+    assert "Order" in names, f"Expected 'Order' in {names}"
+    for concept in result:
+        assert "id" in concept
+        assert "name" in concept
+        assert "type" in concept
+        assert "related_classes" in concept
+        assert "related_files" in concept
