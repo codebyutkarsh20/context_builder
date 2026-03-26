@@ -1815,11 +1815,14 @@ def test_node(state: AgentState) -> AgentState:
         ).stdout.strip()
         state["base_branch"] = base_branch
 
-        # Check for dirty repo
-        dirty = subprocess.run(
+        # Check for dirty repo — ignore untracked files (??) which don't affect worktree
+        porcelain = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=repo_path, capture_output=True, text=True, check=True, timeout=30,
-        ).stdout.strip()
+        ).stdout
+        dirty = "\n".join(
+            l for l in porcelain.splitlines() if l and not l.startswith("??")
+        ).strip()
         if dirty:
             logger.error("Repo has uncommitted changes — cannot create sandbox")
             state["test_result"] = "skipped: repo has uncommitted changes"
