@@ -133,6 +133,7 @@ class GraphRAGRetriever:
 
         results: list[ScoredNode] = []
         for node_id, node in enriched.items():
+            # Safely handle None values for name, docstring, and file fields
             name = (node.get("name") or "").lower()
             doc = (node.get("docstring") or "").lower()
             file_path = (node.get("file") or "").lower()
@@ -163,7 +164,7 @@ class GraphRAGRetriever:
                     id=node_id,
                     score=score,
                     source="keyword",
-                    metadata={"type": node.get("type", ""), "name": node.get("name", "")},
+                    metadata={"type": node.get("type", ""), "name": node.get("name") or ""},
                 ))
 
         results.sort(key=lambda x: x.score, reverse=True)
