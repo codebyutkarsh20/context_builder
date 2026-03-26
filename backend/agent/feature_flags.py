@@ -102,12 +102,12 @@ def toggle_flag(repo_name: str, flag_name: str, enabled: bool) -> dict[str, Any]
     return None
 
 
-def get_flag(repo_name: str, flag_name: str) -> dict[str, Any] | None:
-    """Get details for a single feature flag."""
-    for f in _load_flags(repo_name):
-        if f["name"] == flag_name:
-            return f
-    return None
+for flag in flags:
+    if flag["name"] == flag_name:
+        flag["pr_url"] = pr_url
+        _write_flags(repo_name, flags)
+        return
+logger.warning("Flag %s not found for repo %s", flag_name, repo_name)
 
 
 def set_pr_url(repo_name: str, flag_name: str, pr_url: str) -> None:
