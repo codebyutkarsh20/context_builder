@@ -318,24 +318,39 @@ def _fuzzy_match_replace(content: str, original: str, patched: str) -> str | Non
 
 
 def _run_tests(worktree_path: Path) -> str:
-    """Auto-detect test runner and execute tests."""
-    if (worktree_path / "pytest.ini").exists() or \
-       (worktree_path / "pyproject.toml").exists() or \
-       (worktree_path / "setup.py").exists() or \
-       (worktree_path / "setup.cfg").exists():
-        cmd = [sys.executable, "-m", "pytest", "--tb=short", "-q"]
-    elif (worktree_path / "package.json").exists():
-        cmd = ["npm", "test"]
-    elif (worktree_path / "Makefile").exists():
-        cmd = ["make", "test"]
-    else:
+    """Auto-detect test runner and execute tests.
+
+    Searches both the worktree root and one level of subdirectories so that
+    projects with a backend/ or src/ layout (where pytest.ini lives in a subdir)
+    are found correctly.
+    """
+    pytest_markers = ("pytest.ini", "pyproject.toml", "setup.py", "setup.cfg")
+
+    # Check root first, then immediate subdirs (e.g. backend/, src/)
+    test_cwd = worktree_path
+    cmd = None
+    for search_dir in [worktree_path] + sorted(worktree_path.iterdir()):
+        if not search_dir.is_dir():
+            continue
+        if any((search_dir / m).exists() for m in pytest_markers):
+            cmd = [sys.executable, "-m", "pytest", "--tb=short", "-q"]
+            test_cwd = search_dir
+            break
+        if (search_dir / "package.json").exists() and cmd is None:
+            cmd = ["npm", "test"]
+            test_cwd = search_dir
+        if (search_dir / "Makefile").exists() and cmd is None:
+            cmd = ["make", "test"]
+            test_cwd = search_dir
+
+    if cmd is None:
         logger.info("No test runner detected — skipping tests")
         return "skipped: no test runner found"
 
-    logger.info("Running tests: %s", " ".join(cmd))
+    logger.info("Running tests in %s: %s", test_cwd, " ".join(cmd))
     try:
         result = subprocess.run(
-            cmd, cwd=worktree_path, capture_output=True, text=True, timeout=300,
+            cmd, cwd=test_cwd, capture_output=True, text=True, timeout=300,
         )
         output = (result.stdout + "\n" + result.stderr).strip()
         if len(output) > 5000:
