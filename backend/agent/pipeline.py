@@ -1712,7 +1712,7 @@ Review each check — rate PASS, FAIL, or WARNING:
 Set verdict to:
 - APPROVE if all 6 checks pass
 - CHANGES_REQUESTED if any check is a concrete FAIL (including missing tests)
-- ESCALATE only if the problem is genuinely too complex""
+- ESCALATE only if the problem is genuinely too complex"""
 
     try:
         # Use Opus for deeper reasoning — worth the cost for catching subtle issues
