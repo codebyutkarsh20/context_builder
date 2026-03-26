@@ -1507,20 +1507,22 @@ CRITICAL INSTRUCTIONS:
 2. Each patch: file_path, original_code (EXACT substring from source), patched_code (replacement).
 3. patched_code MUST differ from original_code.
 4. Copy original_code EXACTLY — same whitespace, indentation, newlines. Character-for-character.
-5. Multiple patches per file are OK if they target DIFFERENT code regions.
+5. original_code MUST start with the function definition line (def function_name(...):).
+   NEVER start original_code mid-function — always include the def line for uniqueness.
+6. Multiple patches per file are OK if they target DIFFERENT code regions.
    But NEVER define the same function/variable in two separate patches.
    Each patch should touch a unique region of code — no overlapping.
-6. Keep patches focused: 5-30 lines of original_code. Enough context to be unique.
-7. Address the ROOT CAUSE, not just the symptom.
-8. Wire fixes into call sites. Files marked "(caller)" show where functions are used.
+7. Keep patches focused: 5-30 lines of original_code. Enough context to be unique.
+8. Address the ROOT CAUSE, not just the symptom.
+9. Wire fixes into call sites. Files marked "(caller)" show where functions are used.
    If you add a new function in one patch, add ANOTHER patch at the call site to invoke it.
    Dead code (functions defined but never called) = FAIL.
-9. Follow existing code patterns. Put analysis in explanation field only.
-10. In needs_more_files, list any file paths you need to see but weren't provided.
+10. Follow existing code patterns. Put analysis in explanation field only.
+11. In needs_more_files, list any file paths you need to see but weren't provided.
 
 UNIT TESTS (REQUIRED — in test_patches field):
-11. You MUST write unit tests for every function you change. This is NOT optional.
-12. Use test_patches to ADD tests to existing test files. CRITICAL RULES:
+12. You MUST write unit tests for every function you change. This is NOT optional.
+13. Use test_patches to ADD tests to existing test files. CRITICAL RULES:
     - file_path: the test file path (e.g. 'tests/test_feature_flags.py')
     - If the test file already exists (shown above labeled "EXISTING TEST FILE"):
         * original_code: the LAST few lines of the existing file (enough to be unique, ~5 lines)
@@ -1529,9 +1531,11 @@ UNIT TESTS (REQUIRED — in test_patches field):
     - If creating a brand new test file that does NOT exist yet:
         * original_code: empty string ""
         * patched_code: the complete new test file content
-13. Tests must use pytest. Match the style of the existing test file exactly.
-14. Each test must be focused: one assertion per test, descriptive name.
-15. At minimum write tests for: the happy path, the failure case you just fixed, and edge cases."""
+14. Tests must use pytest. Match the style of the existing test file exactly.
+    Use `import agent.feature_flags as ff` NOT `from backend.agent import feature_flags`.
+    Use `_save_flags` NOT `_write_flags` (that function does not exist).
+15. Each test must be focused: one assertion per test, descriptive name.
+16. At minimum write tests for: the happy path, the failure case you just fixed, and edge cases."""
 
     MAX_FILE_REQUESTS = 2
 
@@ -1889,10 +1893,17 @@ def test_node(state: AgentState) -> AgentState:
 
             original = tp.get("original_code", "")
             if not original.strip():
-                # New test file — create it
-                full_path.write_text(patched)
-                test_patches_applied += 1
-                logger.info("Created test file: %s", file_path)
+                if full_path.exists():
+                    # File exists — APPEND new tests, never overwrite
+                    existing = full_path.read_text()
+                    full_path.write_text(existing.rstrip() + "\n\n\n" + patched)
+                    test_patches_applied += 1
+                    logger.info("Appended tests to existing file: %s", file_path)
+                else:
+                    # Genuinely new file
+                    full_path.write_text(patched)
+                    test_patches_applied += 1
+                    logger.info("Created test file: %s", file_path)
             else:
                 # Update existing test file
                 if full_path.exists():
