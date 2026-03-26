@@ -44,9 +44,9 @@ class Patch(BaseModel):
 
 class RepairResult(BaseModel):
     """Output of repair agent — the generated fix with real code."""
-    patches: list[Patch] = Field(default_factory=list, description="Code patches to apply")
+    patches: list[Patch] = Field(default_factory=list, description="Code patches to apply to existing files")
+    test_patches: list[Patch] = Field(default_factory=list, description="New or updated test files to create. For each test file: file_path is the test file path (e.g. 'tests/test_foo.py'), original_code is empty string (new file) or existing content to replace, patched_code is the full test file content.")
     explanation: str = Field(default="", description="Overall fix summary in 2-3 sentences")
-    tests_added: list[str] = Field(default_factory=list, description="Tests that should be added")
     needs_more_files: list[str] = Field(default_factory=list, description="File paths the agent needs to read to complete the fix. If you cannot produce patches because you need to see more source code, list the file paths here.")
 
 

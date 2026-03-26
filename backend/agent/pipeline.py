@@ -1417,19 +1417,44 @@ def repair_node(state: AgentState) -> AgentState:
     work_order = state.get("work_order", {})
     repo_path = _resolve_repo_path(work_order)
 
+    # Inject one existing test file as a style reference so the agent knows the test conventions
+    if repo_path and not any("test" in k for k in source_code):
+        tests_dir = repo_path / "tests"
+        if not tests_dir.exists():
+            tests_dir = repo_path / "test"
+        if tests_dir.exists():
+            fault_files = localization.get("fault_files", [])
+            # Find a test file that relates to the fault files
+            ref_test = None
+            for fp in fault_files:
+                stem = Path(fp).stem
+                candidate = tests_dir / f"test_{stem}.py"
+                if candidate.exists():
+                    ref_test = candidate
+                    break
+            if ref_test is None:
+                py_tests = sorted(tests_dir.glob("test_*.py"))
+                if py_tests:
+                    ref_test = py_tests[0]
+            if ref_test:
+                content = _read_file_safe(ref_test, max_lines=80)
+                if content:
+                    source_code = dict(source_code)
+                    source_code[f"tests/{ref_test.name} (style reference — follow this pattern)"] = content
+
     # Build source section
     source_section, _ = _build_source_section(source_code)
     if not source_section:
         ctx = state.get("context", "")
         source_section = f"\n\nCODEBASE CONTEXT (summaries only):\n{ctx[:6000]}"
 
-    # Include review feedback on retry
+    # Include review feedback + test failure output on retry
     feedback_section = ""
     if previous_review.get("feedback"):
-        feedback_section = f"""
-PREVIOUS REVIEW FEEDBACK (address these issues):
-{previous_review['feedback']}
-"""
+        feedback_section = f"\nPREVIOUS REVIEW FEEDBACK (address these issues):\n{previous_review['feedback']}\n"
+    test_result = state.get("test_result", "")
+    if test_result and "fail" in test_result.lower():
+        feedback_section += f"\nTEST FAILURE OUTPUT (your previous tests failed — fix them):\n{test_result[:2000]}\n"
 
     prompt = f"""You are a senior developer fixing a bug. Your task is to produce CODE PATCHES — not analysis.
 
@@ -1454,8 +1479,17 @@ CRITICAL INSTRUCTIONS:
    If you add a new function in one patch, add ANOTHER patch at the call site to invoke it.
    Dead code (functions defined but never called) = FAIL.
 9. Follow existing code patterns. Put analysis in explanation field only.
-10. In tests_added, list test descriptions. In needs_more_files, list any file paths
-    you need to see but weren't provided."""
+10. In needs_more_files, list any file paths you need to see but weren't provided.
+
+UNIT TESTS (REQUIRED — in test_patches field):
+11. You MUST write unit tests for every function you change. This is NOT optional.
+12. Use test_patches to provide the full content of new or updated test files.
+    - file_path: e.g. 'tests/test_feature_flags.py'
+    - original_code: empty string "" if creating a new file, or the EXACT existing content to replace
+    - patched_code: the COMPLETE test file content (all imports, fixtures, and test cases)
+13. Tests must use pytest. Follow the existing test style in the repo (see test files above).
+14. Each test must be focused: one assertion per test, descriptive name, no mocking unless necessary.
+15. At minimum write tests for: the happy path, the failure case you just fixed, and edge cases."""
 
     MAX_FILE_REQUESTS = 2
 
@@ -1672,13 +1706,13 @@ Review each check — rate PASS, FAIL, or WARNING:
 4. COMPLETENESS: Is the fix complete? No no-op patches, no dead code (functions defined but never called)?
    Every new function MUST have a corresponding call site patch.
 5. BLAST_RADIUS: Given the downstream consumers listed above, could this break other systems?
-6. TESTS: Are tests mentioned in tests_added? Rate as WARNING (not FAIL) if absent.
+6. TESTS: Are test_patches provided with actual test code? Rate FAIL if test_patches is empty.
+   Tests are REQUIRED — a fix without tests is not production-ready.
 
 Set verdict to:
-- APPROVE if checks 1-5 all pass (test absence is not a blocker)
-- CHANGES_REQUESTED only if 1-5 has a concrete FAIL
-- ESCALATE only if the problem is genuinely too complex
-Do NOT set CHANGES_REQUESTED solely because tests are missing."""
+- APPROVE if all 6 checks pass
+- CHANGES_REQUESTED if any check is a concrete FAIL (including missing tests)
+- ESCALATE only if the problem is genuinely too complex""
 
     try:
         # Use Opus for deeper reasoning — worth the cost for catching subtle issues
@@ -1793,6 +1827,45 @@ def test_node(state: AgentState) -> AgentState:
                 logger.warning("Patch could not be matched in %s", file_path)
 
         state["patches_applied"] = patches_applied
+
+        # Apply test patches — create or overwrite test files in the sandbox
+        test_patches_applied = 0
+        for tp in repair.get("test_patches", []):
+            file_path = tp.get("file_path", "")
+            patched = tp.get("patched_code", "")
+            if not file_path or not patched:
+                continue
+
+            full_path = worktree_path / file_path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+
+            original = tp.get("original_code", "")
+            if not original.strip():
+                # New test file — create it
+                full_path.write_text(patched)
+                test_patches_applied += 1
+                logger.info("Created test file: %s", file_path)
+            else:
+                # Update existing test file
+                if full_path.exists():
+                    content = full_path.read_text()
+                    new_content = _fuzzy_match_replace(content, original, patched)
+                    if new_content is not None:
+                        full_path.write_text(new_content)
+                        test_patches_applied += 1
+                        logger.info("Updated test file: %s", file_path)
+                    else:
+                        # Replace entire file if fuzzy match fails
+                        full_path.write_text(patched)
+                        test_patches_applied += 1
+                        logger.info("Replaced test file: %s", file_path)
+                else:
+                    full_path.write_text(patched)
+                    test_patches_applied += 1
+                    logger.info("Created test file: %s", file_path)
+
+        if test_patches_applied:
+            logger.info("Applied %d test patch(es) to sandbox", test_patches_applied)
 
         if patches_applied == 0:
             logger.warning("No patches applied — cleaning up worktree")
