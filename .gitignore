@@ -27,3 +27,6 @@ build/
 
 # Docker volumes
 neo4j_data/
+
+# Runtime data (generated at runtime, not source)
+data/agent_metrics.json
