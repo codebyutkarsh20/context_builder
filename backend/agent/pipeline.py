@@ -7,6 +7,7 @@ Flow: Intake → Context Assembly → Localization → [Confidence Gate]
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -87,8 +88,9 @@ def _structured_call(model: str, max_tokens: int, schema: type, prompt: str, ret
         if retries <= 0:
             raise
         logger.warning("Structured output failed (%s), retrying", first_err)
-        # Retry with explicit instruction — truncate error to avoid token blowup
-        error_msg = str(first_err)[:300]
+        # Truncate error message so it doesn't blow up the context window, but
+        # keep enough to diagnose which fields failed (ValidationError dumps all fields).
+        error_msg = str(first_err)[:1000]
         retry_prompt = (
             f"Your previous response failed: {error_msg}\n"
             "Please try again. Respond with the exact structured data requested.\n\n"
@@ -488,6 +490,266 @@ def context_assembly_node(state: AgentState) -> AgentState:
             state["context"] = "No context available."
         state["context_nodes"] = 0
 
+    return state
+
+
+def exploration_node(state: AgentState) -> AgentState:
+    """Stage 2b: Agentic exploration — agent uses tools to find the bug itself.
+
+    Like Claude Code: the agent gets grep, read_file, read_function, list_files,
+    search_code, get_function_info. It explores until confident, then summarises
+    what it found (fault files, functions, source snippets) into state.
+
+    Replaces the old context_assembly + localization + read_source combo.
+    """
+    logger.info("=== EXPLORATION: Agent actively exploring the codebase ===")
+    state["status"] = PipelineStatus.EXPLORING
+    _report_progress(state)
+
+    work_order = state.get("work_order", {})
+    intent = state.get("intent", {})
+    repo_name = work_order.get("repo_name", "")
+    repo_path = _resolve_repo_path(work_order)
+
+    if not repo_path:
+        logger.warning("No repo_path — falling back to context_assembly")
+        return context_assembly_node(state)
+
+    # Set per-run context for tools
+    from agent.explore_tools import set_context, ALL_TOOLS
+    set_context(repo_name, repo_path, DATA_DIR)
+
+    # Build the repo overview (just file tree — no code)
+    try:
+        py_files = sorted(
+            str(p.relative_to(repo_path))
+            for p in repo_path.rglob("*.py")
+            if "__pycache__" not in str(p) and ".git" not in str(p)
+        )[:80]
+        other_files = sorted(
+            str(p.relative_to(repo_path))
+            for p in repo_path.rglob("*")
+            if p.is_file()
+            and p.suffix in {'.js', '.ts', '.go', '.java', '.rb', '.rs'}
+            and "node_modules" not in str(p) and ".git" not in str(p)
+        )[:20]
+        file_tree = "\n".join(py_files + other_files)
+    except Exception:
+        file_tree = "(could not list files)"
+
+    system_prompt = f"""You are an expert software engineer debugging a production bug.
+You have tools to explore the codebase: grep, read files, search by concept, get function context.
+Use them like a detective — search for relevant code, read the parts that matter, understand the flow.
+
+REPO: {repo_name}
+REPO ROOT: {repo_path}
+
+FILE TREE (source files):
+{file_tree}
+
+Your goal:
+1. Find the exact location of the bug (file + function)
+2. Read enough source code to understand WHY the bug happens
+3. Collect the relevant source code snippets into your working memory
+
+When you have enough context to fix the bug, stop exploring and write your findings summary.
+
+TOOL USAGE STRATEGY (read carefully):
+1. JUMP, DON'T SCROLL: Never read a file from line 1 hoping to find the bug.
+   Use grep_repo or search_code to locate the exact line first, then jump there.
+2. START BROAD → NARROW:
+   - search_code("payment validation") → find relevant files by concept
+   - grep_repo("def validate_payment") → find the exact function
+   - read_function("services/payment.py", "validate_payment") → read just that function
+   - get_function_info("services/payment.py::validate_payment") → see callers, business rules
+3. USE get_file_structure BEFORE read_file:
+   - get_file_structure gives you all function signatures without reading bodies
+   - Then read_function for just the ones that matter
+4. WINDOW DISCIPLINE: read_file shows 100 lines at a time.
+   If you need more, call it again with start_line pointing past what you've seen.
+5. CALLERS MATTER: Use get_function_info to find who calls the buggy function —
+   the fix often needs to be wired in at the call site too.
+6. EDITING (optional): If you want to draft a fix during exploration, use string_replace
+   to make the edit, then check_syntax to verify it compiles. This creates a patch
+   directly in the repo that the repair stage will pick up.
+7. When confident, stop calling tools and write your final summary.
+"""
+
+    user_message = f"""Bug ticket:
+TITLE: {work_order.get('title', '')}
+DESCRIPTION: {work_order.get('description', '')}
+COMPONENT: {work_order.get('affected_component', '')}
+
+Initial hints from intake analysis:
+- Likely modules: {intent.get('likely_affected_modules', [])}
+- Likely functions: {intent.get('likely_affected_functions', [])}
+- Actual behavior: {intent.get('actual_behavior', '')}
+- Expected behavior: {intent.get('expected_behavior', '')}
+
+Start exploring. Find the bug. When done, write a final summary with:
+1. Exact fault file(s) and function(s)
+2. Root cause explanation
+3. The relevant source code snippets you found
+"""
+
+    from langchain_anthropic import ChatAnthropic
+    from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+
+    llm = ChatAnthropic(
+        model="claude-sonnet-4-6",
+        max_tokens=4000,
+        timeout=120.0,
+    ).bind_tools(ALL_TOOLS)
+
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_message),
+    ]
+
+    exploration_log = []
+    source_code = {}
+    MAX_TOOL_CALLS = 30
+
+    tool_call_count = 0
+    while tool_call_count < MAX_TOOL_CALLS:
+        try:
+            response = llm.invoke(messages)
+        except Exception as e:
+            logger.error("Exploration LLM call failed: %s", e)
+            break
+
+        messages.append(response)
+
+        # No more tool calls — agent is done exploring
+        if not response.tool_calls:
+            logger.info("Exploration complete after %d tool calls", tool_call_count)
+            break
+
+        # Execute each tool call
+        for tc in response.tool_calls:
+            tool_name = tc["name"]
+            tool_args = tc["args"]
+            tool_id = tc["id"]
+            tool_call_count += 1
+
+            logger.info("Exploration tool call %d/%d: %s(%s)",
+                        tool_call_count, MAX_TOOL_CALLS, tool_name, str(tool_args)[:100])
+
+            # Find and invoke the tool
+            result_str = f"Tool '{tool_name}' not found"
+            for t in ALL_TOOLS:
+                if t.name == tool_name:
+                    try:
+                        result_str = t.invoke(tool_args)
+                    except Exception as te:
+                        result_str = f"Tool error: {te}"
+                    break
+
+            # Log the tool call
+            exploration_log.append({
+                "tool": tool_name,
+                "args": tool_args,
+                "result_preview": str(result_str)[:200],
+            })
+
+            # If the tool read file content, store it in source_code
+            if tool_name in ("read_file", "read_function") and "ERROR" not in str(result_str):
+                file_path = tool_args.get("file_path", "")
+                if file_path and file_path not in source_code:
+                    source_code[file_path] = result_str
+
+            # If the agent made a direct edit via string_replace, record the patch
+            if tool_name == "string_replace" and "OK:" in str(result_str):
+                file_path = tool_args.get("file_path", "")
+                old_str = tool_args.get("old_string", "")
+                new_str = tool_args.get("new_string", "")
+                if file_path and old_str and new_str:
+                    exploration_log.append({
+                        "tool": "patch_recorded",
+                        "file": file_path,
+                        "note": "Agent applied string_replace directly during exploration",
+                    })
+
+            messages.append(ToolMessage(content=str(result_str), tool_call_id=tool_id))
+
+        if tool_call_count >= MAX_TOOL_CALLS:
+            logger.warning("Exploration hit %d tool call limit", MAX_TOOL_CALLS)
+            break
+
+    # Extract agent's final summary from last non-tool-call message
+    final_summary = ""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and not msg.tool_calls and msg.content:
+            final_summary = msg.content if isinstance(msg.content, str) else str(msg.content)
+            break
+
+    # Dual-signal localization: merge agent findings with embedding-based file retrieval
+    # (Agentless-style: LLM picks files + semantic search picks files → union → higher recall)
+    embedding_files: list[str] = []
+    try:
+        from embeddings.embedder import NodeEmbedder
+        embedder = NodeEmbedder(repo_name, DATA_DIR)
+        info = embedder.collection_info()
+        if info.get("count", 0) > 0:
+            query = f"{intent.get('actual_behavior', '')} {intent.get('expected_behavior', '')}"
+            emb_results = embedder.query(text=query, n_results=5)
+            for r in emb_results:
+                fpath = r.get("metadata", {}).get("file", "")
+                if fpath and fpath not in embedding_files:
+                    embedding_files.append(fpath)
+            logger.info("Embedding dual-signal: found %d candidate files", len(embedding_files))
+    except Exception as emb_err:
+        logger.debug("Embedding dual-signal unavailable: %s", emb_err)
+
+    # Parse fault locations from the summary using a structured call
+    if final_summary or source_code:
+        try:
+            embedding_hint = ""
+            if embedding_files:
+                embedding_hint = f"\nSEMANTIC SEARCH also suggests these files as relevant:\n{embedding_files}"
+
+            parse_prompt = f"""Based on this exploration summary, extract the fault location.
+
+EXPLORATION SUMMARY:
+{final_summary[:3000]}
+
+FILES READ DURING EXPLORATION:
+{list(source_code.keys())}
+{embedding_hint}
+
+Extract the most likely fault location. If both the exploration and semantic search agree on a file, weight it higher."""
+            loc = _structured_call("claude-sonnet-4-6", 800, LocalizationResult, parse_prompt)
+
+            # Merge: ensure embedding-suggested files appear in fault_files if relevant
+            merged_fault_files = list(loc.fault_files)
+            for ef in embedding_files:
+                if ef not in merged_fault_files and len(merged_fault_files) < 5:
+                    # Only add if not already covered
+                    merged_fault_files.append(ef)
+
+            loc_dict = loc.model_dump()
+            loc_dict["fault_files"] = merged_fault_files
+            state["localization"] = loc_dict
+            logger.info("Exploration localization: confidence=%.2f files=%s",
+                        loc.confidence, merged_fault_files)
+        except Exception as e:
+            logger.warning("Could not parse localization from exploration: %s", e)
+            state["localization"] = {
+                "fault_files": list(source_code.keys())[:3] or embedding_files[:3],
+                "fault_functions": intent.get("likely_affected_functions", []),
+                "fault_classes": [],
+                "root_cause_hypothesis": final_summary[:500] if final_summary else "See exploration log",
+                "confidence": 0.5,
+                "evidence": [f"Explored {tool_call_count} code locations"],
+            }
+
+    state["context"] = final_summary
+    state["source_code"] = source_code
+    state["exploration_log"] = exploration_log
+    state["context_nodes"] = tool_call_count
+
+    logger.info("Exploration done: %d tool calls, %d files read, summary_len=%d",
+                tool_call_count, len(source_code), len(final_summary))
     return state
 
 
@@ -1056,16 +1318,18 @@ You MUST produce patches where original_code is an EXACT character-for-character
 
 
 def _check_syntax(file_path: Path) -> str | None:
-    """Check Python file for syntax errors. Returns error message or None if OK."""
+    """Check Python file for syntax errors. Returns error message or None if OK.
+
+    Uses ``ast.parse`` in-process instead of spawning a subprocess — avoids
+    any shell/Python injection risk from unusual file paths and is ~100x faster.
+    """
     if file_path.suffix != ".py":
         return None
     try:
-        result = subprocess.run(
-            ["python3", "-c", f"import ast; ast.parse(open('{file_path}').read())"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return result.stderr.strip()
+        source = file_path.read_text(encoding="utf-8", errors="replace")
+        ast.parse(source, filename=str(file_path))
+    except SyntaxError as e:
+        return f"SyntaxError at line {e.lineno}: {e.msg}"
     except Exception as e:
         return str(e)
     return None
@@ -1453,9 +1717,14 @@ def test_node(state: AgentState) -> AgentState:
         state["sandbox_path"] = ""
         return state
 
+    # Sanitize ticket_id: keep only alphanumerics, hyphens, and underscores.
+    # Prevents special characters (e.g. "/" or "..") from escaping into file
+    # paths or git branch names.
+    safe_ticket_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", ticket_id).lower()
+
     # Generate unique branch name
     branch_suffix = uuid.uuid4().hex[:6]
-    branch_name = f"fix/{ticket_id.lower()}-{branch_suffix}"
+    branch_name = f"fix/{safe_ticket_id}-{branch_suffix}"
     state["branch_name"] = branch_name
 
     try:
@@ -1478,8 +1747,8 @@ def test_node(state: AgentState) -> AgentState:
             state["error"] = "Repository has uncommitted changes. Commit or stash them first."
             return state
 
-        # Create worktree
-        worktree_path = Path(f"/tmp/agent_sandbox_{ticket_id}_{branch_suffix}")
+        # Create worktree (safe_ticket_id has no special chars, path is safe)
+        worktree_path = Path(f"/tmp/agent_sandbox_{safe_ticket_id}_{branch_suffix}")
         subprocess.run(
             ["git", "worktree", "add", "-b", branch_name, str(worktree_path), base_branch],
             cwd=repo_path, capture_output=True, text=True, check=True, timeout=30,
@@ -1796,44 +2065,50 @@ def should_iterate(state: AgentState) -> Literal["test", "retry_fix", "escalate"
 # ---------------------------------------------------------------------------
 
 def build_agent_graph():
-    """Build and compile the LangGraph state machine."""
+    """Build and compile the LangGraph state machine.
+
+    AGENT_MODE env var controls exploration strategy:
+      'explore'  — agentic tool loop (grep/read/search), agent finds context itself (new)
+      'rag'      — Graph RAG push context upfront (legacy default)
+    """
+    mode = os.environ.get("AGENT_MODE", "explore")
+    logger.info("Building agent graph in mode: %s", mode)
+
     graph = StateGraph(AgentState)
 
-    # Add nodes
     graph.add_node("intake", intake_node)
-    graph.add_node("context_assembly", context_assembly_node)
-    graph.add_node("localization", localization_node)
-    graph.add_node("read_source", read_source_node)
     graph.add_node("repair", repair_node)
     graph.add_node("review", review_node)
     graph.add_node("test", test_node)
     graph.add_node("create_pr", pr_creation_node)
     graph.add_node("escalate", escalate_node)
-
-    # Linear flow: intake → context → localization
     graph.set_entry_point("intake")
-    graph.add_edge("intake", "context_assembly")
-    graph.add_edge("context_assembly", "localization")
 
-    # Confidence gate after localization
-    graph.add_conditional_edges(
-        "localization",
-        should_read_source_or_escalate,
-        {"read_source": "read_source", "escalate": "escalate"},
-    )
+    if mode == "explore":
+        # New: agentic exploration replaces context_assembly + localization + read_source
+        graph.add_node("exploration", exploration_node)
+        graph.add_edge("intake", "exploration")
+        graph.add_edge("exploration", "repair")
+    else:
+        # Legacy: push context upfront via Graph RAG
+        graph.add_node("context_assembly", context_assembly_node)
+        graph.add_node("localization", localization_node)
+        graph.add_node("read_source", read_source_node)
+        graph.add_edge("intake", "context_assembly")
+        graph.add_edge("context_assembly", "localization")
+        graph.add_conditional_edges(
+            "localization",
+            should_read_source_or_escalate,
+            {"read_source": "read_source", "escalate": "escalate"},
+        )
+        graph.add_edge("read_source", "repair")
 
-    # Source reading → repair → review
-    graph.add_edge("read_source", "repair")
     graph.add_edge("repair", "review")
-
-    # Dev↔reviewer loop
     graph.add_conditional_edges(
         "review",
         should_iterate,
         {"test": "test", "retry_fix": "repair", "escalate": "escalate"},
     )
-
-    # Test → PR → End
     graph.add_edge("test", "create_pr")
     graph.add_edge("create_pr", END)
     graph.add_edge("escalate", END)

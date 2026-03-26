@@ -276,9 +276,10 @@ class CallGraphBuilder:
         # Phase 6: external call detection
         self._detect_external_calls(G)
 
-        # Phase 7: PageRank
+        # Phase 7: PageRank — use edge weights so CALLS edges (weight=3.0) dominate
+        # hotspot scoring over structural CONTAINS edges (weight=0.5).
         try:
-            pr: dict[str, float] = nx.pagerank(G, alpha=0.85)
+            pr: dict[str, float] = nx.pagerank(G, alpha=0.85, weight="weight")
         except nx.PowerIterationFailedConvergence:
             logger.warning("PageRank did not converge; using uniform scores")
             pr = {n: 1.0 / max(len(G), 1) for n in G.nodes}
@@ -335,27 +336,40 @@ class CallGraphBuilder:
     # Phase 2: CONTAINS edges
     # ------------------------------------------------------------------
 
+    # Edge weights for PageRank computation.
+    # CALLS edges carry the most weight — a function called by many callers
+    # should rank significantly higher than a file that merely contains them.
+    # CONTAINS edges have low weight to avoid inflating hub files artificially.
+    _EDGE_WEIGHTS = {
+        "CALLS": 3.0,
+        "IMPORTS": 1.5,
+        "INHERITS": 1.0,
+        "CONTAINS": 0.5,
+    }
+
     def _add_contains_edges(self, G: nx.DiGraph) -> None:
+        w = self._EDGE_WEIGHTS["CONTAINS"]
         for pf in self._parsed:
             rel = pf["path"]
             fnode = _file_id(rel)
 
             for cls in pf.get("classes", []):
                 cid = _class_id(rel, cls["name"])
-                G.add_edge(fnode, cid, type="CONTAINS")
+                G.add_edge(fnode, cid, type="CONTAINS", weight=w)
                 for method in cls.get("methods", []):
                     mid = _method_id(rel, cls["name"], method["name"])
-                    G.add_edge(cid, mid, type="CONTAINS")
+                    G.add_edge(cid, mid, type="CONTAINS", weight=w)
 
             for fn in pf.get("functions", []):
                 fid = _func_id(rel, fn["name"])
-                G.add_edge(fnode, fid, type="CONTAINS")
+                G.add_edge(fnode, fid, type="CONTAINS", weight=w)
 
     # ------------------------------------------------------------------
     # Phase 3: IMPORTS edges
     # ------------------------------------------------------------------
 
     def _add_import_edges(self, G: nx.DiGraph) -> None:
+        w = self._EDGE_WEIGHTS["IMPORTS"]
         for pf in self._parsed:
             rel = pf["path"]
             src_fnode = _file_id(rel)
@@ -370,7 +384,7 @@ class CallGraphBuilder:
                 if target_path and target_path != rel:
                     tgt_fnode = _file_id(target_path)
                     if G.has_node(tgt_fnode):
-                        G.add_edge(src_fnode, tgt_fnode, type="IMPORTS")
+                        G.add_edge(src_fnode, tgt_fnode, type="IMPORTS", weight=w)
 
     # ------------------------------------------------------------------
     # Phase 4: INHERITS edges
@@ -385,6 +399,7 @@ class CallGraphBuilder:
                 cid = _class_id(rel, cls["name"])
                 class_name_to_ids.setdefault(cls["name"], []).append(cid)
 
+        w = self._EDGE_WEIGHTS["INHERITS"]
         for pf in self._parsed:
             rel = pf["path"]
             for cls in pf.get("classes", []):
@@ -394,7 +409,7 @@ class CallGraphBuilder:
                     base_name = base.split(".")[-1]
                     for parent_cid in class_name_to_ids.get(base_name, []):
                         if parent_cid != child_cid:
-                            G.add_edge(child_cid, parent_cid, type="INHERITS")
+                            G.add_edge(child_cid, parent_cid, type="INHERITS", weight=w)
 
     # ------------------------------------------------------------------
     # Phase 5: CALLS edges
@@ -453,6 +468,8 @@ class CallGraphBuilder:
                         short = mod.split(".")[-1]
                         file_imports[short] = resolved
 
+            call_w = self._EDGE_WEIGHTS["CALLS"]
+
             # Top-level functions
             for fn in pf.get("functions", []):
                 if "line_start" not in fn or "line_end" not in fn:
@@ -461,7 +478,7 @@ class CallGraphBuilder:
                 body_text = _slice_lines(lines, fn["line_start"], fn["line_end"])
                 for target_id in _scan_body_for_calls(body_text, func_name_to_ids, rel, file_imports):
                     if target_id != caller_id and not G.has_edge(caller_id, target_id):
-                        G.add_edge(caller_id, target_id, type="CALLS")
+                        G.add_edge(caller_id, target_id, type="CALLS", weight=call_w)
 
             # Methods
             for cls in pf.get("classes", []):
@@ -472,7 +489,7 @@ class CallGraphBuilder:
                     body_text = _slice_lines(lines, method["line_start"], method["line_end"])
                     for target_id in _scan_body_for_calls(body_text, func_name_to_ids, rel, file_imports):
                         if target_id != caller_id and not G.has_edge(caller_id, target_id):
-                            G.add_edge(caller_id, target_id, type="CALLS")
+                            G.add_edge(caller_id, target_id, type="CALLS", weight=call_w)
 
     # ------------------------------------------------------------------
     # Phase 6: External call detection

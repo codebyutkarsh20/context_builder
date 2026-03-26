@@ -61,7 +61,7 @@ class TestPipelineStatusEnum:
 
     def test_all_stages_present(self):
         expected = {
-            "pending", "intake", "context_assembly", "localizing",
+            "pending", "intake", "context_assembly", "exploring", "localizing",
             "reading_source", "repairing", "reviewing", "testing",
             "pr_creating", "done", "escalated", "failed",
         }

@@ -223,7 +223,11 @@ class GraphRAGRetriever:
 
             for node_id in frontier:
                 for edge in edge_index.get(node_id, []):
-                    neighbor = edge["target"] if edge["source"] == node_id else edge["source"]
+                    src = edge.get("source", "")
+                    tgt = edge.get("target", "")
+                    if not src or not tgt:
+                        continue
+                    neighbor = tgt if src == node_id else src
                     if neighbor not in visited and edge.get("type") in allowed_types:
                         visited.add(neighbor)
                         next_frontier.add(neighbor)

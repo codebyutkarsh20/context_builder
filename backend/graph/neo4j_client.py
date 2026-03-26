@@ -40,6 +40,13 @@ class Neo4jClient:
             self._driver.verify_connectivity()
             logger.info("Connected to Neo4j at %s", uri)
         except (ServiceUnavailable, AuthError) as exc:
+            # Close the driver if it was created before verify_connectivity raised,
+            # to avoid leaking the connection pool.
+            if self._driver is not None:
+                try:
+                    self._driver.close()
+                except Exception:
+                    pass
             self._driver = None
             logger.error("Failed to connect to Neo4j: %s", exc)
             raise

@@ -32,7 +32,7 @@ class TestStructuredCallConfig:
 
     def test_error_truncation_in_source(self):
         src = inspect.getsource(_structured_call)
-        assert "[:300]" in src
+        assert "[:1000]" in src
 
 
 class TestStructuredCallRetry:
@@ -77,7 +77,7 @@ class TestStructuredCallRetry:
         mock_structured = MagicMock()
         mock_llm.with_structured_output.return_value = mock_structured
 
-        long_error = "x" * 500
+        long_error = "x" * 1200
         mock_structured.invoke.side_effect = [ValueError(long_error), MagicMock()]
 
         _structured_call("model", 100, dict, "prompt", retries=1)
@@ -85,9 +85,10 @@ class TestStructuredCallRetry:
         # Check the retry prompt
         retry_call = mock_structured.invoke.call_args_list[1]
         retry_prompt = retry_call[0][0]
-        # Error should be truncated to 300 chars
-        assert "x" * 300 in retry_prompt
-        assert "x" * 301 not in retry_prompt
+        # Error should be truncated to 1000 chars (increased from 300 to preserve
+        # more of ValidationError detail without blowing up context window)
+        assert "x" * 1000 in retry_prompt
+        assert "x" * 1001 not in retry_prompt
 
     @patch("agent.pipeline.ChatAnthropic")
     def test_both_calls_fail_raises(self, mock_cls):

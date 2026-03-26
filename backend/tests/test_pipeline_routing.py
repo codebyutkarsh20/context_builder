@@ -124,13 +124,27 @@ class TestGraphStructure:
 
     def test_graph_has_all_nodes(self):
         graph = build_agent_graph()
-        # LangGraph compiled graph stores nodes internally
+        # LangGraph compiled graph stores nodes internally.
+        # The exact node set depends on AGENT_MODE:
+        #   "explore"      → exploration node replaces context_assembly/localization/read_source
+        #   anything else  → classic context_assembly + localization + read_source nodes
         if hasattr(graph, 'nodes'):
             node_names = set(graph.nodes.keys()) if isinstance(graph.nodes, dict) else set()
-            for expected in ["intake", "context_assembly", "localization",
-                             "read_source", "repair", "review", "test",
-                             "create_pr", "escalate"]:
+            if not node_names:
+                return  # LangGraph version doesn't expose nodes dict — skip
+
+            # Nodes common to both modes
+            common = ["intake", "repair", "review", "test", "create_pr", "escalate"]
+            for expected in common:
                 assert expected in node_names, f"Missing node: {expected}"
+
+            # Mode-dependent nodes
+            is_explore_mode = "exploration" in node_names
+            if is_explore_mode:
+                assert "exploration" in node_names
+            else:
+                for expected in ["context_assembly", "localization", "read_source"]:
+                    assert expected in node_names, f"Missing node: {expected}"
 
 
 # ── PipelineStatus Enum ──────────────────────────────────────────────

@@ -14,8 +14,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
 )
-for _lib in ("httpcore", "httpx", "chromadb", "urllib3", "openai._base_client"):
-    logging.getLogger(_lib).setLevel(logging.WARNING)
+for _lib in ("httpcore", "httpx", "chromadb", "urllib3", "openai._base_client",
+             "chromadb.telemetry", "chromadb.telemetry.product.posthog"):
+    logging.getLogger(_lib).setLevel(logging.ERROR)
 
 from fastapi.middleware.cors import CORSMiddleware
 

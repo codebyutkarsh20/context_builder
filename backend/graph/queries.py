@@ -56,14 +56,10 @@ def get_graph_nodes(
     limit:
         Maximum number of nodes to return.
     """
-    if node_type:
-        label_filter = f":{node_type}"
-    elif layer and layer in _LAYER_LABELS:
-        label_filter = f":{_LAYER_LABELS[layer].replace('|', '|')}"
-        # Neo4j doesn't accept "n:A|B" inline; we use WHERE instead.
-        label_filter = ""
-    else:
-        label_filter = ""
+    # label_filter is only used in the node_type fast-path below.
+    # The layer branch uses a parameterised WHERE clause instead, because
+    # Neo4j does not support inline multi-label patterns ("n:A|B").
+    label_filter = f":{node_type}" if node_type else ""
 
     params: dict = {"repo": repo, "limit": limit}
 

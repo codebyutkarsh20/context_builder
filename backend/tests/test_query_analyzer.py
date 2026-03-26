@@ -153,8 +153,14 @@ class TestScopeDetection:
         assert intent.scope in ("broad", "architectural")  # depends on whether arch hint fires
 
     def test_specific_scope_with_long_name(self):
+        # "how does ... work" matches _ARCH_HINTS → architectural takes priority
+        # after the scope priority fix (arch before specific).
         intent = analyze_query("How does UserAuthenticationService work?")
-        # has a long name — should be specific
+        assert intent.scope == "architectural"
+
+    def test_specific_scope_no_arch_hint(self):
+        # Long name with no architectural hint → specific
+        intent = analyze_query("What does UserAuthenticationService return?")
         assert intent.scope == "specific"
 
     def test_broad_scope_short_question(self):

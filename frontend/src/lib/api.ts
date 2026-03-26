@@ -203,6 +203,19 @@ export function getKnowledgeRules(repo: string): Promise<KnowledgeRule[]> {
   return request<KnowledgeRule[]>(`/api/knowledge/${encodeURIComponent(repo)}/rules`)
 }
 
+export function addRule(repo: string, rule: {
+  description: string
+  rule_type: string
+  severity: string
+  file?: string
+  constraint?: string
+}): Promise<{ rule_id: string }> {
+  return request<{ rule_id: string }>(`/api/knowledge/${encodeURIComponent(repo)}/rules`, {
+    method: 'POST',
+    body: JSON.stringify(rule),
+  })
+}
+
 export function getKnowledgeStats(repo: string): Promise<KnowledgeStats> {
   return request<KnowledgeStats>(`/api/knowledge/${encodeURIComponent(repo)}/stats`)
 }

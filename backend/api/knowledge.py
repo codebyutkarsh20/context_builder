@@ -139,9 +139,30 @@ def list_questions(
     decision_points = data.get("decision_points", [])
     answers = _load_answers(repo)
 
+    def _make_question(dp: dict) -> str:
+        """Generate a human-readable question from a decision point."""
+        q = dp.get("question_for_human") or dp.get("question", "")
+        if q:
+            return q
+        condition = dp.get("condition", "")
+        ctype = dp.get("condition_type", "")
+        func = dp.get("function_id", "").split("::")[-1] if "::" in dp.get("function_id", "") else ""
+        if ctype == "threshold":
+            return f"What is the business reason for the threshold check `{condition}` in `{func}`?"
+        if ctype == "role_check":
+            return f"What access control policy does `{condition}` enforce in `{func}`?"
+        if ctype == "null_check":
+            return f"What should happen when `{condition}` is true in `{func}`? Is this an error, a valid state, or something else?"
+        if condition:
+            return f"What is the business intent behind `{condition}` in `{func}`?"
+        return ""
+
+    # Prioritise meaningful condition types
+    _PRIORITY = {"threshold": 0, "role_check": 1, "null_check": 2, "logic_branch": 3}
+
     questions: list[dict] = []
     for dp in decision_points:
-        q = dp.get("question_for_human") or dp.get("question", "")
+        q = _make_question(dp)
         if not q:
             continue
 
@@ -166,8 +187,8 @@ def list_questions(
         }
         questions.append(item)
 
-    # Sort: unanswered first, then by file
-    questions.sort(key=lambda x: (x["answered"], x["file"]))
+    # Sort: unanswered first, then by priority type, then by file
+    questions.sort(key=lambda x: (x["answered"], _PRIORITY.get(x["condition_type"], 9), x["file"]))
     return questions[:limit]
 
 
@@ -269,6 +290,38 @@ def submit_answer(repo: str, submission: AnswerSubmission):
 
     logger.info("Answer submitted for %s → rule %s (%s)", submission.question_id, rule_id, submission.severity)
     return {"rule_id": rule_id, "status": "stored", "description": rule["description"]}
+
+
+class AddRuleRequest(BaseModel):
+    description: str
+    rule_type: str = "policy"
+    severity: str = "medium"
+    file: str = ""
+    constraint: str = ""
+    added_by: str = ""
+
+
+@router.post("/knowledge/{repo}/rules")
+def add_rule(repo: str, body: AddRuleRequest):
+    """Manually add a business rule directly (no question needed)."""
+    rule_id = f"rule_manual_{uuid.uuid4().hex[:8]}"
+    rule = {
+        "id": rule_id,
+        "description": body.description,
+        "rule_type": body.rule_type,
+        "severity": body.severity,
+        "source": f"manual:{body.added_by or 'developer'}",
+        "function_id": "",
+        "file": body.file,
+        "constraint": body.constraint or body.description,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    rules = _load_rules(repo)
+    rules.append(rule)
+    _save_rules(repo, rules)
+    _inject_rule_into_enriched(repo, rule)
+    logger.info("Manual rule %s added for repo '%s'", rule_id, repo)
+    return {"rule_id": rule_id, "status": "stored"}
 
 
 @router.get("/knowledge/{repo}/rules")

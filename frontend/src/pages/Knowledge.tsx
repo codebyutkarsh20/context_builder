@@ -1,13 +1,13 @@
 import { useState, useEffect } from 'react'
 import {
-  BookOpen, HelpCircle, CheckCircle2, Shield, AlertTriangle,
-  ChevronDown, ChevronRight, FileCode, Send, Loader2, BarChart3,
+  BookOpen, HelpCircle, CheckCircle2, Shield,
+  ChevronDown, ChevronRight, FileCode, Send, Loader2, BarChart3, Plus, X,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { useRepo } from '../lib/RepoContext'
 import {
   getKnowledgeQuestions, getKnowledgeRules, getKnowledgeStats,
-  submitAnswer,
+  submitAnswer, addRule,
   type KnowledgeQuestion, type KnowledgeRule, type KnowledgeStats,
 } from '../lib/api'
 
@@ -171,6 +171,108 @@ function QuestionCard({ q, repo, onAnswered }: {
   )
 }
 
+function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () => void; onAdded: () => void }) {
+  const [description, setDescription] = useState('')
+  const [ruleType, setRuleType] = useState('policy')
+  const [severity, setSeverity] = useState('medium')
+  const [file, setFile] = useState('')
+  const [constraint, setConstraint] = useState('')
+  const [submitting, setSubmitting] = useState(false)
+
+  const handleSubmit = async () => {
+    if (!description.trim()) return
+    setSubmitting(true)
+    try {
+      await addRule(repo, { description, rule_type: ruleType, severity, file, constraint })
+      onAdded()
+      onClose()
+    } catch (e) {
+      alert(e instanceof Error ? e.message : 'Failed to add rule')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+      <div className="w-full max-w-lg bg-zinc-900 border border-zinc-700 rounded-2xl shadow-2xl">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800">
+          <div className="flex items-center gap-2">
+            <Shield className="w-4 h-4 text-purple-400" />
+            <h2 className="text-sm font-bold text-zinc-100">Add Business Rule</h2>
+          </div>
+          <button onClick={onClose} className="text-zinc-600 hover:text-zinc-300 transition-colors">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+        <div className="p-5 space-y-4">
+          <div>
+            <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">Rule Description *</label>
+            <textarea
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="e.g. Late fees cannot exceed 10% of principal per RBI guidelines"
+              rows={3}
+              className="w-full px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-purple-500/50 focus:outline-none resize-none"
+              autoFocus
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">Constraint / Enforcement Detail</label>
+            <input
+              value={constraint}
+              onChange={(e) => setConstraint(e.target.value)}
+              placeholder="e.g. max_late_fee = principal * 0.10"
+              className="w-full px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-purple-500/50 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">Relevant File (optional)</label>
+            <input
+              value={file}
+              onChange={(e) => setFile(e.target.value)}
+              placeholder="e.g. services/loan_service.py"
+              className="w-full px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-purple-500/50 focus:outline-none"
+            />
+          </div>
+          <div className="flex gap-3">
+            <div className="flex-1">
+              <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">Type</label>
+              <select value={ruleType} onChange={(e) => setRuleType(e.target.value)}
+                className="w-full text-xs bg-zinc-800 border border-zinc-700 text-zinc-300 rounded-lg px-2 py-2">
+                <option value="legal">Legal</option>
+                <option value="contractual">Contractual</option>
+                <option value="policy">Policy</option>
+                <option value="architectural">Architectural</option>
+              </select>
+            </div>
+            <div className="flex-1">
+              <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">Severity</label>
+              <select value={severity} onChange={(e) => setSeverity(e.target.value)}
+                className="w-full text-xs bg-zinc-800 border border-zinc-700 text-zinc-300 rounded-lg px-2 py-2">
+                <option value="critical">Critical</option>
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-zinc-800">
+          <button onClick={onClose} className="px-4 py-1.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors">
+            Cancel
+          </button>
+          <button onClick={handleSubmit} disabled={!description.trim() || submitting}
+            className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-purple-500/20 text-purple-300 hover:bg-purple-500/30 border border-purple-500/30 text-xs font-medium transition-all disabled:opacity-50">
+            {submitting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
+            Add Rule
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function RuleCard({ rule }: { rule: KnowledgeRule }) {
   return (
     <div className="p-3 rounded-xl bg-zinc-900 border border-zinc-800">
@@ -205,6 +307,7 @@ export default function KnowledgePage() {
   const [stats, setStats] = useState<KnowledgeStats | null>(null)
   const [loading, setLoading] = useState(true)
   const [showAnswered, setShowAnswered] = useState(false)
+  const [showAddRule, setShowAddRule] = useState(false)
 
   const loadData = () => {
     if (!activeRepo) return
@@ -228,6 +331,9 @@ export default function KnowledgePage() {
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
+      {showAddRule && activeRepo && (
+        <AddRuleModal repo={activeRepo} onClose={() => setShowAddRule(false)} onAdded={loadData} />
+      )}
       <div className="flex-shrink-0 px-6 py-4 border-b border-zinc-700/50 bg-zinc-900 flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 rounded-lg bg-purple-500/20 flex items-center justify-center">
@@ -248,6 +354,10 @@ export default function KnowledgePage() {
             className={cn('px-3 py-1.5 rounded-lg text-xs font-medium transition-all',
               tab === 'rules' ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30' : 'text-zinc-500 hover:text-zinc-300')}>
             <Shield className="w-3 h-3 inline mr-1" />Rules {stats ? `(${stats.rules})` : ''}
+          </button>
+          <button onClick={() => setShowAddRule(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-medium transition-all">
+            <Plus className="w-3 h-3" />Add Rule
           </button>
         </div>
       </div>

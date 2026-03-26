@@ -22,20 +22,47 @@ _agent_jobs_lock = threading.Lock()
 _MAX_AGENT_JOBS = 50
 
 
+_STALE_RUNNING_SECONDS = 1800  # 30 minutes — running jobs older than this are considered stale
+
+
 def _cleanup_old_jobs() -> None:
-    """Remove oldest completed jobs when store exceeds max size.
+    """Remove oldest completed/stale jobs when store exceeds max size.
 
     Must be called while holding _agent_jobs_lock.
+
+    Cleans up:
+    1. Completed jobs (done / failed / escalated) — oldest first.
+    2. Stale running jobs (started > 30 min ago) — guards against threads that
+       crashed without updating their status, which would otherwise pin entries
+       in memory forever.
     """
     if len(_agent_jobs) <= _MAX_AGENT_JOBS:
         return
-    completed = [
+
+    now = time.time()
+
+    # Collect terminal jobs (safe to remove)
+    removable = [
         (jid, job) for jid, job in _agent_jobs.items()
         if job.get("status") in ("done", "failed", "escalated")
     ]
-    completed.sort(key=lambda x: x[1].get("_created", 0))
+    # Also collect stale running jobs (thread likely dead)
+    removable += [
+        (jid, job) for jid, job in _agent_jobs.items()
+        if job.get("status") == "running"
+        and (now - job.get("_created", now)) > _STALE_RUNNING_SECONDS
+    ]
+
+    # Sort by creation time (oldest first) and deduplicate
+    seen: set[str] = set()
+    unique: list[tuple[str, dict]] = []
+    for item in sorted(removable, key=lambda x: x[1].get("_created", 0)):
+        if item[0] not in seen:
+            seen.add(item[0])
+            unique.append(item)
+
     to_remove = len(_agent_jobs) - _MAX_AGENT_JOBS
-    for jid, _ in completed[:to_remove]:
+    for jid, _ in unique[:to_remove]:
         del _agent_jobs[jid]
 
 

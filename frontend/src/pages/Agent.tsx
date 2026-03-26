@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Cpu, Play, Loader2, CheckCircle2, XCircle, AlertTriangle,
   ArrowRight, FileCode, Bug, Wrench, Eye, GitPullRequest,
-  Target, Brain, Shield, Clock,
+  Target, Brain, Shield, Clock, Search,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { useRepo } from '../lib/RepoContext'
@@ -17,6 +17,7 @@ const MAX_ITERATIONS = 3
 
 const STAGES = [
   { key: 'intake', label: 'Intake', icon: Bug, color: 'text-blue-400', bg: 'bg-blue-500' },
+  { key: 'exploring', label: 'Explore', icon: Search, color: 'text-teal-400', bg: 'bg-teal-500' },
   { key: 'context_assembly', label: 'Context', icon: Brain, color: 'text-purple-400', bg: 'bg-purple-500' },
   { key: 'localizing', label: 'Localize', icon: Target, color: 'text-amber-400', bg: 'bg-amber-500' },
   { key: 'reading_source', label: 'Read Code', icon: FileCode, color: 'text-yellow-400', bg: 'bg-yellow-500' },

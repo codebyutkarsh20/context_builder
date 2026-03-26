@@ -66,6 +66,14 @@ class ContextAssembler:
         if used_tokens + primary_tokens < token_budget:
             sections.append(primary_section)
             used_tokens += primary_tokens
+        else:
+            # Primary alone exceeds budget: truncate it to fit rather than
+            # skipping it entirely, which would produce context with no primary
+            # matches at all.
+            chars_left = (token_budget - used_tokens) * 4
+            truncated = primary_section[:chars_left]
+            sections.append(truncated)
+            used_tokens += _estimate_tokens(truncated)
 
         # Section 2: Related code (compact)
         if used_tokens < token_budget * 0.7:
@@ -73,10 +81,11 @@ class ContextAssembler:
             related_tokens = _estimate_tokens(related_section)
             budget_left = token_budget - used_tokens
             if related_tokens > budget_left:
-                # Truncate to fit
+                # Truncate to stay within budget (budget_left * 4 converts tokens → chars)
                 related_section = related_section[:budget_left * 4]
-            sections.append(related_section)
-            used_tokens += _estimate_tokens(related_section)
+            if related_section:
+                sections.append(related_section)
+                used_tokens += _estimate_tokens(related_section)
 
         # Section 3: Call relationships
         if edges and used_tokens < token_budget * 0.85:

@@ -307,10 +307,11 @@ def _compile_without_neo4j(
     decision_points: list | None = None,
     domain_concepts: list | None = None,
     git_decisions: list | None = None,
+    out_dir: Path | None = None,
 ):
     """Write context.md and summary.md directly from in-memory data (no Neo4j)."""
     from datetime import datetime, timezone
-    out = Path(f"/tmp/context_builder/{repo_name}")
+    out = Path(out_dir) if out_dir else Path(f"/tmp/context_builder/{repo_name}")
     out.mkdir(parents=True, exist_ok=True)
 
     tech = ", ".join(structure.get("tech_stack", []))

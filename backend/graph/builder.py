@@ -230,7 +230,12 @@ class GraphBuilder:
     # --- Edges ---------------------------------------------------------
 
     def _upsert_edges(self, graph_data: dict[str, Any]) -> None:
-        """Create IMPORTS and CALLS edges from graph_data."""
+        """Create IMPORTS, CALLS, and INHERITS edges from graph_data.
+
+        CONTAINS edges are intentionally excluded here — they are created
+        as part of the node upsert methods (_upsert_file, _upsert_classes,
+        _upsert_method) to maintain structural integrity.
+        """
         edges: list[dict[str, Any]] = graph_data.get("edges", []) or []
 
         import_query = (
@@ -240,6 +245,10 @@ class GraphBuilder:
         call_query = (
             "MATCH (a {id: $source}), (b {id: $target}) "
             "MERGE (a)-[:CALLS]->(b)"
+        )
+        inherits_query = (
+            "MATCH (a {id: $source}), (b {id: $target}) "
+            "MERGE (a)-[:INHERITS]->(b)"
         )
 
         for edge in edges:
@@ -257,24 +266,51 @@ class GraphBuilder:
                 neo4j_client.run(import_query, edge_params)
             elif edge_type == "CALLS":
                 neo4j_client.run(call_query, edge_params)
+            elif edge_type == "INHERITS":
+                neo4j_client.run(inherits_query, edge_params)
+            elif edge_type == "CONTAINS":
+                pass  # Handled during node upsert; skip to avoid duplicates.
             else:
                 logger.debug("Unknown edge type '%s'; skipping.", edge_type)
 
     # --- PageRank ------------------------------------------------------
 
     def _apply_pagerank(self, graph_data: dict[str, Any]) -> None:
-        """Write pre-computed pagerank scores onto nodes."""
-        hotspots: dict[str, float] = graph_data.get("hotspots", {}) or {}
+        """Write pre-computed pagerank scores onto nodes.
 
-        if not hotspots:
+        Handles both data shapes produced by CallGraphBuilder:
+          - ``hotspots`` is a list of dicts: [{id, pagerank, ...}, ...]
+          - ``nodes``    is a list of dicts: [{id, pagerank, ...}, ...]
+        Falls back to the full ``nodes`` list when hotspots is empty.
+        """
+        raw = graph_data.get("hotspots") or []
+
+        # CallGraphBuilder._compute_hotspots returns list[dict], not dict[str, float].
+        # Build a (node_id → score) mapping regardless of the input shape.
+        if isinstance(raw, dict):
+            # Legacy dict format: {node_id: score}
+            scores: dict[str, float] = {k: float(v) for k, v in raw.items()}
+        elif isinstance(raw, list) and raw:
+            # Current format: [{id: ..., pagerank: ...}, ...]
+            scores = {entry["id"]: float(entry.get("pagerank", 0)) for entry in raw if "id" in entry}
+        else:
+            # hotspots empty — fall back to full nodes list for pagerank scores
+            nodes = graph_data.get("nodes") or []
+            scores = {
+                n["id"]: float(n.get("pagerank", 0))
+                for n in nodes
+                if "id" in n and n.get("pagerank") is not None
+            }
+
+        if not scores:
             return
 
         query = (
             "MATCH (n {id: $id}) "
             "SET n.pagerank = $score"
         )
-        for node_id, score in hotspots.items():
-            neo4j_client.run(query, {"id": node_id, "score": float(score)})
+        for node_id, score in scores.items():
+            neo4j_client.run(query, {"id": node_id, "score": score})
 
     # --- Decision Points -----------------------------------------------
 

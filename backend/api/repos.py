@@ -161,6 +161,7 @@ async def run_analysis(job_id: str, req: AnalyzeRequest):
                 decision_points=decision_points,
                 domain_concepts=domain_concepts,
                 git_decisions=git_decisions,
+                out_dir=_DATA_DIR / repo_name,
             )
 
         # Write graph.json cache for dashboard (used when Neo4j is unavailable)

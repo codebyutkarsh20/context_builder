@@ -29,7 +29,8 @@ _TODO_FIXME_PATTERN: re.Pattern = re.compile(
 )
 
 _CONSTANT_PATTERN: re.Pattern = re.compile(
-    r"^[A-Z][A-Z0-9_]*_(?:LIMIT|MAX|MIN|TIMEOUT|RATE|THRESHOLD|CAP|QUOTA|WINDOW|PERIOD|SIZE|COUNT)$",
+    r"^[A-Z][A-Z0-9_]*_(?:LIMIT|MAX|MIN|TIMEOUT|RATE|THRESHOLD|CAP|QUOTA|"
+    r"WINDOW|PERIOD|SIZE|COUNT|RETRIES|ATTEMPTS|DELAY|INTERVAL|AGE|DAYS|HOURS)$",
 )
 
 # Matches FastAPI/Flask/Django route decorators
@@ -137,8 +138,21 @@ class BusinessLogicExtractor:
     # Per-file extraction
     # ------------------------------------------------------------------
 
+    # File-name patterns that identify test/config files.
+    # Business rules extracted from test files are almost always noise
+    # (e.g. "# TODO: must add more test cases" looks like a rule but isn't).
+    _TEST_PATH_PATTERNS = re.compile(
+        r"(^|[\\/])(tests?|conftest|test_[^/\\]+)([\\/]|$)|test_[^/\\]+\.py$",
+        re.IGNORECASE,
+    )
+
     def _extract_from_file(self, file_record: dict[str, Any]) -> list[_BusinessRule]:
         source_file: str = file_record.get("path", "unknown")
+
+        # Skip test/fixture files — their TODOs and docstrings are not business rules.
+        if self._TEST_PATH_PATTERNS.search(source_file):
+            return []
+
         rules: list[_BusinessRule] = []
 
         # ---- 1. Docstring rules (classes + functions) --------------------

@@ -86,6 +86,7 @@ class PipelineStatus(str, Enum):
     PENDING = "pending"
     INTAKE = "intake"
     CONTEXT = "context_assembly"
+    EXPLORING = "exploring"        # Agentic exploration phase
     LOCALIZING = "localizing"
     READING_SOURCE = "reading_source"
     REPAIRING = "repairing"
@@ -105,7 +106,7 @@ class AgentState(TypedDict, total=False):
     """Full state flowing through the LangGraph pipeline."""
     work_order: dict          # WorkOrder fields
     intent: dict              # IntentAnalysis.model_dump()
-    context: str              # Assembled context from Graph RAG
+    context: str              # Assembled context (from Graph RAG or exploration)
     context_nodes: int        # Number of nodes in context
     source_code: dict         # {file_path: code_string} — actual source of localized files
     localization: dict        # LocalizationResult.model_dump()
@@ -120,3 +121,4 @@ class AgentState(TypedDict, total=False):
     branch_name: str          # Fix branch name
     base_branch: str          # Original branch for PR base
     patches_applied: int      # Number of patches applied
+    exploration_log: list     # Tool calls + results from exploration phase

@@ -74,11 +74,13 @@ def analyze_query(question: str) -> QueryIntent:
 
     intent.mentioned_names = sorted(names)
 
-    # Determine scope
-    if names and any(len(n) > 5 for n in names):
-        intent.scope = "specific"
-    elif _ARCH_HINTS.search(question):
+    # Determine scope.
+    # Architectural hints take priority: a question like "how does the pipeline
+    # architecture work?" has long names but is clearly architectural in intent.
+    if _ARCH_HINTS.search(question):
         intent.scope = "architectural"
+    elif names and any(len(n) > 5 for n in names):
+        intent.scope = "specific"
     else:
         intent.scope = "broad"
 
