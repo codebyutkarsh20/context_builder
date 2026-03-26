@@ -1461,30 +1461,23 @@ def repair_node(state: AgentState) -> AgentState:
     work_order = state.get("work_order", {})
     repo_path = _resolve_repo_path(work_order)
 
-    # Inject one existing test file as a style reference so the agent knows the test conventions
-    if repo_path and not any("test" in k for k in source_code):
+    # Inject the full existing test file for each fault file so the agent
+    # can ADD tests to it rather than replace it entirely.
+    if repo_path:
         tests_dir = repo_path / "tests"
         if not tests_dir.exists():
             tests_dir = repo_path / "test"
         if tests_dir.exists():
             fault_files = localization.get("fault_files", [])
-            # Find a test file that relates to the fault files
-            ref_test = None
+            source_code = dict(source_code)
             for fp in fault_files:
                 stem = Path(fp).stem
                 candidate = tests_dir / f"test_{stem}.py"
-                if candidate.exists():
-                    ref_test = candidate
-                    break
-            if ref_test is None:
-                py_tests = sorted(tests_dir.glob("test_*.py"))
-                if py_tests:
-                    ref_test = py_tests[0]
-            if ref_test:
-                content = _read_file_safe(ref_test, max_lines=80)
-                if content:
-                    source_code = dict(source_code)
-                    source_code[f"tests/{ref_test.name} (style reference — follow this pattern)"] = content
+                key = f"tests/test_{stem}.py (EXISTING TEST FILE — preserve all tests, only ADD new ones)"
+                if candidate.exists() and key not in source_code:
+                    content = _read_file_safe(candidate, max_lines=5000)
+                    if content:
+                        source_code[key] = content
 
     # Build source section
     source_section, _ = _build_source_section(source_code)
@@ -1527,12 +1520,17 @@ CRITICAL INSTRUCTIONS:
 
 UNIT TESTS (REQUIRED — in test_patches field):
 11. You MUST write unit tests for every function you change. This is NOT optional.
-12. Use test_patches to provide the full content of new or updated test files.
-    - file_path: e.g. 'tests/test_feature_flags.py'
-    - original_code: empty string "" if creating a new file, or the EXACT existing content to replace
-    - patched_code: the COMPLETE test file content (all imports, fixtures, and test cases)
-13. Tests must use pytest. Follow the existing test style in the repo (see test files above).
-14. Each test must be focused: one assertion per test, descriptive name, no mocking unless necessary.
+12. Use test_patches to ADD tests to existing test files. CRITICAL RULES:
+    - file_path: the test file path (e.g. 'tests/test_feature_flags.py')
+    - If the test file already exists (shown above labeled "EXISTING TEST FILE"):
+        * original_code: the LAST few lines of the existing file (enough to be unique, ~5 lines)
+        * patched_code: those same last lines PLUS your new test classes/functions appended after
+        * NEVER remove or replace existing tests — only ADD new ones at the end
+    - If creating a brand new test file that does NOT exist yet:
+        * original_code: empty string ""
+        * patched_code: the complete new test file content
+13. Tests must use pytest. Match the style of the existing test file exactly.
+14. Each test must be focused: one assertion per test, descriptive name.
 15. At minimum write tests for: the happy path, the failure case you just fixed, and edge cases."""
 
     MAX_FILE_REQUESTS = 2
