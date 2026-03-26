@@ -19,9 +19,14 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 
 
-def _flags_path(repo_name: str) -> Path:
-    return DATA_DIR / repo_name / "feature_flags.json"
-
+def set_pr_url(repo_name: str, flag_name: str, pr_url: str) -> None:
+    flags = list_flags(repo_name)
+    for flag in flags:
+        if flag["name"] == flag_name:
+            flag["pr_url"] = pr_url
+            _save_flags(repo_name, flags)
+            return
+    logger.warning("Flag %s not found for repo %s", flag_name, repo_name)
 
 def _load_flags(repo_name: str) -> list[dict[str, Any]]:
     path = _flags_path(repo_name)

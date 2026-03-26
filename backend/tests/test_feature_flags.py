@@ -231,8 +231,27 @@ class TestSetPrUrl:
         assert flag["pr_url"] == "https://github.com/org/repo/pull/42"
 
     def test_no_op_for_missing_flag(self, tmp_path):
-        # Should not crash
-        set_pr_url("repo", "nonexistent", "https://github.com/x/y/pull/1")
+        # Should log a warning when flag is not found
+        with unittest.mock.patch("agent.feature_flags.logger") as mock_logger:
+            set_pr_url("repo", "nonexistent", "https://github.com/x/y/pull/1")
+            mock_logger.warning.assert_called_once_with(
+                "Flag %s not found for repo %s", "nonexistent", "repo"
+            )
+
+    def test_no_warning_for_existing_flag(self, tmp_path):
+        # Should NOT log a warning when flag is found
+        name = create_flag("repo", "T-2", "Valid flag", [])
+        with unittest.mock.patch("agent.feature_flags.logger") as mock_logger:
+            set_pr_url("repo", name, "https://example.com/pr/42")
+            mock_logger.warning.assert_not_called()
+
+    def test_no_side_effects_for_missing_flag(self, tmp_path):
+        # flags list should remain unchanged after a missing-flag call
+        name = create_flag("repo", "T-3", "Existing flag", [])
+        flags_before = list_flags("repo")
+        set_pr_url("repo", "nonexistent", "https://github.com/x/y/pull/99")
+        flags_after = list_flags("repo")
+        assert flags_before == flags_after
 
     def test_pr_url_persists(self, tmp_path):
         name = create_flag("repo", "T-1", "Fix", [])
