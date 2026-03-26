@@ -81,8 +81,11 @@ class ContextAssembler:
             related_tokens = _estimate_tokens(related_section)
             budget_left = token_budget - used_tokens
             if related_tokens > budget_left:
-                # Truncate to stay within budget (budget_left * 4 converts tokens → chars)
-                related_section = related_section[:budget_left * 4]
+                # Truncate to stay within budget (max(0, budget_left) * 4 converts
+                # tokens → chars, and the clamp ensures a negative budget_left does
+                # not become a negative slice index that would return the tail of
+                # the string instead of an empty string.
+                related_section = related_section[:max(0, budget_left) * 4]
             if related_section:
                 sections.append(related_section)
                 used_tokens += _estimate_tokens(related_section)
