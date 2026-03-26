@@ -2041,6 +2041,18 @@ def test_node(state: AgentState) -> AgentState:
     # Step 18: Enrich failed test results with business context
     _append_test_business_context(state, work_order)
 
+    # If tests passed and review was CHANGES_REQUESTED only for TESTS, upgrade verdict
+    test_result = state.get("test_result", "")
+    review = state.get("review", {})
+    if test_result.startswith("passed") and review.get("verdict") == "CHANGES_REQUESTED":
+        checks = review.get("checks", [])
+        non_test_fails = [c for c in checks if c.get("status") == "FAIL" and c.get("name", "").upper() != "TESTS"]
+        if not non_test_fails:
+            review = dict(review)
+            review["verdict"] = "APPROVE"
+            state["review"] = review
+            logger.info("Upgraded review verdict to APPROVE — tests now pass")
+
     return state
 
 
