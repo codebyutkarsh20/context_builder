@@ -60,7 +60,7 @@ def create_flag(
 
     Returns the generated flag name.
     """
-    flag_name = f"fix_{ticket_id}_{_slugify(description)}"
+    flag_name = f"fix_{_slugify(ticket_id)}_{_slugify(description)}"
     flags = _load_flags(repo_name)
 
     # Avoid duplicates — if a flag with the same name exists, return it.
