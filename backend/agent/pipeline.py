@@ -1631,8 +1631,10 @@ patched_code must fix the stated root cause."""
         if not raw_patches and focused_source:
             logger.warning("No patches on first try — retrying with targeted prompt")
             explanation = repair_dump.get("explanation", "")
-            fault_file = localization.get("fault_files", [""])[0]
-            fault_fn = localization.get("fault_functions", [""])[0]
+            fault_files_list = localization.get("fault_files") or [""]
+            fault_fns_list = localization.get("fault_functions") or [""]
+            fault_file = fault_files_list[0] if fault_files_list else ""
+            fault_fn = fault_fns_list[0] if fault_fns_list else ""
 
             retry_prompt = f"""Patches array was empty. You must produce patches.
 
