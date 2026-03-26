@@ -113,8 +113,9 @@ def get_flag(repo_name: str, flag_name: str) -> dict[str, Any] | None:
 def set_pr_url(repo_name: str, flag_name: str, pr_url: str) -> None:
     """Update the pr_url field after PR creation succeeds."""
     flags = _load_flags(repo_name)
-    for f in flags:
-        if f["name"] == flag_name:
-            f["pr_url"] = pr_url
-            _save_flags(repo_name, flags)
+    for flag in flags:
+        if flag["name"] == flag_name:
+            flag["pr_url"] = pr_url
+            _write_flags(repo_name, flags)
             return
+    logger.warning("Flag %s not found for repo %s", flag_name, repo_name)
