@@ -127,7 +127,7 @@ class GraphRAGRetriever:
         if not enriched:
             return []
 
-        terms = [name.lower() for name in intent.mentioned_names if len(name) >= 3]
+        terms = [name.lower() for name in intent.mentioned_names if name is not None and len(name) >= 3]
         if not terms:
             return []
 
