@@ -863,13 +863,13 @@ def _load_graph_data(repo_name: str) -> tuple[dict, dict]:
         if graph_path.exists():
             graph_data = json.loads(graph_path.read_text())
     except Exception as e:
-        logger.debug("Failed to load graph.json: %s", e)
+        logger.warning("Failed to load graph.json: %s", e)
     try:
         enriched_path = DATA_DIR / repo_name / "enriched_nodes.json"
         if enriched_path.exists():
             enriched = json.loads(enriched_path.read_text())
     except Exception as e:
-        logger.debug("Failed to load enriched_nodes.json: %s", e)
+        logger.warning("Failed to load enriched_nodes.json: %s", e)
     return graph_data, enriched
 
 
