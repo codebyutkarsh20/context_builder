@@ -12,6 +12,7 @@ import {
 } from '../lib/api'
 
 const MAX_ITERATIONS = 3
+const MAX_POLL_COUNT = 900 // 30 min × (2s interval)
 
 // ─── Pipeline stage config ──────────────────────────────────────────────────
 
@@ -233,10 +234,14 @@ export default function AgentPage() {
   const [error, setError] = useState<string | null>(null)
   const [pastJobs, setPastJobs] = useState<AgentJobStatus[]>([])
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const pollCountRef = useRef(0)
 
   // Custom ticket form
+  const [customTicketId, setCustomTicketId] = useState('')
   const [customTitle, setCustomTitle] = useState('')
   const [customDesc, setCustomDesc] = useState('')
+  const [customComponent, setCustomComponent] = useState('')
+  const [customRepoPath, setCustomRepoPath] = useState('')
   const [showCustom, setShowCustom] = useState(false)
 
   useEffect(() => {
@@ -254,7 +259,17 @@ export default function AgentPage() {
 
   const pollJob = useCallback((id: string) => {
     if (pollRef.current) clearInterval(pollRef.current)
+    pollCountRef.current = 0
     pollRef.current = setInterval(async () => {
+      pollCountRef.current += 1
+      if (pollCountRef.current > MAX_POLL_COUNT) {
+        if (pollRef.current) clearInterval(pollRef.current)
+        pollRef.current = null
+        setRunningTicketId(null)
+        clearJobStorage()
+        setError('Agent pipeline timed out after 30 minutes — check backend logs')
+        return
+      }
       try {
         const status = await getAgentJobStatus(id)
         setActiveJob(status)
@@ -321,16 +336,21 @@ export default function AgentPage() {
     setActiveJob(null)
     try {
       const res = await runAgentTicket({
+        ticket_id: customTicketId.trim() || undefined,
         title: customTitle,
         description: customDesc,
         repo_name: activeRepo,
-        repo_path: activeRepoData?.repo_path,
+        repo_path: customRepoPath.trim() || activeRepoData?.repo_path,
+        affected_component: customComponent.trim() || undefined,
       })
       saveJobToStorage(res.job_id, 'custom')
       setActiveJob({ job_id: res.job_id, status: 'pending', stage: 'Queued', iteration_count: 0, result: null, error: '' })
       pollJob(res.job_id)
+      setCustomTicketId('')
       setCustomTitle('')
       setCustomDesc('')
+      setCustomComponent('')
+      setCustomRepoPath('')
       setShowCustom(false)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to start agent')
@@ -513,20 +533,45 @@ export default function AgentPage() {
             {/* Custom ticket form */}
             {showCustom && (
               <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 mb-3 space-y-3">
-                <input
-                  type="text"
-                  value={customTitle}
-                  onChange={(e) => setCustomTitle(e.target.value)}
-                  placeholder="Bug title (e.g., 500 error on checkout)"
-                  className="w-full px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={customTicketId}
+                    onChange={(e) => setCustomTicketId(e.target.value)}
+                    placeholder="Ticket ID (e.g. PROJ-1001)"
+                    className="w-40 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none font-mono"
+                  />
+                  <input
+                    type="text"
+                    value={customTitle}
+                    onChange={(e) => setCustomTitle(e.target.value)}
+                    placeholder="Bug title (e.g., 500 error on checkout) *"
+                    className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none"
+                  />
+                </div>
                 <textarea
                   value={customDesc}
                   onChange={(e) => setCustomDesc(e.target.value)}
-                  placeholder="Description of the bug..."
-                  rows={3}
+                  placeholder="Full bug description — include reproduction steps and expected vs actual behavior..."
+                  rows={4}
                   className="w-full px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none resize-none"
                 />
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={customComponent}
+                    onChange={(e) => setCustomComponent(e.target.value)}
+                    placeholder="Affected file/component (e.g. agent/feature_flags.py)"
+                    className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none font-mono"
+                  />
+                  <input
+                    type="text"
+                    value={customRepoPath}
+                    onChange={(e) => setCustomRepoPath(e.target.value)}
+                    placeholder={activeRepoData?.repo_path ?? 'Repo path (overrides default)'}
+                    className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none font-mono"
+                  />
+                </div>
                 <button
                   onClick={handleRunCustom}
                   disabled={isRunning || !customTitle.trim() || !activeRepo}
@@ -587,11 +632,33 @@ export default function AgentPage() {
                         {job.status === 'escalated' && <AlertTriangle className="w-3.5 h-3.5 text-yellow-400" />}
                         {(job.status === 'running' || job.status === 'pending') && <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin" />}
                         <span className="text-xs font-mono text-zinc-400">{job.job_id.slice(0, 8)}</span>
+                        {job.result?.review?.verdict && (
+                          <span className={cn('text-[10px] px-1.5 py-0.5 rounded border font-medium',
+                            job.result.review.verdict === 'APPROVE' ? 'bg-green-500/10 text-green-400 border-green-500/20' :
+                            job.result.review.verdict === 'ESCALATE' ? 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20' :
+                            'bg-zinc-700 text-zinc-400 border-zinc-600'
+                          )}>{job.result.review.verdict}</span>
+                        )}
                       </div>
-                      <span className="text-[10px] text-zinc-600">{job.status}</span>
+                      <span className="text-[10px] text-zinc-600 font-mono">{job.status}</span>
                     </div>
-                    {job.result?.repair?.explanation && (
+                    {job.result?.localization?.root_cause_hypothesis && (
+                      <p className="text-xs text-zinc-500 mt-1 truncate">{job.result.localization.root_cause_hypothesis}</p>
+                    )}
+                    {job.result?.repair?.explanation && !job.result?.localization?.root_cause_hypothesis && (
                       <p className="text-xs text-zinc-500 mt-1 truncate">{job.result.repair.explanation}</p>
+                    )}
+                    {job.result?.pr_url && (
+                      <a
+                        href={job.result.pr_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        className="mt-1.5 flex items-center gap-1 text-[10px] text-green-500 hover:text-green-400 font-mono hover:underline"
+                      >
+                        <GitPullRequest className="w-3 h-3" />
+                        {job.result.pr_url}
+                      </a>
                     )}
                   </div>
                 ))}

@@ -129,10 +129,10 @@ export default function Context() {
 
           {/* Viewer */}
           <div className="flex-1 overflow-hidden">
-            {fullError && (
+            {(fullError || layersError) && (
               <div className="m-4 flex items-center gap-3 p-4 rounded-xl bg-red-950/30 border border-red-800/40 text-red-400">
                 <AlertCircle className="w-5 h-5 flex-shrink-0" />
-                <p className="text-sm">{fullError}</p>
+                <p className="text-sm">{fullError ?? layersError}</p>
               </div>
             )}
             <ContextViewer

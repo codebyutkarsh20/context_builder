@@ -1,0 +1,29 @@
+[
+  {
+    "ticket_id": "PROJ-1001",
+    "title": "Feature flag toggle is inverted — enabling a flag disables it instead",
+    "description": "When calling toggle_flag(enabled=True), the flag is being disabled instead of enabled. Conversely, toggle_flag(enabled=False) enables the flag. Reproduction: (1) Create a flag (starts as enabled=false), (2) Call toggle with enabled=true, (3) Fetch flag — it is still false. The logic inversion is in agent/feature_flags.py inside the toggle_flag function.",
+    "repo_name": "context_builder",
+    "priority": "high",
+    "affected_component": "agent/feature_flags.py",
+    "comments": ["Reported by ops team after hotfix deploy failed to activate"]
+  },
+  {
+    "ticket_id": "PROJ-1002",
+    "title": "Search results show scores above 100% for exact matches",
+    "description": "The search result cards in the UI display match scores like '120% match' for exact keyword hits. The backend returns raw scores > 1.0 for perfect matches, but the frontend multiplies by 100 without capping at 100, causing misleading percentages.",
+    "repo_name": "context_builder",
+    "priority": "low",
+    "affected_component": "frontend/src/pages/Search.tsx",
+    "comments": []
+  },
+  {
+    "ticket_id": "PROJ-1003",
+    "title": "Graph page shows stale data when switching repos quickly",
+    "description": "If the user clicks between two repos in quick succession on the Graph page, the second repo's graph occasionally loads data from the first repo. The race condition is in the getGraph() call in Graph.tsx — no request ID tracking, so whichever request resolves last wins.",
+    "repo_name": "context_builder",
+    "priority": "medium",
+    "affected_component": "frontend/src/pages/Graph.tsx",
+    "comments": ["Repros consistently on slow connections"]
+  }
+]

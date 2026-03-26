@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import {
   BookOpen, HelpCircle, CheckCircle2, Shield,
-  ChevronDown, ChevronRight, FileCode, Send, Loader2, BarChart3, Plus, X,
+  ChevronDown, ChevronRight, FileCode, Send, Loader2, BarChart3, Plus, X, AlertCircle,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { useRepo } from '../lib/RepoContext'
@@ -64,15 +64,17 @@ function QuestionCard({ q, repo, onAnswered }: {
   const [ruleType, setRuleType] = useState('policy')
   const [severity, setSeverity] = useState('medium')
   const [submitting, setSubmitting] = useState(false)
+  const [submitError, setSubmitError] = useState<string | null>(null)
 
   const handleSubmit = async () => {
     if (!answer.trim()) return
     setSubmitting(true)
+    setSubmitError(null)
     try {
       await submitAnswer(repo, q.id, answer, ruleType, severity)
       onAnswered()
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Failed to submit')
+      setSubmitError(e instanceof Error ? e.message : 'Failed to submit')
     } finally {
       setSubmitting(false)
     }
@@ -142,6 +144,11 @@ function QuestionCard({ q, repo, onAnswered }: {
                   ))}
                 </div>
               )}
+              {submitError && (
+                <div className="flex items-center gap-2 p-2 rounded-lg bg-red-950/30 border border-red-800/40 text-red-400 text-xs">
+                  <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />{submitError}
+                </div>
+              )}
               <div className="flex items-center gap-3">
                 <select value={ruleType} onChange={(e) => setRuleType(e.target.value)}
                   className="text-xs bg-zinc-800 border border-zinc-700 text-zinc-300 rounded-lg px-2 py-1.5">
@@ -178,16 +185,18 @@ function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () =>
   const [file, setFile] = useState('')
   const [constraint, setConstraint] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [modalError, setModalError] = useState<string | null>(null)
 
   const handleSubmit = async () => {
     if (!description.trim()) return
     setSubmitting(true)
+    setModalError(null)
     try {
       await addRule(repo, { description, rule_type: ruleType, severity, file, constraint })
       onAdded()
       onClose()
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Failed to add rule')
+      setModalError(e instanceof Error ? e.message : 'Failed to add rule')
     } finally {
       setSubmitting(false)
     }
@@ -258,6 +267,11 @@ function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () =>
             </div>
           </div>
         </div>
+        {modalError && (
+          <div className="mx-5 mb-3 flex items-center gap-2 p-2.5 rounded-lg bg-red-950/30 border border-red-800/40 text-red-400 text-xs">
+            <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />{modalError}
+          </div>
+        )}
         <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-zinc-800">
           <button onClick={onClose} className="px-4 py-1.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors">
             Cancel

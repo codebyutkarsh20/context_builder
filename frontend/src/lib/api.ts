@@ -102,25 +102,42 @@ export interface SearchResult {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+type RequestOptions = RequestInit & { timeout?: number }
+
+async function request<T>(path: string, options?: RequestOptions): Promise<T> {
+  const { timeout = 30_000, ...fetchOptions } = options ?? {}
   const url = `${BASE_URL}${path}`
-  const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
-    ...options,
-  })
 
-  if (!res.ok) {
-    let message = `HTTP ${res.status}`
-    try {
-      const body = await res.json()
-      message = body.detail ?? body.message ?? message
-    } catch {
-      // ignore parse errors
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeout)
+
+  try {
+    const res = await fetch(url, {
+      headers: { 'Content-Type': 'application/json', ...fetchOptions.headers },
+      signal: controller.signal,
+      ...fetchOptions,
+    })
+
+    if (!res.ok) {
+      let message = `HTTP ${res.status}`
+      try {
+        const body = await res.json()
+        message = body.detail ?? body.message ?? message
+      } catch {
+        // ignore parse errors
+      }
+      throw new Error(message)
     }
-    throw new Error(message)
-  }
 
-  return res.json() as Promise<T>
+    return res.json() as Promise<T>
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      throw new Error('Request timed out — the server took too long to respond')
+    }
+    throw e
+  } finally {
+    clearTimeout(timeoutId)
+  }
 }
 
 // ─── API Functions ────────────────────────────────────────────────────────────
@@ -275,6 +292,7 @@ export function chatAsk(
   return request<ChatResponse>('/api/chat', {
     method: 'POST',
     body: JSON.stringify({ repo, question, history }),
+    timeout: 120_000, // 2 min — LLM call can be slow
   })
 }
 
@@ -333,15 +351,18 @@ export function runMockTicket(ticketId: string): Promise<{ job_id: string; statu
 }
 
 export function runAgentTicket(ticket: {
+  ticket_id?: string
   title: string
   description: string
   repo_name: string
   repo_path?: string
   priority?: string
+  affected_component?: string
 }): Promise<{ job_id: string; status: string }> {
   return request<{ job_id: string; status: string }>('/api/agent/run', {
     method: 'POST',
     body: JSON.stringify(ticket),
+    timeout: 10_000, // POST returns immediately with job_id
   })
 }
 

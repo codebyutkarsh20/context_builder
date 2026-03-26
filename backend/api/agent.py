@@ -8,6 +8,7 @@ import logging
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -152,11 +153,15 @@ def list_agent_jobs() -> list[dict]:
     return jobs
 
 
+_SAMPLE_TICKETS_PATH = Path(__file__).parent.parent / "agent" / "intake" / "sample_tickets.json"
+# Resolves to: backend/agent/intake/sample_tickets.json
+
+
 @router.get("/agent/tickets")
 def list_mock_tickets() -> list[dict]:
     """List available mock bug tickets for testing."""
     from agent.intake.mock_jira import load_tickets
-    return load_tickets()
+    return load_tickets(_SAMPLE_TICKETS_PATH)
 
 
 @router.post("/agent/run-mock/{ticket_id}")
@@ -164,7 +169,7 @@ def run_mock_ticket(ticket_id: str) -> dict:
     """Run a specific mock ticket through the pipeline."""
     from agent.intake.mock_jira import get_ticket
 
-    ticket = get_ticket(ticket_id)
+    ticket = get_ticket(ticket_id, _SAMPLE_TICKETS_PATH)
     if not ticket:
         raise HTTPException(status_code=404, detail=f"Mock ticket '{ticket_id}' not found")
 

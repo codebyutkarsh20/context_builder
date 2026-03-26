@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { X, GitGraph, AlertCircle, ChevronRight, FileCode, Hash, Network, ArrowDownToLine, ArrowUpFromLine } from 'lucide-react'
 import { cn, formatNumber, truncate } from '../lib/utils'
 import KnowledgeGraph, { NODE_COLORS, EDGE_COLORS, type KnowledgeGraphControls } from '../components/KnowledgeGraph'
@@ -316,23 +316,26 @@ export default function Graph() {
   const [error, setError] = useState<string | null>(null)
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
   const jumpToNodeRef = useRef<KnowledgeGraphControls | null>(null)
+  // Tracks the latest request so stale responses are ignored
+  const reqId = useRef(0)
 
   useEffect(() => {
     if (!activeRepo) return
+    const id = ++reqId.current
     setLoading(true)
     setError(null)
     setSelectedNode(null)
     const layer = layerFilter !== 'all' ? layerFilter : undefined
     getGraph(activeRepo, layer, 5000)
-      .then(setGraphData)
-      .catch((e: Error) => setError(e.message))
-      .finally(() => setLoading(false))
+      .then((data) => { if (id === reqId.current) setGraphData(data) })
+      .catch((e: Error) => { if (id === reqId.current) setError(e.message) })
+      .finally(() => { if (id === reqId.current) setLoading(false) })
   }, [activeRepo, layerFilter])
 
-  const handleJump = (node: GraphNode) => {
+  const handleJump = useCallback((node: GraphNode) => {
     setSelectedNode(node)
     jumpToNodeRef.current?.jumpToNode(node)
-  }
+  }, [])
 
   if (!activeRepo) {
     return (

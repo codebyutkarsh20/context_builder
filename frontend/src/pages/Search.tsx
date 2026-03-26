@@ -95,7 +95,7 @@ function ResultCard({ result, query }: ResultCardProps) {
           </h3>
         </div>
         <span className="text-xs text-zinc-500 flex-shrink-0 font-mono">
-          {(result.score * 100).toFixed(0)}% match
+          {Math.min(Math.round(result.score * 100), 100)}% match
         </span>
       </div>
 
@@ -147,6 +147,7 @@ export default function Search() {
     async (q: string) => {
       if (!activeRepo || !q.trim()) {
         setResults([])
+        setError(null)
         setSearched(false)
         return
       }
