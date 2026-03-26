@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -322,7 +323,7 @@ def _run_tests(worktree_path: Path) -> str:
        (worktree_path / "pyproject.toml").exists() or \
        (worktree_path / "setup.py").exists() or \
        (worktree_path / "setup.cfg").exists():
-        cmd = ["python3", "-m", "pytest", "--tb=short", "-q"]
+        cmd = [sys.executable, "-m", "pytest", "--tb=short", "-q"]
     elif (worktree_path / "package.json").exists():
         cmd = ["npm", "test"]
     elif (worktree_path / "Makefile").exists():

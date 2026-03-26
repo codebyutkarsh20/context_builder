@@ -642,6 +642,10 @@ def check_syntax(file_path: str) -> str:
         return f"ERROR: {e}"
 
 
+# Exploration tools — READ-ONLY. The agent uses these to understand the codebase.
+# string_replace and check_syntax are intentionally excluded: direct edits during
+# exploration leave the main repo dirty, which blocks git worktree creation in the
+# test node. Patching happens exclusively in the repair stage via the sandbox worktree.
 ALL_TOOLS = [
     grep_repo,
     read_file,
@@ -651,8 +655,6 @@ ALL_TOOLS = [
     get_function_info,
     get_file_summary,
     get_file_structure,
-    string_replace,
-    check_syntax,
 ]
 
 
