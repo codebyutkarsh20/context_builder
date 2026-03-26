@@ -70,7 +70,9 @@ class ContextAssembler:
             # Primary alone exceeds budget: truncate it to fit rather than
             # skipping it entirely, which would produce context with no primary
             # matches at all.
-            chars_left = (token_budget - used_tokens) * 4
+            # Clamp to 0 so that a negative budget yields an empty string
+            # instead of a tail-truncated substring (Python negative slice bug).
+            chars_left = max(0, (token_budget - used_tokens) * 4)
             truncated = primary_section[:chars_left]
             sections.append(truncated)
             used_tokens += _estimate_tokens(truncated)
@@ -81,8 +83,9 @@ class ContextAssembler:
             related_tokens = _estimate_tokens(related_section)
             budget_left = token_budget - used_tokens
             if related_tokens > budget_left:
-                # Truncate to stay within budget (budget_left * 4 converts tokens → chars)
-                related_section = related_section[:budget_left * 4]
+                # Truncate to stay within budget (budget_left * 4 converts tokens → chars).
+                # Clamp to 0 to avoid negative slice indices.
+                related_section = related_section[:max(0, budget_left * 4)]
             if related_section:
                 sections.append(related_section)
                 used_tokens += _estimate_tokens(related_section)
