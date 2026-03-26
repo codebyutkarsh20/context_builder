@@ -1697,6 +1697,16 @@ def test_node(state: AgentState) -> AgentState:
         if not non_test_fails:
             review = dict(review)
             review["verdict"] = "APPROVE"
+            # Also update the TESTS check status so the UI shows green
+            updated_checks = []
+            for c in checks:
+                c = dict(c)
+                if c.get("name", "").upper() == "TESTS" and c.get("status") == "FAIL":
+                    c["status"] = "PASS"
+                    c["comment"] = f"Tests passed after fix: {test_result.splitlines()[0]}"
+                updated_checks.append(c)
+            review["checks"] = updated_checks
+            review["feedback"] = ""
             state["review"] = review
             logger.info("Upgraded review verdict to APPROVE — tests now pass")
 
