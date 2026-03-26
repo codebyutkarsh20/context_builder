@@ -127,12 +127,13 @@ class GraphRAGRetriever:
         if not enriched:
             return []
 
-        terms = [name.lower() for name in intent.mentioned_names if len(name) >= 3]
+        terms = [name.lower() for name in intent.mentioned_names if name and len(name) >= 3]
         if not terms:
             return []
 
         results: list[ScoredNode] = []
         for node_id, node in enriched.items():
+            # Guard against None values for name, docstring, and file fields
             name = (node.get("name") or "").lower()
             doc = (node.get("docstring") or "").lower()
             file_path = (node.get("file") or "").lower()
@@ -143,7 +144,7 @@ class GraphRAGRetriever:
             for term in terms:
                 if term == name:
                     score += 1.0
-                elif name.startswith(term) or term.startswith(name):
+                elif name and (name.startswith(term) or term.startswith(name)):
                     score += 0.7
                 elif term in name:
                     score += 0.5
@@ -154,7 +155,7 @@ class GraphRAGRetriever:
 
             if score > 0:
                 # Boost by PageRank
-                pr = float(node.get("pagerank", 0))
+                pr = float(node.get("pagerank") or 0)
                 if pr > 0:
                     import math
                     score *= (1 + math.log1p(pr * 10000))
@@ -163,7 +164,7 @@ class GraphRAGRetriever:
                     id=node_id,
                     score=score,
                     source="keyword",
-                    metadata={"type": node.get("type", ""), "name": node.get("name", "")},
+                    metadata={"type": node.get("type") or "", "name": node.get("name") or ""},
                 ))
 
         results.sort(key=lambda x: x.score, reverse=True)
