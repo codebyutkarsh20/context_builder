@@ -155,7 +155,7 @@ class ContextAssembler:
         return "\n".join(parts)
 
     def _render_function_detail(self, node: dict) -> str:
-        params = ", ".join(node.get("params", []))
+        params = ", ".join(node.get("params") or [])
         ret = f" -> {node['return_type']}" if node.get("return_type") else ""
         doc = node.get("docstring", "")
 
@@ -200,7 +200,7 @@ class ContextAssembler:
             file_path = node.get("file", "")
 
             if ntype == "function":
-                params = ", ".join(node.get("params", []))
+                params = ", ".join(node.get("params") or [])
                 ret = f" -> {node['return_type']}" if node.get("return_type") else ""
                 desc = f" — {doc}" if doc else ""
                 lines.append(f"- `{name}({params}){ret}` ({file_path}){desc}")
