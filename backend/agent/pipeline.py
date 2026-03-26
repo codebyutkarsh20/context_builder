@@ -838,6 +838,20 @@ def _read_file_safe(file_path: Path, max_lines: int = 500, focus_lines: list[int
         return None
 
 
+def _strip_gap_markers(content: str) -> str:
+    """Remove gap-marker lines inserted by _read_file_safe windowing.
+
+    Gap markers look like '# ... (lines X-Y omitted) ...' or '# ... (N more lines)'.
+    They are injected for display but must NOT appear in source sent to the repair LLM,
+    because the LLM will copy them into original_code causing patch mismatches.
+    """
+    import re as _re
+    lines = content.splitlines()
+    cleaned = [l for l in lines if not _re.match(r'\s*#\s*\.\.\.\s*\(lines? ', l)
+               and not _re.match(r'\s*#\s*\.\.\.\s*\(\d+ more lines', l)]
+    return '\n'.join(cleaned)
+
+
 def _find_file_in_repo(repo_path: Path, rel_path: str) -> Path | None:
     """Resolve a relative path to an actual file in the repo."""
     candidates = [
@@ -1107,8 +1121,10 @@ def read_source_node(state: AgentState) -> AgentState:
             for m in _re.finditer(r'lines?\s+(\d+)', root_cause):
                 focus_lines.append(int(m.group(1)))
 
-            content = _read_file_safe(resolved, max_lines=800, focus_lines=focus_lines or None)
+            content = _read_file_safe(resolved, max_lines=3000, focus_lines=focus_lines or None)
             if content:
+                # Strip gap markers so LLM sees only real source lines it can copy from
+                content = _strip_gap_markers(content)
                 source_code[rel_path] = content
                 logger.info("Read fault file: %s (%d lines, %d focus points)",
                            rel_path, len(content.split('\n')), len(focus_lines))
@@ -1127,8 +1143,9 @@ def read_source_node(state: AgentState) -> AgentState:
             continue
         resolved = _find_file_in_repo(repo_path, rel)
         if resolved:
-            content = _read_file_safe(resolved, max_lines=400)
+            content = _read_file_safe(resolved, max_lines=3000)
             if content:
+                content = _strip_gap_markers(content)
                 source_code[f"{rel} (caller)"] = content
                 logger.info("Read caller: %s (%d lines)", rel, len(content.split('\n')))
 
@@ -1225,7 +1242,7 @@ def _verify_and_fix_patches(
             failed_patches.append(patch)
             continue
 
-        content = _read_file_safe(resolved, max_lines=2000)
+        content = _read_file_safe(resolved, max_lines=10000)
         if not content:
             failed_patches.append(patch)
             continue
@@ -1308,8 +1325,20 @@ You MUST produce patches where original_code is an EXACT character-for-character
                 retry_result = _structured_call("claude-sonnet-4-6", 8000, RepairResult, retry_prompt)
                 for rp in retry_result.patches:
                     rp_dict = rp.model_dump()
-                    if rp_dict.get("original_code", "").strip() != rp_dict.get("patched_code", "").strip():
+                    orig = rp_dict.get("original_code", "").strip()
+                    patched_c = rp_dict.get("patched_code", "").strip()
+                    if orig == patched_c:
+                        continue
+                    # Verify against the actual file content we sent
+                    fp_key = rp_dict.get("file_path", "")
+                    actual = extra_source.get(fp_key, "")
+                    if actual and _fuzzy_match_replace(actual, rp_dict["original_code"], rp_dict["patched_code"]) is not None:
                         verified.append(rp_dict)
+                        logger.info("Full retry patch verified: %s", fp_key)
+                    elif actual:
+                        logger.warning("Full retry patch still does not match: %s", fp_key)
+                    else:
+                        verified.append(rp_dict)  # No content to verify against
                 if verified:
                     logger.info("Full retry produced %d patches", len(verified))
             except Exception as e:
@@ -1718,6 +1747,9 @@ Set verdict to:
         # Use Opus for deeper reasoning — worth the cost for catching subtle issues
         result = _structured_call("claude-opus-4-6", 3000, ReviewResult, prompt)
         state["review"] = result.model_dump()
+        logger.info("Review verdict: %s (%.0f%%) — %s",
+                    result.verdict, result.confidence * 100,
+                    result.feedback or ", ".join(f"{c.name}:{c.status}" for c in result.checks))
     except Exception as e:
         logger.error("Opus review failed, falling back to Sonnet: %s", e)
         try:
