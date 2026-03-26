@@ -215,6 +215,14 @@ class Summarizer:
                 text = block.text.strip()
                 break
 
+        if not text:
+            logger.warning(
+                "No text content found in API response for functions in '%s'; "
+                "skipping summarization for this file.",
+                file_path,
+            )
+            return {}
+
         # Parse "function_name: description" lines
         results: dict[str, str] = {}
         fn_id_map = {fn["name"]: fn["id"] for fn in functions}
