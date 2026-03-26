@@ -1184,6 +1184,30 @@ def read_source_node(state: AgentState) -> AgentState:
     return state
 
 
+def _extract_function_source(source: str, function_name: str, context_lines: int = 2) -> str | None:
+    """Extract a single named function from source using AST.
+
+    Returns just the function body (plus a few context lines) so the repair
+    LLM sees only what it needs to change — not the entire file.
+    Falls back to None if AST parse fails or function not found.
+    """
+    import ast as _ast
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return None
+
+    src_lines = source.splitlines()
+
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            if node.name == function_name:
+                start = max(0, node.lineno - 1 - context_lines)
+                end = min(len(src_lines), getattr(node, "end_lineno", node.lineno) + context_lines)
+                return "\n".join(src_lines[start:end])
+    return None
+
+
 def _build_source_section(source_code: dict) -> tuple[str, str]:
     """Build the source code prompt section from loaded source files."""
     source_section = ""
@@ -1202,11 +1226,14 @@ def _build_source_section(source_code: dict) -> tuple[str, str]:
             business_rules_section = code
             continue
         lines = code.split('\n')
-        max_lines = 400
+        # Fault files may already be pre-extracted to just target functions (short).
+        # Callers/requested files truncate more aggressively to keep total tokens down.
+        is_caller = "(caller)" in fpath or "(requested)" in fpath
+        max_lines = 400 if is_caller else 200
         truncated = '\n'.join(lines[:max_lines])
         if len(lines) > max_lines:
             truncated += f"\n# ... truncated ({len(lines) - max_lines} more lines)"
-        if "(caller)" in fpath or "(requested)" in fpath:
+        if is_caller:
             caller_parts.append(f"\n--- {fpath} ---\n{truncated}\n")
         else:
             fault_parts.append(f"\n--- {fpath} ---\n{truncated}\n")
@@ -1279,19 +1306,24 @@ def _verify_and_fix_patches(
             if not actual:
                 continue
 
-            retry_prompt = f"""Your previous patch for {fp['file_path']} does NOT match the actual file content.
-The original_code you provided is not found in the file.
+            # Try to extract just the target function to send in retry (Research #23)
+            fault_fns = localization.get("fault_functions", [])
+            fn_extract = ""
+            for fn_name in fault_fns:
+                fn_src = _extract_function_source(actual, fn_name)
+                if fn_src:
+                    fn_extract += f"\n\n# function: {fn_name}\n{fn_src}"
+            target_section = fn_extract if fn_extract else chr(10).join(actual.split(chr(10))[:150])
 
-ACTUAL FILE CONTENT (first 200 lines):
-{chr(10).join(actual.split(chr(10))[:200])}
+            retry_prompt = f"""Your patch for `{fp['file_path']}` did not match. Here is the actual source.
 
 BUG: {intent.get('actual_behavior', '')}
 ROOT CAUSE: {localization.get('root_cause_hypothesis', '')}
-YOUR INTENDED FIX: {fp.get('explanation', fp.get('patched_code', '')[:200])}
 
-Generate a SINGLE corrected patch for this file.
-The original_code MUST be an exact substring from the ACTUAL FILE CONTENT above.
-Copy it character-for-character including whitespace."""
+ACTUAL SOURCE:
+{target_section}
+
+Produce a patch where original_code is copied EXACTLY from ACTUAL SOURCE above (start from `def`)."""
 
             try:
                 retry_result = _structured_call("claude-sonnet-4-6", 4000, RepairResult, retry_prompt)
@@ -1324,17 +1356,29 @@ Copy it character-for-character including whitespace."""
             for fpath, content in extra_source.items():
                 combined[fpath] = content  # Replace with full actual content
 
-            source_section, _ = _build_source_section(combined)
-            retry_prompt = f"""ALL your previous patches failed — none of them matched the actual source code.
-
-Here is the ACTUAL source code (re-read from disk). Generate new patches using EXACT substrings from this code.
+            # Build focused section from actual file content (Research #23)
+            fault_fns = localization.get("fault_functions", [])
+            focused_actual: dict = {}
+            for fpath, content in extra_source.items():
+                clean = _strip_gap_markers(content)
+                if fault_fns:
+                    parts = [src for fn in fault_fns if (src := _extract_function_source(clean, fn))]
+                    focused_actual[fpath] = "\n\n".join(parts) if parts else clean
+                else:
+                    focused_actual[fpath] = clean
+            for fpath, content in combined.items():
+                if fpath not in focused_actual:
+                    focused_actual[fpath] = content
+            source_section, _ = _build_source_section(focused_actual)
+            retry_prompt = f"""All patches failed to match. Below is the ACTUAL source re-read from disk.
 
 BUG: {intent.get('actual_behavior', '')}
 ROOT CAUSE: {localization.get('root_cause_hypothesis', '')}
+TARGET FUNCTIONS: {fault_fns} in {localization.get('fault_files', [])}
 {feedback_section}
 {source_section}
 
-You MUST produce patches where original_code is an EXACT character-for-character substring from the source above."""
+Produce patches where original_code starts from the `def` line and is an EXACT substring of the source above."""
 
             try:
                 retry_result = _structured_call("claude-sonnet-4-6", 8000, RepairResult, retry_prompt)
@@ -1479,8 +1523,30 @@ def repair_node(state: AgentState) -> AgentState:
                     if content:
                         source_code[key] = content
 
-    # Build source section
-    source_section, _ = _build_source_section(source_code)
+    # Build focused source section — send only target functions, not entire files (Research #23, #4)
+    fault_functions = localization.get("fault_functions", [])
+    focused_source: dict = {}
+    for fpath, code in source_code.items():
+        is_caller = "(caller)" in fpath or "(requested)" in fpath
+        is_test = "EXISTING TEST FILE" in fpath
+        if is_caller or is_test:
+            focused_source[fpath] = code  # callers + test files stay full
+            continue
+        # For fault files: extract just the target functions
+        if fault_functions:
+            clean = _strip_gap_markers(code)
+            extracted_parts: list[str] = []
+            for fn_name in fault_functions:
+                fn_src = _extract_function_source(clean, fn_name)
+                if fn_src:
+                    extracted_parts.append(fn_src)
+                    logger.info("Extracted function %s from %s (%d chars)", fn_name, fpath, len(fn_src))
+            if extracted_parts:
+                focused_source[fpath] = "\n\n".join(extracted_parts)
+                continue
+        focused_source[fpath] = _strip_gap_markers(code)  # fallback: full file, no gap markers
+
+    source_section, _ = _build_source_section(focused_source)
     if not source_section:
         ctx = state.get("context", "")
         source_section = f"\n\nCODEBASE CONTEXT (summaries only):\n{ctx[:6000]}"
@@ -1488,54 +1554,40 @@ def repair_node(state: AgentState) -> AgentState:
     # Include review feedback + test failure output on retry
     feedback_section = ""
     if previous_review.get("feedback"):
-        feedback_section = f"\nPREVIOUS REVIEW FEEDBACK (address these issues):\n{previous_review['feedback']}\n"
+        feedback_section = f"\nPREVIOUS REVIEW FEEDBACK:\n{previous_review['feedback'][:500]}\n"
     test_result = state.get("test_result", "")
     if test_result and "fail" in test_result.lower():
-        feedback_section += f"\nTEST FAILURE OUTPUT (your previous tests failed — fix them):\n{test_result[:2000]}\n"
+        feedback_section += f"\nTEST FAILURE (fix your tests):\n{test_result[:1000]}\n"
 
-    prompt = f"""You are a senior developer fixing a bug. Your task is to produce CODE PATCHES — not analysis.
+    # End-state prompt style (Research Finding #10 — Claude performs better with end-state descriptions)
+    prompt = f"""Fix this bug by producing a RepairResult with correct patches.
 
 BUG: {intent.get('actual_behavior', '')}
 EXPECTED: {intent.get('expected_behavior', '')}
 ROOT CAUSE: {localization.get('root_cause_hypothesis', '')}
-FAULT LOCATION: files={localization.get('fault_files', [])}, functions={localization.get('fault_functions', [])}
+TARGET FUNCTIONS: {localization.get('fault_functions', [])} in {localization.get('fault_files', [])}
 {feedback_section}
 {source_section}
 
-CRITICAL INSTRUCTIONS:
-1. You MUST produce at least one patch. Empty patches list is NEVER acceptable.
-2. Each patch: file_path, original_code (EXACT substring from source), patched_code (replacement).
-3. patched_code MUST differ from original_code.
-4. Copy original_code EXACTLY — same whitespace, indentation, newlines. Character-for-character.
-5. original_code MUST start with the function definition line (def function_name(...):).
-   NEVER start original_code mid-function — always include the def line for uniqueness.
-6. Multiple patches per file are OK if they target DIFFERENT code regions.
-   But NEVER define the same function/variable in two separate patches.
-   Each patch should touch a unique region of code — no overlapping.
-7. Keep patches focused: 5-30 lines of original_code. Enough context to be unique.
-8. Address the ROOT CAUSE, not just the symptom.
-9. Wire fixes into call sites. Files marked "(caller)" show where functions are used.
-   If you add a new function in one patch, add ANOTHER patch at the call site to invoke it.
-   Dead code (functions defined but never called) = FAIL.
-10. Follow existing code patterns. Put analysis in explanation field only.
-11. In needs_more_files, list any file paths you need to see but weren't provided.
+A correct RepairResult has:
+- `patches`: one entry per function you change.
+  - `original_code`: copy the function EXACTLY as shown above, starting from the `def` line.
+    Character-for-character. Same indentation, same newlines. Do NOT truncate or paraphrase.
+  - `patched_code`: the corrected function. Must differ from original_code.
+  - `file_path`: exact file path as shown above.
+- `test_patches`: adds tests WITHOUT removing existing ones.
+  - If the test file is shown above ("EXISTING TEST FILE"):
+    * `original_code`: the last ~5 lines of that file (verbatim, for unique matching)
+    * `patched_code`: those same lines + new test functions appended at the end
+  - If test file does not exist: `original_code` = "", `patched_code` = full new file.
+  - Use `_save_flags` (NOT `_write_flags` — does not exist). Use `import agent.X as X` style.
+- `explanation`: one sentence on what was wrong and how the patch fixes it.
+- `needs_more_files`: list paths you need to see before you can produce patches.
 
-UNIT TESTS (REQUIRED — in test_patches field):
-12. You MUST write unit tests for every function you change. This is NOT optional.
-13. Use test_patches to ADD tests to existing test files. CRITICAL RULES:
-    - file_path: the test file path (e.g. 'tests/test_feature_flags.py')
-    - If the test file already exists (shown above labeled "EXISTING TEST FILE"):
-        * original_code: the LAST few lines of the existing file (enough to be unique, ~5 lines)
-        * patched_code: those same last lines PLUS your new test classes/functions appended after
-        * NEVER remove or replace existing tests — only ADD new ones at the end
-    - If creating a brand new test file that does NOT exist yet:
-        * original_code: empty string ""
-        * patched_code: the complete new test file content
-14. Tests must use pytest. Match the style of the existing test file exactly.
-    Use `import agent.feature_flags as ff` NOT `from backend.agent import feature_flags`.
-    Use `_save_flags` NOT `_write_flags` (that function does not exist).
-15. Each test must be focused: one assertion per test, descriptive name.
-16. At minimum write tests for: the happy path, the failure case you just fixed, and edge cases."""
+The fix is complete when:
+1. original_code is an EXACT substring of the source shown (start from `def`)
+2. patched_code addresses the stated root cause
+3. new tests cover the fixed behaviour and the existing ones still pass"""
 
     MAX_FILE_REQUESTS = 2
 
@@ -1572,47 +1624,41 @@ UNIT TESTS (REQUIRED — in test_patches field):
 
                 if new_count > 0:
                     source_section, _ = _build_source_section(current_source)
-                    current_prompt = prompt.replace(
-                        source_section.split("\n")[0] if source_section else "",
-                        ""
-                    )
-                    # Rebuild full prompt with expanded source
-                    current_prompt = f"""You are a senior developer. Additional files loaded. Generate patches.
+                    current_prompt = f"""Fix the bug. Additional files have been loaded per your request.
 
 BUG: {intent.get('actual_behavior', '')}
 ROOT CAUSE: {localization.get('root_cause_hypothesis', '')}
 {feedback_section}
 {source_section}
 
-ONE patch per file. original_code must be EXACT substring from source above.
-Wire new functions into call sites. No dead code."""
+Produce patches where original_code is an EXACT substring of source above (start from `def` line).
+patched_code must fix the stated root cause."""
                     state["source_code"] = current_source
                     continue
 
             break
 
         # Retry if no patches — use a more targeted approach
-        if not raw_patches and source_code:
+        if not raw_patches and focused_source:
             logger.warning("No patches on first try — retrying with targeted prompt")
-            # Extract the explanation to help guide the retry
             explanation = repair_dump.get("explanation", "")
             fault_file = localization.get("fault_files", [""])[0]
+            fault_fn = localization.get("fault_functions", [""])[0]
 
-            retry_prompt = f"""You FAILED to produce any patches. This is NOT acceptable.
-Your explanation was: {explanation}
+            retry_prompt = f"""Patches array was empty. You must produce patches.
 
-Now you MUST generate actual `patches` array entries. Each patch needs:
-- file_path: the file to modify
-- original_code: an EXACT copy-paste of 5-20 lines from the source code below
-- patched_code: the corrected version of those same lines
+BUG: {intent.get('actual_behavior', '')}
+TARGET: function `{fault_fn}` in file `{fault_file}`
+Your analysis: {explanation[:200]}
 
-The original_code MUST be a character-for-character copy from the source. Find the exact lines,
-copy them, and provide the fixed version.
-
-Target file: {fault_file}
 {source_section}
 
-Generate patches NOW. The patches array MUST NOT be empty."""
+The correct patch has:
+- file_path: "{fault_file}"
+- original_code: copy the `def {fault_fn}` function EXACTLY from the source above
+- patched_code: the corrected version of that function
+
+Produce the RepairResult with this patch now."""
 
             result2 = _structured_call("claude-sonnet-4-6", 8000, RepairResult, retry_prompt)
             repair_dump2 = result2.model_dump()
