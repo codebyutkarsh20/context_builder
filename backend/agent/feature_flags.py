@@ -118,3 +118,4 @@ def set_pr_url(repo_name: str, flag_name: str, pr_url: str) -> None:
             f["pr_url"] = pr_url
             _save_flags(repo_name, flags)
             return
+    logger.warning("Flag %s not found for repo %s", flag_name, repo_name)
