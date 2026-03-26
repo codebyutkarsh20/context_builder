@@ -1937,17 +1937,27 @@ def should_iterate(state: AgentState) -> Literal["test", "retry_fix", "escalate"
 
 
 def should_retry_after_test(state: AgentState) -> str:
-    """Route after test_node: retry repair on syntax errors, else proceed to PR."""
+    """Route after test_node: block PR on test failures, retry on syntax errors."""
     test_result = state.get("test_result", "")
     iteration = state.get("iteration_count", 0)
 
+    # Syntax errors → retry repair
     if "syntax error" in test_result.lower():
         if iteration >= MAX_ITERATIONS:
             logger.warning("Syntax errors after max iterations — escalating")
             return "escalate"
-        logger.info("Syntax errors in patched files — routing back to repair (iteration %d)", iteration)
+        logger.info("Syntax errors — routing back to repair (iteration %d)", iteration)
         return "retry_fix"
 
+    # Test failures → retry repair (agent's fix or tests are wrong)
+    if test_result.startswith("failed"):
+        if iteration >= MAX_ITERATIONS:
+            logger.warning("Tests still failing after max iterations — escalating")
+            return "escalate"
+        logger.info("Tests failed — routing back to repair (iteration %d)", iteration)
+        return "retry_fix"
+
+    # Tests passed, skipped, or errored (non-blocking) → proceed to PR
     return "create_pr"
 
 
