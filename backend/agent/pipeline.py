@@ -80,6 +80,10 @@ def _report_progress(state: AgentState) -> None:
 
 def _structured_call(model: str, max_tokens: int, schema: type, prompt: str, retries: int = 1):
     """Call LLM with structured output (tool use). Returns a Pydantic model instance."""
+    # Finding #11: Log approximate token usage to monitor context window utilization
+    approx_tokens = len(prompt) // 4
+    logger.info("LLM call: model=%s schema=%s ~%d input tokens", model, schema.__name__, approx_tokens)
+
     llm = ChatAnthropic(model=model, max_tokens=max_tokens, timeout=120.0, max_retries=2)
     structured = llm.with_structured_output(schema)
 
@@ -352,16 +356,27 @@ def _run_tests(worktree_path: Path) -> str:
         result = subprocess.run(
             cmd, cwd=test_cwd, capture_output=True, text=True, timeout=300,
         )
-        output = (result.stdout + "\n" + result.stderr).strip()
-        if len(output) > 5000:
-            output = output[:5000] + "\n... (truncated)"
+        raw_output = (result.stdout + "\n" + result.stderr).strip()
 
         if result.returncode == 0:
             logger.info("Tests passed")
-            return f"passed\n{output}"
+            # On success, keep summary short (Spotify: short success message)
+            summary_lines = [l for l in raw_output.splitlines() if "passed" in l.lower() or "ok" in l.lower()]
+            return "passed\n" + ("\n".join(summary_lines[-5:]) if summary_lines else raw_output[:500])
         else:
             logger.warning("Tests failed (exit code %d)", result.returncode)
-            return f"failed (exit code {result.returncode})\n{output}"
+            # On failure, extract only error-relevant lines (Spotify: regex to extract relevant errors)
+            error_lines = []
+            for line in raw_output.splitlines():
+                line_lower = line.lower()
+                if any(kw in line_lower for kw in ("error", "fail", "assert", "exception", "traceback", "syntaxerror", "nameerror", "import")):
+                    error_lines.append(line)
+                elif line.startswith("E ") or line.startswith("> "):  # pytest error/assertion lines
+                    error_lines.append(line)
+                elif line.startswith("FAILED "):
+                    error_lines.append(line)
+            parsed = "\n".join(error_lines[:40]) if error_lines else raw_output[:3000]
+            return f"failed (exit code {result.returncode})\n{parsed}"
     except subprocess.TimeoutExpired:
         logger.warning("Tests timed out after 5 minutes")
         return "failed: timed out after 5 minutes"
@@ -431,8 +446,7 @@ def intake_node(state: AgentState) -> AgentState:
 
     work_order = state.get("work_order", {})
 
-    prompt = f"""You are a senior developer reading a bug ticket.
-Translate this into a precise technical specification.
+    prompt = f"""Translate this bug ticket into a technical specification.
 
 Ticket: {work_order.get('title', '')}
 Description: {work_order.get('description', '')}
@@ -440,8 +454,10 @@ Priority: {work_order.get('priority', 'unknown')}
 Component: {work_order.get('affected_component', 'unknown')}
 Comments: {'; '.join(work_order.get('comments', []))}
 
-Identify the expected behavior, actual behavior, likely affected modules and functions,
-the type of fix needed, and severity."""
+Include acceptance_criteria: 2-4 testable assertions derived from the bug description
+that prove the fix works. These must come from the SPEC (what the user reported),
+not from guessing the implementation. Example: "calling set_pr_url with a nonexistent
+flag name should log a warning message"."""
 
     try:
         result = _structured_call("claude-sonnet-4-6", 1000, IntentAnalysis, prompt)
@@ -535,78 +551,43 @@ def exploration_node(state: AgentState) -> AgentState:
     from agent.explore_tools import set_context, ALL_TOOLS
     set_context(repo_name, repo_path, DATA_DIR)
 
-    # Build the repo overview (just file tree — no code)
+    # Load non-inferable business rules for this repo (Finding #4: only non-inferable context helps)
+    business_context = ""
     try:
-        py_files = sorted(
-            str(p.relative_to(repo_path))
-            for p in repo_path.rglob("*.py")
-            if "__pycache__" not in str(p) and ".git" not in str(p)
-        )[:80]
-        other_files = sorted(
-            str(p.relative_to(repo_path))
-            for p in repo_path.rglob("*")
-            if p.is_file()
-            and p.suffix in {'.js', '.ts', '.go', '.java', '.rb', '.rs'}
-            and "node_modules" not in str(p) and ".git" not in str(p)
-        )[:20]
-        file_tree = "\n".join(py_files + other_files)
+        br_path = DATA_DIR / repo_name / "business_rules.json"
+        if br_path.exists():
+            import json as _json
+            br_data = _json.loads(br_path.read_text())
+            if br_data:
+                top_rules = [f"  - [{r.get('rule_type','rule')}] {r.get('content','')[:120]}"
+                             for r in br_data[:10]]
+                business_context = "\nBUSINESS RULES (non-inferable — cannot be discovered from code):\n" + "\n".join(top_rules)
     except Exception:
-        file_tree = "(could not list files)"
+        pass
 
-    system_prompt = f"""You are an expert software engineer debugging a production bug.
-You have tools to explore the codebase: grep, read files, search by concept, get function context.
-Use them like a detective — search for relevant code, read the parts that matter, understand the flow.
+    # End-state prompt (Findings #5, #7, #10: no file tree, no step-by-step, describe outcome)
+    system_prompt = f"""You are debugging a production bug in repo `{repo_name}` at `{repo_path}`.
 
-REPO: {repo_name}
-REPO ROOT: {repo_path}
+You have tools: grep_repo, read_file, read_function, list_files, search_code, get_function_info, get_file_structure.
 
-FILE TREE (source files):
-{file_tree}
+A successful exploration ends with you writing a summary that contains:
+- The exact fault file path(s) and function name(s)
+- A root cause hypothesis explaining WHY the bug occurs
+- The relevant source code of the buggy function(s) and their callers
 
-Your goal:
-1. Find the exact location of the bug (file + function)
-2. Read enough source code to understand WHY the bug happens
-3. Collect the relevant source code snippets into your working memory
-
-When you have enough context to fix the bug, stop exploring and write your findings summary.
-
-TOOL USAGE STRATEGY (read carefully):
-1. JUMP, DON'T SCROLL: Never read a file from line 1 hoping to find the bug.
-   Use grep_repo or search_code to locate the exact line first, then jump there.
-2. START BROAD → NARROW:
-   - search_code("payment validation") → find relevant files by concept
-   - grep_repo("def validate_payment") → find the exact function
-   - read_function("services/payment.py", "validate_payment") → read just that function
-   - get_function_info("services/payment.py::validate_payment") → see callers, business rules
-3. USE get_file_structure BEFORE read_file:
-   - get_file_structure gives you all function signatures without reading bodies
-   - Then read_function for just the ones that matter
-4. WINDOW DISCIPLINE: read_file shows 100 lines at a time.
-   If you need more, call it again with start_line pointing past what you've seen.
-5. CALLERS MATTER: Use get_function_info to find who calls the buggy function —
-   the fix often needs to be wired in at the call site too.
-6. EDITING (optional): If you want to draft a fix during exploration, use string_replace
-   to make the edit, then check_syntax to verify it compiles. This creates a patch
-   directly in the repo that the repair stage will pick up.
-7. When confident, stop calling tools and write your final summary.
+Stop exploring as soon as you have enough evidence. Do not read files you don't need.
+{business_context}
 """
 
-    user_message = f"""Bug ticket:
-TITLE: {work_order.get('title', '')}
-DESCRIPTION: {work_order.get('description', '')}
-COMPONENT: {work_order.get('affected_component', '')}
+    user_message = f"""Bug: {work_order.get('title', '')}
+{work_order.get('description', '')}
+Component: {work_order.get('affected_component', 'unknown')}
 
-Initial hints from intake analysis:
-- Likely modules: {intent.get('likely_affected_modules', [])}
-- Likely functions: {intent.get('likely_affected_functions', [])}
-- Actual behavior: {intent.get('actual_behavior', '')}
-- Expected behavior: {intent.get('expected_behavior', '')}
+Likely location: {intent.get('likely_affected_modules', [])} / {intent.get('likely_affected_functions', [])}
+Actual behavior: {intent.get('actual_behavior', '')}
+Expected behavior: {intent.get('expected_behavior', '')}
 
-Start exploring. Find the bug. When done, write a final summary with:
-1. Exact fault file(s) and function(s)
-2. Root cause explanation
-3. The relevant source code snippets you found
-"""
+Find the bug and write your findings summary."""
 
     from langchain_anthropic import ChatAnthropic
     from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
@@ -1559,6 +1540,13 @@ def repair_node(state: AgentState) -> AgentState:
     if test_result and "fail" in test_result.lower():
         feedback_section += f"\nTEST FAILURE (fix your tests):\n{test_result[:1000]}\n"
 
+    # Acceptance criteria from spec (Finding #21: verification from spec, not implementation)
+    acceptance = intent.get("acceptance_criteria", [])
+    criteria_section = ""
+    if acceptance:
+        criteria_section = "\nACCEPTANCE CRITERIA (your tests MUST verify these):\n"
+        criteria_section += "\n".join(f"  - {c}" for c in acceptance)
+
     # End-state prompt style (Research Finding #10 — Claude performs better with end-state descriptions)
     prompt = f"""Fix this bug by producing a RepairResult with correct patches.
 
@@ -1566,6 +1554,7 @@ BUG: {intent.get('actual_behavior', '')}
 EXPECTED: {intent.get('expected_behavior', '')}
 ROOT CAUSE: {localization.get('root_cause_hypothesis', '')}
 TARGET FUNCTIONS: {localization.get('fault_functions', [])} in {localization.get('fault_files', [])}
+{criteria_section}
 {feedback_section}
 {source_section}
 
@@ -1774,37 +1763,36 @@ def review_node(state: AgentState) -> AgentState:
         for p in repair.get("patches", [])
     ]
 
-    prompt = f"""You are a senior code reviewer conducting an INDEPENDENT review.
-You have NOT seen the developer's working context — you are a fresh pair of eyes.
+    # Include acceptance criteria from intake (Finding #21: verification from spec)
+    acceptance = intent.get("acceptance_criteria", [])
+    criteria_section = ""
+    if acceptance:
+        criteria_section = "\nACCEPTANCE CRITERIA (from the bug spec — the fix must satisfy these):\n"
+        criteria_section += "\n".join(f"  - {c}" for c in acceptance)
+
+    prompt = f"""Review this bug fix as an independent reviewer who has NOT seen the developer's code.
 
 BUG: {intent.get('actual_behavior', '')}
 EXPECTED: {intent.get('expected_behavior', '')}
+{criteria_section}
 
 PROPOSED PATCHES:
 {json.dumps(clean_patches, indent=2)}
 
 FIX EXPLANATION: {repair.get('explanation', '')}
 
-INDEPENDENT CONTEXT (queried from knowledge graph, NOT from the developer):
+INDEPENDENT CONTEXT (from knowledge graph):
 {reviewer_context}
 
-Review each check — rate PASS, FAIL, or WARNING:
-1. ROOT_CAUSE: Does the fix address the actual root cause, not just the symptom?
-   Check: are all callers of the modified functions covered?
-2. BUSINESS_RULES: Does it violate any business rules listed above?
-   Any CRITICAL rules MUST NOT be violated.
-3. PATTERNS: Does the new code follow existing conventions?
-   Check: import style, naming, async/sync consistency.
-4. COMPLETENESS: Is the fix complete? No no-op patches, no dead code (functions defined but never called)?
-   Every new function MUST have a corresponding call site patch.
-5. BLAST_RADIUS: Given the downstream consumers listed above, could this break other systems?
-6. TESTS: Are test_patches provided with actual test code? Rate FAIL if test_patches is empty.
-   Tests are REQUIRED — a fix without tests is not production-ready.
-
-Set verdict to:
-- APPROVE if all 6 checks pass
-- CHANGES_REQUESTED if any check is a concrete FAIL (including missing tests)
-- ESCALATE only if the problem is genuinely too complex"""
+A correct review produces:
+- 6 checks (ROOT_CAUSE, BUSINESS_RULES, PATTERNS, COMPLETENESS, BLAST_RADIUS, TESTS), each PASS/FAIL/WARNING
+- ROOT_CAUSE passes when the fix addresses why the bug happens, not just the symptom
+- BUSINESS_RULES passes when no rules from the context above are violated
+- PATTERNS passes when code follows existing conventions (naming, imports, style)
+- COMPLETENESS passes when every changed function is wired into its call sites (no dead code)
+- BLAST_RADIUS passes when downstream consumers (listed above) are not broken
+- TESTS passes when test_patches contains real test code covering the fix
+- verdict: APPROVE (all pass), CHANGES_REQUESTED (concrete failures), ESCALATE (too complex)"""
 
     try:
         # Use Opus for deeper reasoning — worth the cost for catching subtle issues
@@ -1888,6 +1876,15 @@ def test_node(state: AgentState) -> AgentState:
         )
         state["sandbox_path"] = str(worktree_path)
         logger.info("Created worktree at %s on branch %s", worktree_path, branch_name)
+
+        # Scope guard (Finding #22/#23): verify patches only touch expected files
+        localization = state.get("localization", {})
+        expected_files = set(localization.get("fault_files", []))
+        for patch in repair.get("patches", []):
+            pf = patch.get("file_path", "")
+            pf_name = Path(pf).name if pf else ""
+            if pf and not any(pf in ef or ef in pf or pf_name == Path(ef).name for ef in expected_files):
+                logger.warning("SCOPE GUARD: patch touches unexpected file %s (expected: %s)", pf, expected_files)
 
         # Apply patches — use pre-merged content if available, otherwise fuzzy match
         patches_applied = 0
@@ -2165,6 +2162,8 @@ def pr_creation_node(state: AgentState) -> AgentState:
                     _set_flag_pr_url(repo_name, flag_name, pr_url)
                 except Exception:
                     pass
+            # Self-enriching loop (Finding #26): store fix pattern
+            _enrich_from_fix(state)
         else:
             logger.warning("gh pr create failed: %s", pr_result.stderr)
             state["pr_url"] = f"branch://{branch_name} (PR creation failed: {pr_result.stderr[:200]})"
@@ -2184,6 +2183,45 @@ def pr_creation_node(state: AgentState) -> AgentState:
     state["status"] = PipelineStatus.DONE
     _report_progress(state)
     return state
+
+
+def _enrich_from_fix(state: AgentState) -> None:
+    """Self-enriching loop (Finding #26): store fix pattern after successful PR.
+
+    Every successful fix permanently enriches the knowledge base so the agent
+    never has to re-discover the same pattern. This is the compounding advantage.
+    """
+    work_order = state.get("work_order", {})
+    repo_name = work_order.get("repo_name", "")
+    if not repo_name:
+        return
+
+    repair = state.get("repair", {})
+    localization = state.get("localization", {})
+    pr_url = state.get("pr_url", "")
+
+    fix_record = {
+        "ticket_id": work_order.get("ticket_id", ""),
+        "root_cause": localization.get("root_cause_hypothesis", "")[:200],
+        "fix_summary": repair.get("explanation", "")[:200],
+        "fault_files": localization.get("fault_files", []),
+        "fault_functions": localization.get("fault_functions", []),
+        "pr_url": pr_url,
+        "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+    }
+
+    try:
+        fixes_path = DATA_DIR / repo_name / "fix_history.json"
+        fixes_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = []
+        if fixes_path.exists():
+            existing = json.loads(fixes_path.read_text())
+        existing.append(fix_record)
+        fixes_path.write_text(json.dumps(existing, indent=2))
+        logger.info("Stored fix pattern for %s → fix_history.json (%d total)",
+                    work_order.get("ticket_id", ""), len(existing))
+    except Exception as e:
+        logger.debug("Failed to store fix pattern: %s", e)
 
 
 def escalate_node(state: AgentState) -> AgentState:

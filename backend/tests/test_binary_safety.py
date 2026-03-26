@@ -183,7 +183,8 @@ class TestReadSourceNodeBinarySafety:
 
     def test_truncates_long_files(self, tmp_repo):
         """Files longer than the max line limit are truncated."""
-        long_content = "\n".join(f"line_{i} = {i}" for i in range(1200))
+        # read_source_node uses max_lines=3000, so file must exceed that
+        long_content = "\n".join(f"line_{i} = {i}" for i in range(4000))
         (tmp_repo / "long.py").write_text(long_content)
 
         state = {
@@ -194,8 +195,8 @@ class TestReadSourceNodeBinarySafety:
         result = read_source_node(state)
         content = result["source_code"]["long.py"]
         lines = content.strip().split("\n")
-        # Should be truncated below the original 1200 lines
-        assert len(lines) < 1200
+        # Should be truncated below the original 4000 lines
+        assert len(lines) < 4000
         assert "truncated" in content or "omitted" in content
 
     def test_redacts_secrets_in_source(self, tmp_repo):

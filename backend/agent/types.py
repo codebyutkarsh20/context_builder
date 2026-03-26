@@ -22,6 +22,7 @@ class IntentAnalysis(BaseModel):
     likely_affected_functions: list[str] = Field(default_factory=list, description="Function names likely involved")
     fix_type: str = Field(default="bug_fix", description="bug_fix, enhancement, or refactor")
     severity: str = Field(default="medium", description="critical, high, medium, or low")
+    acceptance_criteria: list[str] = Field(default_factory=list, description="Testable assertions that prove the fix works. E.g. 'set_pr_url with nonexistent flag should log a warning'. These come from the spec, not the implementation.")
 
 
 class LocalizationResult(BaseModel):

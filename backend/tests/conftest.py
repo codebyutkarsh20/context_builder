@@ -76,8 +76,10 @@ def tmp_repo(tmp_path):
 
 @pytest.fixture
 def tmp_repo_dirty(tmp_repo):
-    """A repo with uncommitted changes."""
+    """A repo with uncommitted staged changes (not just untracked)."""
+    import subprocess
     (tmp_repo / "dirty.txt").write_text("uncommitted file")
+    subprocess.run(["git", "add", "dirty.txt"], cwd=tmp_repo, capture_output=True)
     return tmp_repo
 
 
