@@ -2166,6 +2166,21 @@ def should_iterate(state: AgentState) -> Literal["test", "retry_fix", "escalate"
         return "retry_fix"
 
 
+def should_retry_after_test(state: AgentState) -> str:
+    """Route after test_node: retry repair on syntax errors, else proceed to PR."""
+    test_result = state.get("test_result", "")
+    iteration = state.get("iteration_count", 0)
+
+    if "syntax error" in test_result.lower():
+        if iteration >= MAX_ITERATIONS:
+            logger.warning("Syntax errors after max iterations — escalating")
+            return "escalate"
+        logger.info("Syntax errors in patched files — routing back to repair (iteration %d)", iteration)
+        return "retry_fix"
+
+    return "create_pr"
+
+
 # ---------------------------------------------------------------------------
 # Graph builder
 # ---------------------------------------------------------------------------
@@ -2215,7 +2230,11 @@ def build_agent_graph():
         should_iterate,
         {"test": "test", "retry_fix": "repair", "escalate": "escalate"},
     )
-    graph.add_edge("test", "create_pr")
+    graph.add_conditional_edges(
+        "test",
+        should_retry_after_test,
+        {"create_pr": "create_pr", "retry_fix": "repair", "escalate": "escalate"},
+    )
     graph.add_edge("create_pr", END)
     graph.add_edge("escalate", END)
 
