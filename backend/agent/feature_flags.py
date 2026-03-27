@@ -44,7 +44,7 @@ def _slugify(text: str) -> str:
     """Turn arbitrary text into a safe flag-name slug."""
     slug = re.sub(r"[^a-zA-Z0-9_-]", "_", text)
     slug = re.sub(r"_+", "_", slug).strip("_")
-    return slug[:80] if slug else "flag"
+    return slug[:8] if slug else "flag"
 
 
 # ── Public API ────────────────────────────────────────────────────────────
