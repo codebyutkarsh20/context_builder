@@ -155,7 +155,7 @@ def test_phase1():
     # 1.6 Retry Truncation — verify error is truncated in retry prompt
     print("\n--- 1.6 Retry Truncation ---")
     src = inspect.getsource(pipeline._structured_call)
-    check("[:300]" in src, "Error truncated to 300 chars in retry prompt")
+    check("[:1000]" in src, "Error truncated to 1000 chars in retry prompt")
 
 
 # ======================================================================

@@ -18,7 +18,10 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
+
+if TYPE_CHECKING:
+    from agent.trace import RunTrace
 
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import END, StateGraph
@@ -902,6 +905,8 @@ def read_source_node(state: AgentState) -> AgentState:
     if not repo_path:
         logger.warning("Could not resolve repo path for %s — using context only", repo_name)
         state["source_code"] = {}
+        if trace:
+            trace.stage_end("read_source")
         return state
 
     # Load the knowledge graph for smart caller discovery
@@ -1547,6 +1552,8 @@ def review_node(state: AgentState) -> AgentState:
             "checks": [{"name": "ROOT_CAUSE", "status": "FAIL", "comment": "No patches generated — repair stage failed."}],
             "feedback": f"Repair produced no patches: {repair.get('explanation', 'unknown error')}",
         }
+        if trace:
+            trace.stage_end("review")
         return state
 
     intent = state.get("intent", {})
@@ -1947,6 +1954,8 @@ def pr_creation_node(state: AgentState) -> AgentState:
         state["error"] = state.get("error", "") or "No sandbox available for PR creation."
         state["status"] = PipelineStatus.DONE
         _report_progress(state)
+        if trace:
+            trace.stage_end("pr_creation")
         return state
 
     try:
@@ -1961,6 +1970,8 @@ def pr_creation_node(state: AgentState) -> AgentState:
             state["status"] = PipelineStatus.DONE
             _report_progress(state)
             _cleanup_worktree(repo_path, sandbox_path)
+            if trace:
+                trace.stage_end("pr_creation")
             return state
 
         logger.info("Pushed branch %s to origin", branch_name)
@@ -2111,6 +2122,9 @@ def _enrich_from_fix(state: AgentState) -> None:
 def escalate_node(state: AgentState) -> AgentState:
     """Escalate to human when agent can't fix confidently."""
     _thread_local.current_stage = "escalate"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("escalate")
     _emit_trace("info", {
         "message": "Escalating to human",
         "iterations": state.get("iteration_count", 0),
@@ -2123,6 +2137,8 @@ def escalate_node(state: AgentState) -> AgentState:
         f"Last review: {state.get('review', {}).get('feedback', 'no feedback')}"
     )
     _report_progress(state)
+    if trace:
+        trace.stage_end("escalate")
     return state
 
 
@@ -2259,7 +2275,7 @@ agent_app = build_agent_graph()
 def run_ticket(
     work_order: dict,
     progress_cb: Callable[[AgentState], None] | None = None,
-    trace=None,
+    trace: RunTrace | None = None,
 ) -> dict:
     """Run a bug ticket through the full agent pipeline.
 
