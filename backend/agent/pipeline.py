@@ -1338,9 +1338,10 @@ TARGET FUNCTIONS: {target_fns} in {target_files}
 
 A correct RepairResult has:
 - `patches`: one entry per target function — you MUST patch EVERY function in TARGET FUNCTIONS.
-  - `original_code`: copy the function EXACTLY as shown above, starting from the `def` line.
-    Character-for-character. Same indentation, same newlines. Do NOT truncate or paraphrase.
-  - `patched_code`: the corrected function. Must differ from original_code.
+  - `original_code`: copy the ENTIRE function EXACTLY as shown above, starting from the `def` line
+    through the LAST line of the function body. Include ALL lines — do NOT use a single-line snippet
+    like `slug[:8]`. The original_code MUST be at least 3 lines. Character-for-character exact copy.
+  - `patched_code`: the corrected ENTIRE function. Must differ from original_code.
   - `file_path`: exact file path as shown above.
 - `test_patches`: adds tests WITHOUT removing existing ones.
   - If the test file is shown above ("EXISTING TEST FILE"):
@@ -1420,13 +1421,15 @@ patched_code must fix the stated root cause."""
 BUG: {intent.get('actual_behavior', '')}
 TARGET: function `{fault_fn}` in file `{fault_file}`
 Your analysis: {explanation[:200]}
-
+{feedback_section}
 {source_section}
 
 The correct patch has:
 - file_path: "{fault_file}"
-- original_code: copy the `def {fault_fn}` function EXACTLY from the source above
-- patched_code: the corrected version of that function
+- original_code: copy the ENTIRE `def {fault_fn}(...)` function from the source above,
+  starting from `def` through the last line. Do NOT use a single-line snippet.
+- patched_code: the corrected version of that entire function
+- test_patches: add tests that verify the fix works
 
 Produce the RepairResult with this patch now."""
 
@@ -1656,6 +1659,9 @@ def test_node(state: AgentState) -> AgentState:
         logger.warning("No repo path — skipping sandbox and tests")
         state["test_result"] = "skipped: no repo path"
         state["sandbox_path"] = ""
+        _emit_trace("test_output", {"result": "skipped: no repo path", "passed": False, "patches_applied": 0})
+        if trace:
+            trace.stage_end("test")
         return state
 
     # Sanitize ticket_id: keep only alphanumerics, hyphens, and underscores.
@@ -1689,6 +1695,9 @@ def test_node(state: AgentState) -> AgentState:
             state["test_result"] = "skipped: repo has uncommitted changes"
             state["sandbox_path"] = ""
             state["error"] = "Repository has uncommitted changes. Commit or stash them first."
+            _emit_trace("test_output", {"result": "skipped: repo has uncommitted changes", "passed": False, "patches_applied": 0})
+            if trace:
+                trace.stage_end("test")
             return state
 
         # Create worktree (safe_ticket_id has no special chars, path is safe)
@@ -1741,8 +1750,17 @@ def test_node(state: AgentState) -> AgentState:
                 full_path.write_text(new_content)
                 patches_applied += 1
                 logger.info("Applied patch to %s", file_path)
+                _emit_trace("info", {"message": f"Patch applied: {file_path}"})
             else:
-                logger.warning("Patch could not be matched in %s", file_path)
+                logger.warning("Patch could not be matched in %s (original=%d chars, file=%d chars)",
+                               file_path, len(original), len(content))
+                _emit_trace("error", {
+                    "message": f"Patch FAILED to match in {file_path}",
+                    "original_code_preview": original[:200],
+                    "file_content_preview": content[:200],
+                    "original_len": len(original),
+                    "file_len": len(content),
+                })
 
         state["patches_applied"] = patches_applied
 
@@ -1798,6 +1816,9 @@ def test_node(state: AgentState) -> AgentState:
             state["sandbox_path"] = ""
             state["test_result"] = "failed: no patches could be applied"
             state["error"] = "No patches could be applied to the source code."
+            _emit_trace("test_output", {"result": "failed: no patches could be applied", "passed": False, "patches_applied": 0})
+            if trace:
+                trace.stage_end("test")
             return state
 
         # Syntax validation — check patched Python files compile
@@ -1817,6 +1838,9 @@ def test_node(state: AgentState) -> AgentState:
             state["sandbox_path"] = ""
             state["test_result"] = "failed: syntax errors in patched files\n" + "\n".join(syntax_errors)
             state["error"] = "Patches introduced syntax errors: " + "; ".join(syntax_errors)
+            _emit_trace("test_output", {"result": "failed: syntax errors", "passed": False, "patches_applied": patches_applied})
+            if trace:
+                trace.stage_end("test")
             return state
 
         # Custom lint rules (Step 16) — run against patched files
@@ -1860,10 +1884,12 @@ def test_node(state: AgentState) -> AgentState:
         logger.error("Sandbox/test operation failed: %s — %s", e, e.stderr)
         state["test_result"] = f"error: {e.stderr}"
         state["error"] = f"Sandbox operation failed: {e.stderr}"
+        _emit_trace("test_output", {"result": f"error: {e.stderr}", "passed": False, "patches_applied": 0})
         _cleanup_worktree(repo_path, state.get("sandbox_path", ""))
     except Exception as e:
         logger.error("Test node failed: %s", e)
         state["test_result"] = f"error: {e}"
+        _emit_trace("test_output", {"result": f"error: {e}", "passed": False, "patches_applied": 0})
         _cleanup_worktree(repo_path, state.get("sandbox_path", ""))
 
     # Step 18: Enrich failed test results with business context
