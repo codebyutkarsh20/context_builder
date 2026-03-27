@@ -135,7 +135,10 @@ def list_questions(
     if not graph_path.exists():
         raise HTTPException(status_code=404, detail=f"Repository '{repo}' not found")
 
-    data = json.loads(graph_path.read_text())
+    try:
+        data = json.loads(graph_path.read_text())
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Repository '{repo}' has a corrupted graph.json file")
     decision_points = data.get("decision_points", [])
     answers = _load_answers(repo)
 
