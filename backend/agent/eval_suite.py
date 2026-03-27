@@ -9,14 +9,19 @@ fix generation, and review outcomes.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Per-case timeout in seconds (autoplan eng review: critical gap)
+EVAL_CASE_TIMEOUT = int(os.environ.get("EVAL_CASE_TIMEOUT", "600"))
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 
@@ -115,8 +120,23 @@ def score_single_run(result: dict, bug: dict) -> dict:
 # Full eval run
 # ---------------------------------------------------------------------------
 
+def _run_single_case(work_order: dict) -> dict:
+    """Run a single eval case inside a thread (for timeout support)."""
+    from agent.pipeline import run_ticket
+    from agent.trace import RunTrace
+
+    trace = RunTrace(run_id=work_order["ticket_id"])
+    result = run_ticket(work_order, trace=trace)
+    result["_trace"] = trace.to_report()
+    return result
+
+
 def run_eval(repo: str, repo_path: str = "") -> dict:
     """Run all eval bugs through the pipeline and produce a summary report.
+
+    Each case runs with a per-case timeout (EVAL_CASE_TIMEOUT env var,
+    default 600s). Crashes and timeouts are captured per-case without
+    aborting the suite. Each case gets its own RunTrace for debugging.
 
     Parameters
     ----------
@@ -129,8 +149,6 @@ def run_eval(repo: str, repo_path: str = "") -> dict:
     -------
     dict with keys: repo, started_at, finished_at, total, scores, summary.
     """
-    from agent.pipeline import run_ticket
-
     bugs = load_eval_bugs(repo)
     effective_repo_path = repo_path or str(DATA_DIR / repo)
 
@@ -150,17 +168,28 @@ def run_eval(repo: str, repo_path: str = "") -> dict:
             "comments": bug.get("comments", []),
         }
 
+        case_start = time.time()
+        result: dict
         try:
-            result = run_ticket(work_order)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_run_single_case, work_order)
+                result = future.result(timeout=EVAL_CASE_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            logger.error("Eval case %s timed out after %ds", bug["ticket_id"], EVAL_CASE_TIMEOUT)
+            result = {"status": "failed", "error": f"Timeout after {EVAL_CASE_TIMEOUT}s"}
         except Exception as e:
             logger.exception("Eval run failed for ticket %s", bug["ticket_id"])
-            result = {"status": "failed", "error": str(e)}
+            result = {"status": "failed", "error": str(e), "_traceback": traceback.format_exc()}
+
+        case_duration = round(time.time() - case_start, 2)
 
         score = score_single_run(result, bug)
+        score["duration_seconds"] = case_duration
+        score["trace"] = result.get("_trace")
         scores.append(score)
         logger.info(
-            "Eval [%d/%d] %s — loc_hit=%s root_match=%s fix=%s approved=%s conf=%.2f",
-            i + 1, len(bugs), bug["ticket_id"],
+            "Eval [%d/%d] %s (%.1fs) — loc_hit=%s root_match=%s fix=%s approved=%s conf=%.2f",
+            i + 1, len(bugs), bug["ticket_id"], case_duration,
             score["localization_hit"], score["root_cause_match"],
             score["fix_generated"], score["review_approved"],
             score["confidence"],
@@ -179,13 +208,29 @@ def run_eval(repo: str, repo_path: str = "") -> dict:
         "summary": summary,
     }
 
-    # Persist results
+    # Regression tracking: compare with previous results before overwriting
     results_dir = DATA_DIR / repo
     results_dir.mkdir(parents=True, exist_ok=True)
     results_file = results_dir / "eval_results.json"
+    history_file = results_dir / "eval_history.json"
+
+    previous = load_latest_results(repo)
+    if previous and previous.get("summary"):
+        prev_summary = previous["summary"]
+        regression = _detect_regressions(prev_summary, summary)
+        report["regression"] = regression
+        if regression.get("regressions"):
+            logger.warning("REGRESSIONS DETECTED: %s", regression["regressions"])
+        else:
+            logger.info("No regressions vs previous run")
+
+    # Persist current results
     with open(results_file, "w") as f:
         json.dump(report, f, indent=2)
     logger.info("Eval results written to %s", results_file)
+
+    # Append to history for trend tracking
+    _append_to_history(history_file, summary, started_at)
 
     return report
 
@@ -253,5 +298,64 @@ def load_latest_results(repo: str) -> dict | None:
     results_file = DATA_DIR / repo / "eval_results.json"
     if not results_file.exists():
         return None
-    with open(results_file) as f:
-        return json.load(f)
+    try:
+        with open(results_file) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to load eval results: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Regression detection
+# ---------------------------------------------------------------------------
+
+_TRACKED_METRICS = ["pass_rate", "localization_accuracy", "fix_rate", "approval_rate"]
+
+
+def _detect_regressions(
+    previous: dict, current: dict, threshold: float = 0.05,
+) -> dict:
+    """Compare current summary against previous. Flag any metric that dropped
+    by more than *threshold* (default 5 percentage points).
+
+    Returns dict with 'regressions' list and 'improvements' list.
+    """
+    regressions: list[dict] = []
+    improvements: list[dict] = []
+
+    for metric in _TRACKED_METRICS:
+        prev_val = previous.get(metric, 0.0)
+        curr_val = current.get(metric, 0.0)
+        delta = curr_val - prev_val
+        entry = {"metric": metric, "previous": prev_val, "current": curr_val, "delta": round(delta, 4)}
+        if delta < -threshold:
+            regressions.append(entry)
+        elif delta > threshold:
+            improvements.append(entry)
+
+    return {"regressions": regressions, "improvements": improvements}
+
+
+def _append_to_history(history_file: Path, summary: dict, timestamp: float) -> None:
+    """Append a summary snapshot to the eval history file for trend tracking."""
+    entry = {
+        "timestamp": timestamp,
+        **{k: summary.get(k, 0.0) for k in _TRACKED_METRICS},
+        "avg_confidence": summary.get("avg_confidence", 0.0),
+    }
+    history: list[dict] = []
+    if history_file.exists():
+        try:
+            with open(history_file) as f:
+                history = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            history = []
+    history.append(entry)
+    # Keep last 100 runs
+    history = history[-100:]
+    try:
+        with open(history_file, "w") as f:
+            json.dump(history, f, indent=2)
+    except OSError as e:
+        logger.warning("Failed to write eval history: %s", e)

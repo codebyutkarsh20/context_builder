@@ -1226,6 +1226,58 @@ Produce patches where original_code starts from the `def` line and is an EXACT s
     return verified
 
 
+def _generate_stub_tests(
+    intent: dict, localization: dict, target_files: list[str],
+) -> list[dict]:
+    """Generate deterministic stub test patches from acceptance criteria and
+    function signatures when the LLM fails to produce test_patches.
+
+    Returns a list of patch dicts suitable for repair_dump["test_patches"].
+    """
+    acceptance = intent.get("acceptance_criteria", [])
+    fault_fns = localization.get("fault_functions", [])
+    if not fault_fns:
+        return []
+
+    # Derive test file path from first target file
+    first_file = target_files[0] if target_files else "unknown.py"
+    stem = Path(first_file).stem
+    test_file = f"tests/test_{stem}.py"
+
+    # Build stub test code from acceptance criteria
+    test_lines = [
+        f'"""Auto-generated stub tests for {stem} — acceptance criteria."""',
+        "import pytest",
+        "",
+    ]
+    for i, criterion in enumerate(acceptance):
+        safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", criterion[:60]).strip("_").lower()
+        test_lines.extend([
+            f"def test_acceptance_{i + 1}_{safe_name}():",
+            f'    """Verify: {criterion}"""',
+            f"    # TODO: replace with real assertion",
+            f'    raise NotImplementedError("Stub test — implement assertion for: {criterion}")',
+            "",
+        ])
+
+    # Fallback: if no acceptance criteria, generate from function names
+    if not acceptance:
+        for fn_name in fault_fns:
+            test_lines.extend([
+                f"def test_{fn_name}_fixed():",
+                f'    """Verify {fn_name} works correctly after fix."""',
+                f"    # TODO: replace with real assertion",
+                f'    raise NotImplementedError("Stub test — implement assertion for {fn_name}")',
+                "",
+            ])
+
+    return [{
+        "file_path": test_file,
+        "original_code": "",
+        "patched_code": "\n".join(test_lines),
+        "explanation": "Auto-generated stub tests from acceptance criteria (LLM failed to produce tests)",
+    }]
+
 
 def repair_node(state: AgentState) -> AgentState:
     """Stage 4: Agentic repair with per-file verification and sequential patching.
@@ -1305,6 +1357,20 @@ def repair_node(state: AgentState) -> AgentState:
     feedback_section = ""
     if previous_review.get("feedback"):
         feedback_section = f"\nPREVIOUS REVIEW FEEDBACK:\n{previous_review['feedback'][:500]}\n"
+        # Mandatory test enforcement: when reviewer flagged TESTS as FAIL,
+        # explicitly require test_patches on retry (Finding: autoplan eng review)
+        review_checks = previous_review.get("checks", [])
+        tests_failed = any(
+            (c.get("name") == "TESTS" and c.get("status") == "FAIL")
+            for c in review_checks
+        )
+        if tests_failed:
+            feedback_section += (
+                "\nMANDATORY: You MUST produce test_patches in your response. "
+                "The reviewer rejected your previous fix because it had NO tests. "
+                "If you return empty test_patches again, the fix will be rejected. "
+                "Generate at least one test that verifies the fixed behavior.\n"
+            )
     test_result = state.get("test_result", "")
     if test_result and "fail" in test_result.lower():
         feedback_section += f"\nTEST FAILURE (fix your tests):\n{test_result[:1000]}\n"
@@ -1474,6 +1540,21 @@ Produce the RepairResult with this patch now."""
                     "has_original": bool(p.get("original_code")),
                     "has_patched": bool(p.get("patched_code")),
                 })
+
+        # Programmatic stub test fallback: if LLM produced patches but no
+        # test_patches after 2+ iterations, generate stubs from acceptance
+        # criteria and function signatures (autoplan eng review finding 5A)
+        test_patches = repair_dump.get("test_patches", [])
+        has_tests = any(
+            tp.get("patched_code", "").strip()
+            for tp in test_patches
+        )
+        if not has_tests and state.get("iteration_count", 0) >= 2 and repair_dump.get("patches"):
+            logger.warning("No test_patches after %d iterations — generating stub tests", state["iteration_count"])
+            stub_tests = _generate_stub_tests(intent, localization, target_files)
+            if stub_tests:
+                repair_dump["test_patches"] = stub_tests
+                logger.info("Generated %d stub test patches", len(stub_tests))
 
         state["repair"] = repair_dump
     except Exception as e:
