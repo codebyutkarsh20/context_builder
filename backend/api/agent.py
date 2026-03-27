@@ -4,18 +4,24 @@ agent.py — API endpoints for controlling the AI Deploy Agent pipeline.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import queue
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 router = APIRouter(tags=["agent"])
 logger = logging.getLogger(__name__)
+
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 
 # In-memory job store with cleanup
 _agent_jobs: dict[str, dict] = {}
@@ -79,6 +85,7 @@ class RunTicketRequest(BaseModel):
     repo_path: str = ""
     priority: str = "medium"
     comments: list[str] = Field(default_factory=list)
+    debug: bool = False  # Enable tracing/observability
 
 
 class AgentJobStatus(BaseModel):
@@ -88,6 +95,7 @@ class AgentJobStatus(BaseModel):
     iteration_count: int = 0
     result: dict | None = None
     error: str = ""
+    debug: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +125,16 @@ def run_agent(req: RunTicketRequest) -> dict:
             "iteration_count": 0,
             "result": None,
             "error": "",
+            "debug": req.debug,
             "_created": time.time(),
         }
 
-    thread = threading.Thread(target=_run_pipeline, args=(job_id, work_order), daemon=True)
+    thread = threading.Thread(
+        target=_run_pipeline, args=(job_id, work_order, req.debug), daemon=True,
+    )
     thread.start()
 
-    return {"job_id": job_id, "status": "pending"}
+    return {"job_id": job_id, "status": "pending", "debug": req.debug}
 
 
 @router.get("/agent/status/{job_id}")
@@ -165,7 +176,7 @@ def list_mock_tickets() -> list[dict]:
 
 
 @router.post("/agent/run-mock/{ticket_id}")
-def run_mock_ticket(ticket_id: str) -> dict:
+def run_mock_ticket(ticket_id: str, debug: bool = Query(False)) -> dict:
     """Run a specific mock ticket through the pipeline."""
     from agent.intake.mock_jira import get_ticket
 
@@ -182,13 +193,87 @@ def run_mock_ticket(ticket_id: str) -> dict:
             "iteration_count": 0,
             "result": None,
             "error": "",
+            "debug": debug,
             "_created": time.time(),
         }
 
-    thread = threading.Thread(target=_run_pipeline, args=(job_id, ticket), daemon=True)
+    thread = threading.Thread(
+        target=_run_pipeline, args=(job_id, ticket, debug), daemon=True,
+    )
     thread.start()
 
-    return {"job_id": job_id, "status": "pending", "ticket_id": ticket_id}
+    return {"job_id": job_id, "status": "pending", "ticket_id": ticket_id, "debug": debug}
+
+
+# ---------------------------------------------------------------------------
+# SSE trace streaming
+# ---------------------------------------------------------------------------
+
+@router.get("/agent/trace/{job_id}")
+def stream_trace(job_id: str):
+    """Stream pipeline trace events via Server-Sent Events (SSE)."""
+    with _agent_jobs_lock:
+        job = _agent_jobs.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        trace = job.get("_trace")
+        if not trace:
+            raise HTTPException(status_code=404, detail="Tracing not enabled for this job (pass debug=true)")
+
+    def event_generator():
+        q = trace.subscribe()
+        try:
+            # Catch up: send all existing events and track last index sent
+            existing = trace.events_since(0)
+            last_sent_idx = -1
+            for evt in existing:
+                yield f"data: {json.dumps(evt, default=str)}\n\n"
+                last_sent_idx = evt.get("index", last_sent_idx)
+
+            # Stream new events — deduplicate by index
+            while True:
+                try:
+                    evt = q.get(timeout=30)
+                    if evt is None:  # sentinel = trace complete
+                        yield f"event: done\ndata: {{}}\n\n"
+                        break
+                    # Skip events already sent during catchup
+                    if evt.index <= last_sent_idx:
+                        continue
+                    last_sent_idx = evt.index
+                    yield f"data: {json.dumps(evt.to_dict(), default=str)}\n\n"
+                except queue.Empty:
+                    yield f": keepalive\n\n"
+        finally:
+            trace.unsubscribe(q)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/agent/trace/{job_id}/report")
+def get_trace_report(job_id: str) -> dict:
+    """Get the full trace report for a completed job."""
+    # Try in-memory trace first
+    with _agent_jobs_lock:
+        job = _agent_jobs.get(job_id)
+        if job:
+            trace = job.get("_trace")
+            if trace:
+                return trace.to_report()
+
+    # Try on-disk report
+    report_path = DATA_DIR / "traces" / f"{job_id}.json"
+    if report_path.exists():
+        return json.loads(report_path.read_text())
+
+    raise HTTPException(status_code=404, detail="Trace report not found")
 
 
 # ---------------------------------------------------------------------------
@@ -229,17 +314,25 @@ def _make_progress_callback(job_id: str):
     return callback
 
 
-def _run_pipeline(job_id: str, work_order: dict) -> None:
+def _run_pipeline(job_id: str, work_order: dict, debug: bool = False) -> None:
     """Run the LangGraph pipeline in a background thread."""
+    trace = None
     try:
         with _agent_jobs_lock:
             _agent_jobs[job_id]["status"] = "running"
             _agent_jobs[job_id]["stage"] = "Starting pipeline"
 
+        # Create trace if debug mode
+        if debug:
+            from agent.trace import RunTrace
+            trace = RunTrace(job_id=job_id, enabled=True)
+            with _agent_jobs_lock:
+                _agent_jobs[job_id]["_trace"] = trace
+
         from agent.pipeline import run_ticket
 
         progress_cb = _make_progress_callback(job_id)
-        result = run_ticket(work_order, progress_cb=progress_cb)
+        result = run_ticket(work_order, progress_cb=progress_cb, trace=trace)
 
         # Determine final status from pipeline outcome
         pipeline_status = result.get("status", "done")
@@ -274,6 +367,13 @@ def _run_pipeline(job_id: str, work_order: dict) -> None:
                 "error": result.get("error", ""),
             })
 
+        # Save trace report to disk
+        if trace:
+            try:
+                trace.save_report(DATA_DIR / "traces" / f"{job_id}.json")
+            except Exception as te:
+                logger.warning("Failed to save trace report: %s", te)
+
         logger.info(
             "Agent pipeline complete for job %s: status=%s, verdict=%s, iterations=%d",
             job_id,
@@ -290,3 +390,6 @@ def _run_pipeline(job_id: str, work_order: dict) -> None:
                 "stage": "Error",
                 "error": str(e),
             })
+        if trace:
+            trace.emit("error", "pipeline", {"message": f"Pipeline crashed: {e}"})
+            trace.complete()
