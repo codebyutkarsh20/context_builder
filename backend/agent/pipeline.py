@@ -446,19 +446,30 @@ config files, or documentation. Test files (test_*.py, conftest.py) are never fa
                     merged_fault_files.append(ef)
 
             # Filter out test/config files from fault_files — they're never the fault location
+            _noise_patterns = (
+                "test_", "conftest", "/tests/", "/test/", "/__pycache__/",
+                ".json", ".md", ".yml", ".yaml", ".txt", ".cfg", ".ini",
+                "setup.py", "setup.cfg", "pyproject.toml",
+            )
             clean_fault_files = [
                 f for f in merged_fault_files
-                if not any(p in f for p in ("test_", "conftest", "/tests/", "/__pycache__/", ".json", ".md", ".yml"))
+                if not any(p in f for p in _noise_patterns)
             ]
-            # Keep at least the original localization files if filter removed everything
+            # Also filter embedding files added to the merge
+            if not clean_fault_files:
+                # Fallback: keep LLM-selected files (pre-merge), also filtered
+                clean_fault_files = [
+                    f for f in loc.fault_files
+                    if not any(p in f for p in _noise_patterns)
+                ]
             if not clean_fault_files:
                 clean_fault_files = list(loc.fault_files)[:3]
 
             loc_dict = loc.model_dump()
             loc_dict["fault_files"] = clean_fault_files
             state["localization"] = loc_dict
-            logger.info("Exploration localization: confidence=%.2f files=%s",
-                        loc.confidence, merged_fault_files)
+            logger.info("Exploration localization: confidence=%.2f files=%s (pre-filter: %s)",
+                        loc.confidence, clean_fault_files, merged_fault_files)
         except Exception as e:
             logger.warning("Could not parse localization from exploration: %s", e)
             state["localization"] = {
@@ -1203,20 +1214,33 @@ def repair_node(state: AgentState) -> AgentState:
         criteria_section = "\nACCEPTANCE CRITERIA (your tests MUST verify these):\n"
         criteria_section += "\n".join(f"  - {c}" for c in acceptance)
 
+    # Build explicit completeness enforcement for multi-function fixes
+    target_fns = localization.get('fault_functions', [])
+    target_files = localization.get('fault_files', [])
+    n_targets = len(target_fns)
+    completeness_rule = ""
+    if n_targets > 1:
+        fn_list = ", ".join(f"`{fn}`" for fn in target_fns)
+        completeness_rule = (
+            f"\nCRITICAL — ALL {n_targets} TARGET FUNCTIONS MUST BE PATCHED: {fn_list}\n"
+            f"The root cause affects every one of them. A fix that patches only some is INCOMPLETE\n"
+            f"and will be rejected. You MUST produce one patch entry for EACH target function.\n"
+        )
+
     # End-state prompt style (Research Finding #10 — Claude performs better with end-state descriptions)
     prompt = f"""Fix this bug by producing a RepairResult with correct patches.
 
 BUG: {intent.get('actual_behavior', '')}
 EXPECTED: {intent.get('expected_behavior', '')}
 ROOT CAUSE: {localization.get('root_cause_hypothesis', '')}
-TARGET FUNCTIONS: {localization.get('fault_functions', [])} in {localization.get('fault_files', [])}
+TARGET FUNCTIONS: {target_fns} in {target_files}
+{completeness_rule}
 {criteria_section}
 {feedback_section}
 {source_section}
 
 A correct RepairResult has:
-- `patches`: one entry per function you fix. You MUST patch ALL target functions listed above —
-  fixing only some of them is an incomplete fix and will be rejected by the reviewer.
+- `patches`: one entry per target function — you MUST patch EVERY function in TARGET FUNCTIONS.
   - `original_code`: copy the function EXACTLY as shown above, starting from the `def` line.
     Character-for-character. Same indentation, same newlines. Do NOT truncate or paraphrase.
   - `patched_code`: the corrected function. Must differ from original_code.
@@ -1233,7 +1257,8 @@ A correct RepairResult has:
 The fix is complete when:
 1. original_code is an EXACT substring of the source shown (start from `def`)
 2. patched_code addresses the stated root cause
-3. new tests cover the fixed behaviour and the existing ones still pass"""
+3. EVERY target function has a corresponding patch (no partial fixes)
+4. new tests cover the fixed behaviour and the existing ones still pass"""
 
     MAX_FILE_REQUESTS = 2
 
@@ -1433,12 +1458,24 @@ def review_node(state: AgentState) -> AgentState:
     localization = state.get("localization", {})
     fault_functions = localization.get("fault_functions", [])
     fault_files = localization.get("fault_files", [])
+    patched_functions = [p.get("file_path", "") for p in clean_patches]
+    n_fault = len(fault_functions)
+    n_patched = len(clean_patches)
+
+    completeness_data = ""
+    if n_fault > 1:
+        completeness_data = (
+            f"\nCOMPLETENESS DATA: Localization identified {n_fault} fault functions: {fault_functions}\n"
+            f"Patches provided: {n_patched} patch(es) touching: {patched_functions}\n"
+            f"If any identified fault function is missing a patch, COMPLETENESS must FAIL.\n"
+        )
 
     prompt = f"""Review this bug fix as an independent reviewer who has NOT seen the developer's code.
 
 BUG: {intent.get('actual_behavior', '')}
 EXPECTED: {intent.get('expected_behavior', '')}
 IDENTIFIED FAULT LOCATIONS: functions={fault_functions} in files={fault_files}
+{completeness_data}
 {criteria_section}
 
 PROPOSED PATCHES:
@@ -1454,11 +1491,12 @@ A correct review produces:
 - ROOT_CAUSE passes when the fix addresses why the bug happens, not just the symptom
 - BUSINESS_RULES passes when no rules from the context above are violated
 - PATTERNS passes when code follows existing conventions (naming, imports, style)
-- COMPLETENESS: FAIL if localization identified N fault functions but patches only fix fewer than N.
-  Every identified fault site must be patched. Also FAIL if new functions are defined but never called.
+- COMPLETENESS: FAIL if localization identified {n_fault} fault function(s) but patches cover fewer.
+  Count the patches: do they fix ALL of {fault_functions}? If ANY fault function is missing a patch,
+  COMPLETENESS = FAIL and verdict MUST be CHANGES_REQUESTED with feedback naming the missing function(s).
 - BLAST_RADIUS passes when downstream consumers (listed above) are not broken
 - TESTS passes when test_patches contains real test code covering the fix
-- verdict: APPROVE (all pass), CHANGES_REQUESTED (concrete failures), ESCALATE (too complex)"""
+- verdict: APPROVE only if ALL checks pass. CHANGES_REQUESTED if any check is FAIL. ESCALATE if too complex."""
 
     try:
         # Use Opus for deeper reasoning — worth the cost for catching subtle issues
