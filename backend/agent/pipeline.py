@@ -1382,9 +1382,19 @@ def repair_node(state: AgentState) -> AgentState:
         criteria_section = "\nACCEPTANCE CRITERIA (your tests MUST verify these):\n"
         criteria_section += "\n".join(f"  - {c}" for c in acceptance)
 
+    # Deduplicate fault_files by basename — exploration sometimes returns
+    # both 'agent/feature_flags.py' and 'backend/agent/feature_flags.py'
+    # for the same file. Keep the longest (most qualified) path per basename.
+    raw_fault_files = localization.get('fault_files', [])
+    by_basename: dict[str, str] = {}
+    for fp in raw_fault_files:
+        base = Path(fp).name
+        if base not in by_basename or len(fp) > len(by_basename[base]):
+            by_basename[base] = fp
+    target_files = list(by_basename.values())
+
     # Build explicit completeness enforcement for multi-function fixes
     target_fns = localization.get('fault_functions', [])
-    target_files = localization.get('fault_files', [])
     n_targets = len(target_fns)
     completeness_rule = ""
     if n_targets > 1:
@@ -1661,7 +1671,14 @@ def review_node(state: AgentState) -> AgentState:
     # Pass localization info to reviewer so it can check completeness
     localization = state.get("localization", {})
     fault_functions = localization.get("fault_functions", [])
-    fault_files = localization.get("fault_files", [])
+    # Deduplicate fault_files by basename (same fix as repair_node)
+    raw_ff = localization.get("fault_files", [])
+    ff_by_base: dict[str, str] = {}
+    for fp in raw_ff:
+        base = Path(fp).name
+        if base not in ff_by_base or len(fp) > len(ff_by_base[base]):
+            ff_by_base[base] = fp
+    fault_files = list(ff_by_base.values())
     patched_functions = [p.get("file_path", "") for p in clean_patches]
     n_fault = len(fault_functions)
     n_patched = len(clean_patches)
