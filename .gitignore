@@ -30,3 +30,7 @@ neo4j_data/
 
 # Runtime data (generated at runtime, not source)
 data/
+
+# Claude Code / gstack skills (vendored tooling)
+.claude/
+AGENTS.md
