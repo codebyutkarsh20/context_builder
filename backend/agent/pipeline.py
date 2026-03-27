@@ -433,7 +433,9 @@ FILES READ DURING EXPLORATION:
 {list(source_code.keys())}
 {embedding_hint}
 
-Extract the most likely fault location. If both the exploration and semantic search agree on a file, weight it higher."""
+Extract the most likely fault location.
+IMPORTANT: fault_files must contain ONLY source files where the bug lives — NOT test files,
+config files, or documentation. Test files (test_*.py, conftest.py) are never fault locations."""
             loc = _structured_call("claude-sonnet-4-6", 800, LocalizationResult, parse_prompt)
 
             # Merge: ensure embedding-suggested files appear in fault_files if relevant
@@ -443,8 +445,17 @@ Extract the most likely fault location. If both the exploration and semantic sea
                     # Only add if not already covered
                     merged_fault_files.append(ef)
 
+            # Filter out test/config files from fault_files — they're never the fault location
+            clean_fault_files = [
+                f for f in merged_fault_files
+                if not any(p in f for p in ("test_", "conftest", "/tests/", "/__pycache__/", ".json", ".md", ".yml"))
+            ]
+            # Keep at least the original localization files if filter removed everything
+            if not clean_fault_files:
+                clean_fault_files = list(loc.fault_files)[:3]
+
             loc_dict = loc.model_dump()
-            loc_dict["fault_files"] = merged_fault_files
+            loc_dict["fault_files"] = clean_fault_files
             state["localization"] = loc_dict
             logger.info("Exploration localization: confidence=%.2f files=%s",
                         loc.confidence, merged_fault_files)
@@ -1204,7 +1215,8 @@ TARGET FUNCTIONS: {localization.get('fault_functions', [])} in {localization.get
 {source_section}
 
 A correct RepairResult has:
-- `patches`: one entry per function you change.
+- `patches`: one entry per function you fix. You MUST patch ALL target functions listed above —
+  fixing only some of them is an incomplete fix and will be rejected by the reviewer.
   - `original_code`: copy the function EXACTLY as shown above, starting from the `def` line.
     Character-for-character. Same indentation, same newlines. Do NOT truncate or paraphrase.
   - `patched_code`: the corrected function. Must differ from original_code.
@@ -1417,10 +1429,16 @@ def review_node(state: AgentState) -> AgentState:
         criteria_section = "\nACCEPTANCE CRITERIA (from the bug spec — the fix must satisfy these):\n"
         criteria_section += "\n".join(f"  - {c}" for c in acceptance)
 
+    # Pass localization info to reviewer so it can check completeness
+    localization = state.get("localization", {})
+    fault_functions = localization.get("fault_functions", [])
+    fault_files = localization.get("fault_files", [])
+
     prompt = f"""Review this bug fix as an independent reviewer who has NOT seen the developer's code.
 
 BUG: {intent.get('actual_behavior', '')}
 EXPECTED: {intent.get('expected_behavior', '')}
+IDENTIFIED FAULT LOCATIONS: functions={fault_functions} in files={fault_files}
 {criteria_section}
 
 PROPOSED PATCHES:
@@ -1436,7 +1454,8 @@ A correct review produces:
 - ROOT_CAUSE passes when the fix addresses why the bug happens, not just the symptom
 - BUSINESS_RULES passes when no rules from the context above are violated
 - PATTERNS passes when code follows existing conventions (naming, imports, style)
-- COMPLETENESS passes when every changed function is wired into its call sites (no dead code)
+- COMPLETENESS: FAIL if localization identified N fault functions but patches only fix fewer than N.
+  Every identified fault site must be patched. Also FAIL if new functions are defined but never called.
 - BLAST_RADIUS passes when downstream consumers (listed above) are not broken
 - TESTS passes when test_patches contains real test code covering the fix
 - verdict: APPROVE (all pass), CHANGES_REQUESTED (concrete failures), ESCALATE (too complex)"""
