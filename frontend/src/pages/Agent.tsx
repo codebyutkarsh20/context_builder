@@ -367,7 +367,7 @@ function TraceLogPanel({ events, isLive }: { events: TraceEvent[]; isLive: boole
             {events.length === 0 ? 'Waiting for trace events...' : 'No events match this filter'}
           </div>
         ) : (
-          filtered.map((evt) => <TraceEventRow key={evt.index} evt={evt} />)
+          filtered.map((evt, i) => <TraceEventRow key={`${evt.index}-${i}`} evt={evt} />)
         )}
       </div>
     </div>
@@ -488,7 +488,11 @@ export default function AgentPage() {
     setTraceIsLive(true)
     traceUnsubRef.current = subscribeToTrace(
       jobId,
-      (evt) => setTraceEvents(prev => [...prev, evt]),
+      (evt) => setTraceEvents(prev => {
+        // Deduplicate by index — SSE catchup + live stream can overlap
+        if (prev.length > 0 && evt.index <= prev[prev.length - 1].index) return prev
+        return [...prev, evt]
+      }),
       () => setTraceIsLive(false),
       () => setTraceIsLive(false),
     )

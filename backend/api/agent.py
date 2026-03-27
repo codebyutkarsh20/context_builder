@@ -223,17 +223,24 @@ def stream_trace(job_id: str):
     def event_generator():
         q = trace.subscribe()
         try:
-            # Catch up: send all existing events
-            for evt in trace.events_since(0):
+            # Catch up: send all existing events and track last index sent
+            existing = trace.events_since(0)
+            last_sent_idx = -1
+            for evt in existing:
                 yield f"data: {json.dumps(evt, default=str)}\n\n"
+                last_sent_idx = evt.get("index", last_sent_idx)
 
-            # Stream new events
+            # Stream new events — deduplicate by index
             while True:
                 try:
                     evt = q.get(timeout=30)
                     if evt is None:  # sentinel = trace complete
                         yield f"event: done\ndata: {{}}\n\n"
                         break
+                    # Skip events already sent during catchup
+                    if evt.index <= last_sent_idx:
+                        continue
+                    last_sent_idx = evt.index
                     yield f"data: {json.dumps(evt.to_dict(), default=str)}\n\n"
                 except queue.Empty:
                     yield f": keepalive\n\n"
