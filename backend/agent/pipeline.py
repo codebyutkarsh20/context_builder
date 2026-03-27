@@ -1685,6 +1685,9 @@ IDENTIFIED FAULT LOCATIONS: functions={fault_functions} in files={fault_files}
 PROPOSED PATCHES:
 {json.dumps(clean_patches, indent=2)}
 
+TEST PATCHES:
+{json.dumps([{k: v for k, v in tp.items() if not k.startswith("_")} for tp in repair.get("test_patches", [])], indent=2)}
+
 FIX EXPLANATION: {repair.get('explanation', '')}
 
 INDEPENDENT CONTEXT (from knowledge graph):
