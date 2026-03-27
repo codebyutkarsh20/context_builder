@@ -338,14 +338,27 @@ export interface AgentJobStatus {
     test_result?: string
   } | null
   error: string
+  debug?: boolean
+}
+
+// ─── Trace / Observability ──────────────────────────────────────────────────
+
+export interface TraceEvent {
+  index: number
+  timestamp: number
+  wall_time: string
+  event_type: 'stage_start' | 'stage_end' | 'llm_request' | 'llm_response' | 'tool_call' | 'tool_result' | 'patch_candidate' | 'test_output' | 'error' | 'info'
+  stage: string
+  data: Record<string, unknown>
 }
 
 export function listAgentTickets(): Promise<AgentTicket[]> {
   return request<AgentTicket[]>('/api/agent/tickets')
 }
 
-export function runMockTicket(ticketId: string): Promise<{ job_id: string; status: string }> {
-  return request<{ job_id: string; status: string }>(`/api/agent/run-mock/${ticketId}`, {
+export function runMockTicket(ticketId: string, debug = false): Promise<{ job_id: string; status: string; debug?: boolean }> {
+  const params = debug ? '?debug=true' : ''
+  return request<{ job_id: string; status: string; debug?: boolean }>(`/api/agent/run-mock/${ticketId}${params}`, {
     method: 'POST',
   })
 }
@@ -358,12 +371,50 @@ export function runAgentTicket(ticket: {
   repo_path?: string
   priority?: string
   affected_component?: string
-}): Promise<{ job_id: string; status: string }> {
-  return request<{ job_id: string; status: string }>('/api/agent/run', {
+  debug?: boolean
+}): Promise<{ job_id: string; status: string; debug?: boolean }> {
+  return request<{ job_id: string; status: string; debug?: boolean }>('/api/agent/run', {
     method: 'POST',
     body: JSON.stringify(ticket),
     timeout: 10_000, // POST returns immediately with job_id
   })
+}
+
+/**
+ * Subscribe to live trace events via SSE. Returns an unsubscribe function.
+ */
+export function subscribeToTrace(
+  jobId: string,
+  onEvent: (event: TraceEvent) => void,
+  onDone: () => void,
+  onError?: (err: Event) => void,
+): () => void {
+  const url = `${BASE_URL}/api/agent/trace/${jobId}`
+  const eventSource = new EventSource(url)
+
+  eventSource.onmessage = (e) => {
+    try {
+      onEvent(JSON.parse(e.data) as TraceEvent)
+    } catch {
+      // ignore parse errors
+    }
+  }
+
+  eventSource.addEventListener('done', () => {
+    onDone()
+    eventSource.close()
+  })
+
+  eventSource.onerror = (e) => {
+    if (onError) onError(e)
+    eventSource.close()
+  }
+
+  return () => eventSource.close()
+}
+
+export function getTraceReport(jobId: string): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>(`/api/agent/trace/${jobId}/report`)
 }
 
 export function getAgentJobStatus(jobId: string): Promise<AgentJobStatus> {

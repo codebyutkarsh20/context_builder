@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -50,8 +51,21 @@ MAX_ITERATIONS = 3
 MIN_CONFIDENCE_TO_REPAIR = 0.3
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 
-# Thread-local storage for per-run progress callback
+# Thread-local storage for per-run progress callback + trace
 _thread_local = threading.local()
+
+
+def _get_trace():
+    """Return the active RunTrace for this thread, or None."""
+    return getattr(_thread_local, "trace", None)
+
+
+def _emit_trace(event_type: str, data: dict | None = None):
+    """Emit a trace event if tracing is active."""
+    trace = _get_trace()
+    if trace:
+        stage = getattr(_thread_local, "current_stage", "unknown")
+        trace.emit(event_type, stage, data)
 
 # Binary extensions — skip these in read_source_node
 _BINARY_EXTENSIONS = frozenset({
@@ -95,24 +109,57 @@ def _structured_call(model: str, max_tokens: int, schema: type, prompt: str, ret
     approx_tokens = len(prompt) // 4
     logger.info("LLM call: model=%s schema=%s ~%d input tokens", model, schema.__name__, approx_tokens)
 
+    _emit_trace("llm_request", {
+        "model": model,
+        "schema": schema.__name__,
+        "max_tokens": max_tokens,
+        "prompt_tokens_approx": approx_tokens,
+        "prompt_preview": prompt[:2000],
+        "prompt_full": prompt,
+    })
+
     llm = ChatAnthropic(model=model, max_tokens=max_tokens, timeout=120.0, max_retries=2)
     structured = llm.with_structured_output(schema)
 
+    t0 = time.monotonic()
     try:
-        return structured.invoke(prompt)
+        result = structured.invoke(prompt)
+        duration_ms = round((time.monotonic() - t0) * 1000)
+        _emit_trace("llm_response", {
+            "model": model,
+            "schema": schema.__name__,
+            "duration_ms": duration_ms,
+            "output": result.model_dump() if hasattr(result, "model_dump") else str(result),
+        })
+        return result
     except Exception as first_err:
+        duration_ms = round((time.monotonic() - t0) * 1000)
+        _emit_trace("error", {
+            "message": f"Structured call failed: {str(first_err)[:500]}",
+            "model": model,
+            "schema": schema.__name__,
+            "duration_ms": duration_ms,
+        })
         if retries <= 0:
             raise
         logger.warning("Structured output failed (%s), retrying", first_err)
-        # Truncate error message so it doesn't blow up the context window, but
-        # keep enough to diagnose which fields failed (ValidationError dumps all fields).
         error_msg = str(first_err)[:1000]
         retry_prompt = (
             f"Your previous response failed: {error_msg}\n"
             "Please try again. Respond with the exact structured data requested.\n\n"
             + prompt
         )
-        return structured.invoke(retry_prompt)
+        t1 = time.monotonic()
+        result = structured.invoke(retry_prompt)
+        duration_ms = round((time.monotonic() - t1) * 1000)
+        _emit_trace("llm_response", {
+            "model": model,
+            "schema": schema.__name__,
+            "duration_ms": duration_ms,
+            "retry": True,
+            "output": result.model_dump() if hasattr(result, "model_dump") else str(result),
+        })
+        return result
 
 
 def _resolve_repo_path(work_order: dict) -> Path | None:
@@ -159,6 +206,10 @@ def _resolve_repo_path(work_order: dict) -> Path | None:
 
 def intake_node(state: AgentState) -> AgentState:
     """Stage 1: Translate bug ticket into technical spec via structured output."""
+    _thread_local.current_stage = "intake"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("intake")
     logger.info("=== INTAKE: Translating bug ticket intent ===")
     state["status"] = PipelineStatus.INTAKE
     _report_progress(state)
@@ -193,11 +244,17 @@ flag name should log a warning message"."""
         }
 
     state["iteration_count"] = 0
+    if trace:
+        trace.stage_end("intake")
     return state
 
 
 def context_assembly_node(state: AgentState) -> AgentState:
     """Stage 2: Query Graph RAG to assemble targeted context."""
+    _thread_local.current_stage = "context_assembly"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("context_assembly")
     logger.info("=== CONTEXT ASSEMBLY: Building targeted context via Graph RAG ===")
     state["status"] = PipelineStatus.CONTEXT
     _report_progress(state)
@@ -241,6 +298,8 @@ def context_assembly_node(state: AgentState) -> AgentState:
             state["context"] = "No context available."
         state["context_nodes"] = 0
 
+    if trace:
+        trace.stage_end("context_assembly")
     return state
 
 
@@ -253,6 +312,10 @@ def exploration_node(state: AgentState) -> AgentState:
 
     Replaces the old context_assembly + localization + read_source combo.
     """
+    _thread_local.current_stage = "exploration"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("exploration")
     logger.info("=== EXPLORATION: Agent actively exploring the codebase ===")
     state["status"] = PipelineStatus.EXPLORING
     _report_progress(state)
@@ -351,8 +414,16 @@ Find the bug and write your findings summary."""
             logger.info("Exploration tool call %d/%d: %s(%s)",
                         tool_call_count, MAX_TOOL_CALLS, tool_name, str(tool_args)[:100])
 
+            _emit_trace("tool_call", {
+                "tool_name": tool_name,
+                "args": tool_args,
+                "call_number": tool_call_count,
+                "max_calls": MAX_TOOL_CALLS,
+            })
+
             # Find and invoke the tool
             result_str = f"Tool '{tool_name}' not found"
+            tool_t0 = time.monotonic()
             for t in ALL_TOOLS:
                 if t.name == tool_name:
                     try:
@@ -360,6 +431,14 @@ Find the bug and write your findings summary."""
                     except Exception as te:
                         result_str = f"Tool error: {te}"
                     break
+            tool_duration = round((time.monotonic() - tool_t0) * 1000)
+
+            _emit_trace("tool_result", {
+                "tool_name": tool_name,
+                "duration_ms": tool_duration,
+                "result_preview": str(result_str)[:500],
+                "result_full": str(result_str),
+            })
 
             # Log the tool call
             exploration_log.append({
@@ -488,11 +567,17 @@ config files, or documentation. Test files (test_*.py, conftest.py) are never fa
 
     logger.info("Exploration done: %d tool calls, %d files read, summary_len=%d",
                 tool_call_count, len(source_code), len(final_summary))
+    if trace:
+        trace.stage_end("exploration")
     return state
 
 
 def localization_node(state: AgentState) -> AgentState:
     """Stage 3: Localize the fault using structured output."""
+    _thread_local.current_stage = "localization"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("localization")
     logger.info("=== LOCALIZATION: Finding the fault site ===")
     state["status"] = PipelineStatus.LOCALIZING
     _report_progress(state)
@@ -526,6 +611,8 @@ Be specific about file paths and function names visible in the context."""
             "evidence": [],
         }
 
+    if trace:
+        trace.stage_end("localization")
     return state
 
 
@@ -792,6 +879,10 @@ def read_source_node(state: AgentState) -> AgentState:
     3. Read caller files (where the fix needs to be wired in)
     4. Add enriched symbol info (docstrings, params, call chains)
     """
+    _thread_local.current_stage = "read_source"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("read_source")
     logger.info("=== READ SOURCE: Loading code via knowledge graph ===")
     state["status"] = PipelineStatus.READING_SOURCE
     _report_progress(state)
@@ -903,6 +994,8 @@ def read_source_node(state: AgentState) -> AgentState:
                 len(source_code) - (1 if enrichment else 0),
                 min(len(fault_files), 5), len(caller_files),
                 "knowledge graph" if has_graph else "grep fallback")
+    if trace:
+        trace.stage_end("read_source")
     return state
 
 
@@ -1141,6 +1234,10 @@ def repair_node(state: AgentState) -> AgentState:
     6. If LLM needs more files, read them and re-run
     7. Syntax-check is done in test_node before commit
     """
+    _thread_local.current_stage = "repair"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("repair")
     logger.info("=== REPAIR: Generating fix (iteration %d) ===", state.get("iteration_count", 0) + 1)
     state["status"] = PipelineStatus.REPAIRING
     state["iteration_count"] = state.get("iteration_count", 0) + 1
@@ -1361,15 +1458,27 @@ Produce the RepairResult with this patch now."""
 
             repair_dump["patches"] = verified
 
+            # Trace: emit each patch candidate
+            for p in verified:
+                _emit_trace("patch_candidate", {
+                    "file_path": p.get("file_path", ""),
+                    "explanation": p.get("explanation", ""),
+                    "has_original": bool(p.get("original_code")),
+                    "has_patched": bool(p.get("patched_code")),
+                })
+
         state["repair"] = repair_dump
     except Exception as e:
         logger.error("Repair failed: %s", e)
+        _emit_trace("error", {"message": f"Repair failed: {e}"})
         state["repair"] = {
             "patches": [],
             "explanation": f"Repair generation failed: {e}",
             "tests_added": [],
         }
 
+    if trace:
+        trace.stage_end("repair")
     return state
 
 
@@ -1417,6 +1526,10 @@ def _build_reviewer_context(repo_name: str, modified_files: list[str]) -> str:
 
 def review_node(state: AgentState) -> AgentState:
     """Stage 5: Independent review with Opus — fresh context, no developer bias."""
+    _thread_local.current_stage = "review"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("review")
     logger.info("=== REVIEW: Independent check with Opus ===")
     state["status"] = PipelineStatus.REVIEWING
     _report_progress(state)
@@ -1519,11 +1632,17 @@ A correct review produces:
                 "feedback": f"Review failed: {e2}",
             }
 
+    if trace:
+        trace.stage_end("review")
     return state
 
 
 def test_node(state: AgentState) -> AgentState:
     """Stage 5.5: Create sandbox via git worktree, apply patches, run tests."""
+    _thread_local.current_stage = "test"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("test")
     logger.info("=== TEST: Creating sandbox and running tests ===")
     state["status"] = PipelineStatus.TESTING
     _report_progress(state)
@@ -1731,6 +1850,11 @@ def test_node(state: AgentState) -> AgentState:
         # Auto-detect and run tests
         test_result = _run_tests(worktree_path)
         state["test_result"] = test_result
+        _emit_trace("test_output", {
+            "result": test_result,
+            "passed": test_result.startswith("passed"),
+            "patches_applied": patches_applied,
+        })
 
     except subprocess.CalledProcessError as e:
         logger.error("Sandbox/test operation failed: %s — %s", e, e.stderr)
@@ -1767,11 +1891,17 @@ def test_node(state: AgentState) -> AgentState:
             state["review"] = review
             logger.info("Upgraded review verdict to APPROVE — tests now pass")
 
+    if trace:
+        trace.stage_end("test")
     return state
 
 
 def pr_creation_node(state: AgentState) -> AgentState:
     """Stage 6: Push branch and create GitHub PR from sandbox."""
+    _thread_local.current_stage = "pr_creation"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("pr_creation")
     logger.info("=== PR CREATION: Pushing branch and creating PR ===")
     state["status"] = PipelineStatus.PR_CREATING
     _report_progress(state)
@@ -1908,6 +2038,8 @@ def pr_creation_node(state: AgentState) -> AgentState:
 
     state["status"] = PipelineStatus.DONE
     _report_progress(state)
+    if trace:
+        trace.stage_end("pr_creation")
     return state
 
 
@@ -1952,6 +2084,12 @@ def _enrich_from_fix(state: AgentState) -> None:
 
 def escalate_node(state: AgentState) -> AgentState:
     """Escalate to human when agent can't fix confidently."""
+    _thread_local.current_stage = "escalate"
+    _emit_trace("info", {
+        "message": "Escalating to human",
+        "iterations": state.get("iteration_count", 0),
+        "last_feedback": state.get("review", {}).get("feedback", ""),
+    })
     logger.info("=== ESCALATE: Agent cannot fix with confidence ===")
     state["status"] = PipelineStatus.ESCALATED
     state["error"] = (
@@ -2092,9 +2230,21 @@ def build_agent_graph():
 agent_app = build_agent_graph()
 
 
-def run_ticket(work_order: dict, progress_cb: Callable[[AgentState], None] | None = None) -> dict:
-    """Run a bug ticket through the full agent pipeline."""
+def run_ticket(
+    work_order: dict,
+    progress_cb: Callable[[AgentState], None] | None = None,
+    trace=None,
+) -> dict:
+    """Run a bug ticket through the full agent pipeline.
+
+    Args:
+        work_order: Bug ticket work order dict.
+        progress_cb: Optional callback for progress updates.
+        trace: Optional RunTrace instance for observability.
+    """
     _thread_local.progress_callback = progress_cb
+    _thread_local.trace = trace
+    _thread_local.current_stage = "pending"
 
     initial_state: AgentState = {
         "work_order": work_order,
@@ -2128,3 +2278,6 @@ def run_ticket(work_order: dict, progress_cb: Callable[[AgentState], None] | Non
         return result_dict
     finally:
         _thread_local.progress_callback = None
+        if trace:
+            trace.complete()
+        _thread_local.trace = None
