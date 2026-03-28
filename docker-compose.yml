@@ -40,7 +40,7 @@ services:
       - repo_mounts:/repos
       - context_data:/data
       - chroma_cache:/root/.cache/chroma
-      - /Users/utkarshpatidar:/Users/utkarshpatidar:ro
+      - /Users/utkarshpatidar:/Users/utkarshpatidar:rw
     depends_on:
       neo4j:
         condition: service_healthy
