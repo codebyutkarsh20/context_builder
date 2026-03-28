@@ -173,11 +173,25 @@ class GraphRAGRetriever:
     # Merge and rank (Reciprocal Rank Fusion)
     # ------------------------------------------------------------------
 
-    def _merge_and_rank(self, *result_lists: list[ScoredNode]) -> list[ScoredNode]:
-        """Merge multiple result lists using Reciprocal Rank Fusion."""
+    def _merge_and_rank(self, *result_lists: list[ScoredNode], K: int = 60) -> list[ScoredNode]:
+        """Merge multiple result lists using Reciprocal Rank Fusion.
+
+        Args:
+            *result_lists: Variable number of ranked result lists to fuse.
+            K: The RRF constant (must be a positive integer; conventionally 60).
+               A ValueError is raised immediately if K <= 0 so that
+               misconfiguration is caught at call time rather than silently
+               producing a ZeroDivisionError during score computation.
+        """
+        if K <= 0:
+            raise ValueError(
+                f"RRF constant K must be a positive integer (conventionally 60), "
+                f"but got K={K}. A value of 0 would cause a ZeroDivisionError "
+                f"when rank=0."
+            )
+
         scores: dict[str, float] = {}
         node_map: dict[str, ScoredNode] = {}
-        K = 60  # RRF constant
 
         for results in result_lists:
             for rank, node in enumerate(results):
