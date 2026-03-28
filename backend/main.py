@@ -10,9 +10,18 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 load_dotenv()  # Also check backend/.env
 
 import logging
+import os
+from logging.handlers import RotatingFileHandler
+
+_log_dir = os.environ.get("DATA_DIR", "/data")
+_log_path = os.path.join(_log_dir, "agent_runs.log")
+_file_handler = RotatingFileHandler(_log_path, maxBytes=10 * 1024 * 1024, backupCount=5)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s — %(message)s"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
+    handlers=[logging.StreamHandler(), _file_handler],
 )
 for _lib in ("httpcore", "httpx", "chromadb", "urllib3", "openai._base_client",
              "chromadb.telemetry", "chromadb.telemetry.product.posthog"):

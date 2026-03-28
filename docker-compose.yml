@@ -35,6 +35,8 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
       ANONYMIZED_TELEMETRY: "False"
       CHROMA_TELEMETRY: "false"
+      GH_TOKEN: ${GH_TOKEN}
+      GITHUB_TOKEN: ${GH_TOKEN}
     volumes:
       - ./backend:/app
       - repo_mounts:/repos

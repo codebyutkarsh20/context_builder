@@ -2386,7 +2386,11 @@ def test_node(state: AgentState) -> AgentState:
         )
         commit_msg = f"fix({ticket_id}): {repair.get('explanation', 'Automated fix')[:200]}"
         subprocess.run(
-            ["git", "commit", "-m", commit_msg],
+            [
+                "git", "-c", "user.email=agent@context-builder.ai",
+                "-c", "user.name=Context Builder Agent",
+                "commit", "-m", commit_msg,
+            ],
             cwd=worktree_path, capture_output=True, text=True, check=True, timeout=30,
         )
         logger.info("Committed %d patches in sandbox", patches_applied)
@@ -2396,6 +2400,15 @@ def test_node(state: AgentState) -> AgentState:
         if repro_steps:
             logger.info("Reproduction steps available (%d steps) — can be used for test generation", len(repro_steps))
             # Inject into any stub test generation prompts
+
+        # Install repo dependencies in sandbox if requirements.txt present
+        req_file = worktree_path / "requirements.txt"
+        if req_file.exists():
+            logger.info("Installing sandbox dependencies from requirements.txt")
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "-q"],
+                cwd=worktree_path, capture_output=True, text=True, timeout=120,
+            )
 
         # Run targeted tests first (faster feedback), then the full suite
         fault_files = state.get("localization", {}).get("fault_files", [])
@@ -2515,10 +2528,21 @@ def pr_creation_node(state: AgentState) -> AgentState:
         return state
 
     try:
-        # Push branch to remote
+        # Push branch to remote — inject GH_TOKEN into git credential helper
+        gh_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+        push_env = {**os.environ}
+        if gh_token:
+            push_env["GIT_ASKPASS"] = "echo"
+            push_env["GIT_USERNAME"] = "x-access-token"
+            push_env["GIT_PASSWORD"] = gh_token
+            # Rewrite remote URL to use token inline for HTTPS
+            subprocess.run(
+                ["git", "config", "url.https://x-access-token:" + gh_token + "@github.com/.insteadOf", "https://github.com/"],
+                cwd=sandbox_path, capture_output=True, text=True,
+            )
         push_result = subprocess.run(
             ["git", "push", "-u", "origin", branch_name],
-            cwd=sandbox_path, capture_output=True, text=True, timeout=120,
+            cwd=sandbox_path, capture_output=True, text=True, timeout=120, env=push_env,
         )
         if push_result.returncode != 0:
             logger.warning("Git push failed: %s", push_result.stderr)
@@ -2599,6 +2623,7 @@ def pr_creation_node(state: AgentState) -> AgentState:
              "--base", base_branch,
              "--head", branch_name],
             cwd=sandbox_path, capture_output=True, text=True, timeout=60,
+            env={**os.environ, "GH_TOKEN": gh_token} if gh_token else None,
         )
 
         if pr_result.returncode == 0:
