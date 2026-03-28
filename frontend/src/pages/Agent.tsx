@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Cpu, Play, Loader2, CheckCircle2, XCircle, AlertTriangle,
   ArrowRight, FileCode, Bug, Wrench, Eye, GitPullRequest,
-  Target, Brain, Shield, Clock, Search, ChevronDown, ChevronRight,
+  Target, Brain, Shield, Search, ChevronDown, ChevronRight,
   Terminal, Filter, Zap, MessageSquare, TestTube, Layers,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
@@ -500,28 +500,276 @@ function getOutcomeDisplay(activeJob: AgentJobStatus) {
   const status = activeJob.status
   const reviewVerdict = result?.review?.verdict
 
-  // Pipeline-level status takes precedence
   if (status === 'escalated') {
     return { label: 'Escalated to Human', icon: AlertTriangle, iconColor: 'text-yellow-400', bg: 'bg-yellow-950/30 border-yellow-800/40' }
   }
   if (status === 'failed') {
     return { label: 'Pipeline Failed', icon: XCircle, iconColor: 'text-red-400', bg: 'bg-red-950/30 border-red-800/40' }
   }
-
-  // Then check review verdict for done jobs
   if (status === 'done' && reviewVerdict === 'APPROVE') {
     return { label: 'Fix Approved', icon: CheckCircle2, iconColor: 'text-green-400', bg: 'bg-green-950/30 border-green-800/40' }
   }
   if (status === 'done' && (reviewVerdict === 'ESCALATE' || reviewVerdict === 'CHANGES_REQUESTED')) {
     return { label: reviewVerdict === 'ESCALATE' ? 'Escalated to Human' : 'Changes Requested', icon: AlertTriangle, iconColor: 'text-yellow-400', bg: 'bg-yellow-950/30 border-yellow-800/40' }
   }
-  // Done with unexpected/missing verdict — still show as completed
   if (status === 'done') {
     return { label: 'Completed', icon: CheckCircle2, iconColor: 'text-green-400', bg: 'bg-green-950/30 border-green-800/40' }
   }
-
-  // Still running
   return { label: 'Running...', icon: Loader2, iconColor: 'text-blue-400', bg: 'bg-zinc-900 border-zinc-800' }
+}
+
+// ─── Result Flow Tabs ──────────────────────────────────────────────────────
+
+type ResultTab = 'localization' | 'changes' | 'tests' | 'review' | 'pr'
+
+const RESULT_TABS: { key: ResultTab; label: string; icon: typeof Target }[] = [
+  { key: 'localization', label: 'Localization', icon: Target },
+  { key: 'changes', label: 'Code Changes', icon: Wrench },
+  { key: 'tests', label: 'Tests', icon: TestTube },
+  { key: 'review', label: 'Review', icon: Eye },
+  { key: 'pr', label: 'PR & Deploy', icon: GitPullRequest },
+]
+
+function ResultFlowView({ job }: { job: AgentJobStatus }) {
+  const [activeTab, setActiveTab] = useState<ResultTab>('localization')
+  const result = job.result
+  if (!result) return null
+
+  const outcome = getOutcomeDisplay(job)
+  const OutcomeIcon = outcome.icon
+  const patches = result.repair?.patches ?? []
+  const testPatches = result.repair?.test_patches ?? []
+  const checks = result.review?.checks ?? []
+  const passCount = checks.filter(c => c.status === 'PASS').length
+
+  // Tab status indicators
+  const tabStatus = (key: ResultTab): 'done' | 'warn' | 'fail' | 'none' => {
+    if (key === 'localization') return result.localization?.confidence ? (result.localization.confidence > 0.5 ? 'done' : 'warn') : 'none'
+    if (key === 'changes') return patches.length > 0 ? 'done' : 'fail'
+    if (key === 'tests') return result.test_result?.includes('passed') ? 'done' : testPatches.length > 0 ? 'warn' : 'none'
+    if (key === 'review') return result.review?.verdict === 'APPROVE' ? 'done' : result.review?.verdict ? 'warn' : 'none'
+    if (key === 'pr') return result.pr_url ? 'done' : 'none'
+    return 'none'
+  }
+
+  const statusDot = (s: ReturnType<typeof tabStatus>) =>
+    s === 'done' ? 'bg-green-400' : s === 'warn' ? 'bg-yellow-400' : s === 'fail' ? 'bg-red-400' : 'bg-zinc-700'
+
+  return (
+    <div className="space-y-4">
+      {/* Status Banner */}
+      <div className={cn('p-4 rounded-xl border flex items-center justify-between', outcome.bg)}>
+        <div className="flex items-center gap-3">
+          <OutcomeIcon className={cn('w-6 h-6', outcome.iconColor, outcome.label === 'Running...' && 'animate-spin')} />
+          <div>
+            <span className="text-base font-bold text-zinc-100">{outcome.label}</span>
+            {job.error && <p className="text-xs text-red-400 mt-0.5 max-w-xl truncate">{job.error}</p>}
+          </div>
+        </div>
+        <div className="flex items-center gap-4 text-xs text-zinc-400">
+          {result.localization?.confidence != null && (
+            <div className="text-center">
+              <div className="text-lg font-bold text-zinc-200">{Math.round(result.localization.confidence * 100)}%</div>
+              <div className="text-[10px] text-zinc-600">localization</div>
+            </div>
+          )}
+          {patches.length > 0 && (
+            <div className="text-center">
+              <div className="text-lg font-bold text-zinc-200">{patches.length}</div>
+              <div className="text-[10px] text-zinc-600">patches</div>
+            </div>
+          )}
+          {checks.length > 0 && (
+            <div className="text-center">
+              <div className="text-lg font-bold text-zinc-200">{passCount}/{checks.length}</div>
+              <div className="text-[10px] text-zinc-600">checks</div>
+            </div>
+          )}
+          <div className="text-center">
+            <div className="text-lg font-bold text-zinc-200">{job.iteration_count}</div>
+            <div className="text-[10px] text-zinc-600">iterations</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Flow Tabs */}
+      <div className="flex gap-1 bg-zinc-900 rounded-xl p-1 border border-zinc-800">
+        {RESULT_TABS.map((tab, idx) => {
+          const Icon = tab.icon
+          const status = tabStatus(tab.key)
+          const isActive = activeTab === tab.key
+          return (
+            <button
+              key={tab.key}
+              onClick={() => setActiveTab(tab.key)}
+              className={cn(
+                'flex-1 flex items-center justify-center gap-2 px-3 py-2.5 rounded-lg text-xs font-medium transition-all relative',
+                isActive
+                  ? 'bg-zinc-800 text-zinc-100 shadow-sm'
+                  : 'text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800/50'
+              )}
+            >
+              <Icon className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">{tab.label}</span>
+              <span className={cn('w-1.5 h-1.5 rounded-full absolute top-1.5 right-1.5', statusDot(status))} />
+              {idx < RESULT_TABS.length - 1 && !isActive && (
+                <ArrowRight className="w-3 h-3 text-zinc-800 absolute -right-2 z-10" />
+              )}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* Tab Content */}
+      <div className="min-h-[300px]">
+        {activeTab === 'localization' && (
+          <div className="space-y-4">
+            {result.localization ? (
+              <div className="p-5 rounded-xl bg-zinc-900 border border-zinc-800">
+                <div className="flex items-center gap-2 mb-4">
+                  <Target className="w-5 h-5 text-amber-400" />
+                  <h3 className="text-sm font-bold text-zinc-200">Root Cause Analysis</h3>
+                  {result.localization.confidence > 0 && (
+                    <span className="ml-auto px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-400 text-xs font-bold border border-amber-500/20">
+                      {Math.round(result.localization.confidence * 100)}% confident
+                    </span>
+                  )}
+                </div>
+                <p className="text-sm text-zinc-300 leading-relaxed mb-4">{result.localization.root_cause_hypothesis}</p>
+                <div>
+                  <p className="text-[10px] font-bold text-zinc-600 uppercase mb-2">Fault Files</p>
+                  <div className="flex flex-wrap gap-2">
+                    {result.localization.fault_files?.map((f: string) => (
+                      <span key={f} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 border border-zinc-700/50 text-xs text-zinc-300 font-mono">
+                        <FileCode className="w-3.5 h-3.5 text-amber-400" />{f}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                {result.localization.fault_functions?.length > 0 && (
+                  <div className="mt-3">
+                    <p className="text-[10px] font-bold text-zinc-600 uppercase mb-2">Fault Functions</p>
+                    <div className="flex flex-wrap gap-2">
+                      {result.localization.fault_functions.map((f: string) => (
+                        <span key={f} className="px-3 py-1.5 rounded-lg bg-orange-500/10 border border-orange-500/20 text-xs text-orange-300 font-mono">{f}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="flex items-center justify-center py-12 text-sm text-zinc-600">No localization data</div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'changes' && (
+          <div className="space-y-4">
+            {patches.length > 0 ? (
+              <>
+                {result.repair?.explanation && (
+                  <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+                    <p className="text-sm text-zinc-300">{result.repair.explanation}</p>
+                  </div>
+                )}
+                <div className="space-y-3">
+                  {patches.map((p) => (
+                    <PatchCard key={p.file_path || p.explanation} patch={p} />
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="flex items-center justify-center py-12 text-sm text-zinc-600">No code changes generated</div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'tests' && (
+          <div className="space-y-4">
+            {/* Test patches */}
+            {testPatches.length > 0 && (
+              <div className="space-y-3">
+                <h4 className="text-xs font-bold text-zinc-400 uppercase">Generated Tests</h4>
+                {testPatches.map((p) => (
+                  <PatchCard key={p.file_path || 'test'} patch={p} />
+                ))}
+              </div>
+            )}
+            {/* Test execution results */}
+            {result.test_result ? (
+              <div className={cn('p-5 rounded-xl border',
+                result.test_result.includes('passed') ? 'bg-green-950/20 border-green-800/30' : 'bg-red-950/20 border-red-800/30'
+              )}>
+                <div className="flex items-center gap-2 mb-3">
+                  <Shield className={cn('w-5 h-5', result.test_result.includes('passed') ? 'text-green-400' : 'text-red-400')} />
+                  <h3 className="text-sm font-bold text-zinc-200">Test Execution</h3>
+                </div>
+                <pre className="text-xs font-mono text-zinc-300 whitespace-pre-wrap bg-zinc-950/50 rounded-lg p-3">{result.test_result}</pre>
+              </div>
+            ) : testPatches.length === 0 ? (
+              <div className="flex items-center justify-center py-12 text-sm text-zinc-600">No test data</div>
+            ) : null}
+          </div>
+        )}
+
+        {activeTab === 'review' && (
+          <div className="space-y-4">
+            {checks.length > 0 ? (
+              <div className="p-5 rounded-xl bg-zinc-900 border border-zinc-800">
+                <div className="flex items-center gap-2 mb-4">
+                  <Eye className="w-5 h-5 text-cyan-400" />
+                  <h3 className="text-sm font-bold text-zinc-200">
+                    Review: <span className={cn(
+                      result.review?.verdict === 'APPROVE' ? 'text-green-400' :
+                      result.review?.verdict === 'CHANGES_REQUESTED' ? 'text-yellow-400' : 'text-red-400'
+                    )}>{result.review?.verdict}</span>
+                  </h3>
+                  {result.review?.confidence != null && (
+                    <span className="ml-auto text-xs font-mono text-zinc-500">{Math.round(Number(result.review.confidence) * 100)}% confidence</span>
+                  )}
+                </div>
+                <ReviewChecks checks={checks} />
+                {result.review?.feedback && (
+                  <div className="mt-4 p-3 rounded-lg bg-zinc-800/50 border border-zinc-700/30">
+                    <p className="text-[10px] font-bold text-zinc-600 uppercase mb-1">Reviewer Feedback</p>
+                    <p className="text-xs text-zinc-400 leading-relaxed">{result.review.feedback}</p>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="flex items-center justify-center py-12 text-sm text-zinc-600">No review data</div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'pr' && (
+          <div className="space-y-4">
+            {result.pr_url ? (
+              <div className="p-6 rounded-xl bg-green-950/20 border border-green-800/30 text-center">
+                <GitPullRequest className="w-10 h-10 text-green-400 mx-auto mb-3" />
+                <h3 className="text-lg font-bold text-green-300 mb-2">Pull Request Created</h3>
+                <a
+                  href={result.pr_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-sm text-green-400 font-mono hover:underline"
+                >{result.pr_url}</a>
+                <p className="text-xs text-zinc-600 mt-3">Review and merge on GitHub</p>
+              </div>
+            ) : job.status === 'done' || job.status === 'escalated' ? (
+              <div className="p-6 rounded-xl bg-zinc-900 border border-zinc-800 text-center">
+                <GitPullRequest className="w-10 h-10 text-zinc-700 mx-auto mb-3" />
+                <h3 className="text-sm font-bold text-zinc-400 mb-1">No PR Created</h3>
+                <p className="text-xs text-zinc-600">{job.error || 'Pipeline did not reach PR creation stage'}</p>
+              </div>
+            ) : (
+              <div className="flex items-center justify-center py-12 text-sm text-zinc-600">Waiting for pipeline to complete...</div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
 }
 
 // ─── Main Page ──────────────────────────────────────────────────────────────
@@ -772,137 +1020,9 @@ export default function AgentPage() {
             <TraceLogPanel events={traceEvents} isLive={traceIsLive} />
           )}
 
-          {/* Pipeline Result */}
-          {result && (
-            <div className="space-y-4">
-              {/* Status banner */}
-              {(() => {
-                const outcome = getOutcomeDisplay(activeJob!)
-                const OutcomeIcon = outcome.icon
-                return (
-                  <div className={cn('p-4 rounded-xl border', outcome.bg)}>
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <OutcomeIcon className={cn('w-5 h-5', outcome.iconColor, outcome.label === 'Running...' && 'animate-spin')} />
-                        <span className="text-sm font-bold text-zinc-200">{outcome.label}</span>
-                      </div>
-                      <div className="flex items-center gap-3 text-xs text-zinc-500">
-                        {result.context_nodes ? (
-                          <span className="flex items-center gap-1"><Brain className="w-3 h-3" /> {result.context_nodes} nodes</span>
-                        ) : null}
-                        <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {activeJob?.iteration_count || 0} iterations</span>
-                        {result.review?.confidence ? (
-                          <span className="font-mono">{Math.round(Number(result.review.confidence) * 100)}% confidence</span>
-                        ) : null}
-                      </div>
-                    </div>
-                    {activeJob?.error && (
-                      <p className="text-xs text-red-400 mt-1">{activeJob.error}</p>
-                    )}
-                  </div>
-                )
-              })()}
-
-              {/* Localization */}
-              {result.localization && (
-                <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
-                  <div className="flex items-center gap-2 mb-3">
-                    <Target className="w-4 h-4 text-amber-400" />
-                    <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Fault Localization</h3>
-                    {result.localization.confidence > 0 && (
-                      <span className="ml-auto text-[10px] font-mono text-zinc-600">
-                        {Math.round(result.localization.confidence * 100)}% confidence
-                      </span>
-                    )}
-                  </div>
-                  {result.localization.root_cause_hypothesis && (
-                    <p className="text-sm text-zinc-300 mb-3">{result.localization.root_cause_hypothesis}</p>
-                  )}
-                  {result.localization.fault_files?.length > 0 && (
-                    <div className="flex flex-wrap gap-1.5">
-                      {result.localization.fault_files.map((f: string) => (
-                        <span key={f} className="flex items-center gap-1 px-2 py-1 rounded-md bg-zinc-800 border border-zinc-700/50 text-xs text-zinc-300 font-mono">
-                          <FileCode className="w-3 h-3 text-amber-400" />{f}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Repair — Code Patches */}
-              {(result.repair?.patches?.length ?? 0) > 0 && (
-                <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
-                  <div className="flex items-center gap-2 mb-2">
-                    <Wrench className="w-4 h-4 text-orange-400" />
-                    <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Code Changes</h3>
-                    <span className="text-[10px] text-zinc-600 ml-auto">{result.repair!.patches.length} file(s)</span>
-                  </div>
-                  {result.repair!.explanation && (
-                    <p className="text-sm text-zinc-300 mb-3">{result.repair!.explanation}</p>
-                  )}
-                  <div className="space-y-2">
-                    {result.repair!.patches.map((p) => (
-                      <PatchCard key={p.file_path || p.explanation} patch={p} />
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Test Patches */}
-              {(result.repair?.test_patches?.length ?? 0) > 0 && (
-                <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
-                  <div className="flex items-center gap-2 mb-2">
-                    <TestTube className="w-4 h-4 text-lime-400" />
-                    <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Test Changes</h3>
-                    <span className="text-[10px] text-zinc-600 ml-auto">{result.repair!.test_patches!.length} test file(s)</span>
-                  </div>
-                  <div className="space-y-2">
-                    {result.repair!.test_patches!.map((p) => (
-                      <PatchCard key={p.file_path || 'test'} patch={p} />
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Test Execution Results */}
-              {result.test_result && (
-                <div className={cn('p-4 rounded-xl border',
-                  result.test_result.includes('passed') ? 'bg-green-950/20 border-green-800/30' : 'bg-red-950/20 border-red-800/30'
-                )}>
-                  <div className="flex items-center gap-2 mb-2">
-                    <Shield className={cn('w-4 h-4', result.test_result.includes('passed') ? 'text-green-400' : 'text-red-400')} />
-                    <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Test Results</h3>
-                  </div>
-                  <pre className="text-xs font-mono text-zinc-300 whitespace-pre-wrap">{result.test_result}</pre>
-                </div>
-              )}
-
-              {/* Review */}
-              {result.review?.checks?.length ? (
-                <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
-                  <div className="flex items-center gap-2 mb-3">
-                    <Eye className="w-4 h-4 text-cyan-400" />
-                    <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Review Checks</h3>
-                  </div>
-                  <ReviewChecks checks={result.review.checks} />
-                  {result.review.feedback && (
-                    <p className="text-xs text-zinc-500 mt-3 italic">{result.review.feedback}</p>
-                  )}
-                </div>
-              ) : null}
-
-              {/* PR */}
-              {result.pr_url && (
-                <div className="p-4 rounded-xl bg-green-950/20 border border-green-800/30">
-                  <div className="flex items-center gap-2">
-                    <GitPullRequest className="w-4 h-4 text-green-400" />
-                    <span className="text-sm text-green-300 font-medium">PR Created</span>
-                    <a href={result.pr_url} target="_blank" rel="noopener noreferrer" className="text-xs text-green-500 font-mono ml-auto hover:underline">{result.pr_url}</a>
-                  </div>
-                </div>
-              )}
-            </div>
+          {/* Pipeline Result — Flow View */}
+          {activeJob?.result && (
+            <ResultFlowView job={activeJob} />
           )}
 
           {/* Running indicator (no result yet) */}
