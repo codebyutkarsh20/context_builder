@@ -124,7 +124,48 @@ def get_graph_stats(repo: str = Query(...)):
     """Return aggregate stats: node counts by type, edge counts by type."""
     if neo4j_client.is_connected():
         result = neo4j_client.run(queries.get_graph_stats(repo))
-        return result[0] if result else {}
+        if result:
+            r = result[0]
+            # Normalize Neo4j column names to the field names the frontend expects
+            files = r.get("file_count", r.get("files", 0))
+            classes = r.get("class_count", r.get("classes", 0))
+            functions = r.get("function_count", r.get("functions", 0))
+            loc = r.get("lines_of_code") or 0
+            tech = r.get("tech_stack") or []
+            # Count language breakdown from nodes if available
+            lang_map = {".py": "Python", ".ts": "TypeScript", ".tsx": "TypeScript",
+                        ".js": "JavaScript", ".jsx": "JavaScript", ".go": "Go",
+                        ".rs": "Rust", ".java": "Java", ".rb": "Ruby", ".vue": "Vue"}
+            # Fetch language counts from enriched nodes cache
+            cache = _load_graph_cache(repo)
+            lang_counts: dict = {}
+            if cache:
+                from collections import Counter
+                lc: Counter = Counter()
+                for n in cache.get("nodes", []):
+                    if n.get("type", "").lower() != "file":
+                        continue
+                    nid = n.get("id", "")
+                    for ext, lang in lang_map.items():
+                        if nid.endswith(ext):
+                            lc[lang] += 1
+                            break
+                lang_counts = dict(lc)
+            total_nodes = r.get("total_nodes", files + classes + functions)
+            total_edges = r.get("total_edges", r.get("call_edge_count", 0) + r.get("import_edge_count", 0))
+            return {
+                "repo": repo,
+                "files": files,
+                "classes": classes,
+                "functions": functions,
+                "lines_of_code": loc,
+                "languages": lang_counts or {"TypeScript": files},
+                "node_type_counts": {"File": files, "Class": classes, "Function": functions},
+                "tech_stack": tech,
+                "total_nodes": total_nodes,
+                "total_edges": total_edges,
+            }
+        return {}
     # Fallback: use graph.json cache
     cache = _load_graph_cache(repo)
     if cache and "stats" in cache:

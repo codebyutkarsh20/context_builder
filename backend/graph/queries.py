@@ -243,30 +243,28 @@ def get_graph_stats(repo: str) -> tuple[str, dict]:
     """
     cypher = (
         "MATCH (r:Repo {name: $repo}) "
-        # Node counts
+        # File count + sum loc in one pass
         "OPTIONAL MATCH (r)-[:CONTAINS*1..]->(f:File) "
-        "WITH r, count(DISTINCT f) AS file_count "
+        "WITH r, count(DISTINCT f) AS file_count, sum(coalesce(f.loc, 0)) AS lines_of_code "
         "OPTIONAL MATCH (r)-[:CONTAINS*1..]->(c:Class) "
-        "WITH r, file_count, count(DISTINCT c) AS class_count "
+        "WITH r, file_count, lines_of_code, count(DISTINCT c) AS class_count "
         "OPTIONAL MATCH (r)-[:CONTAINS*1..]->(fn:Function) "
-        "WITH r, file_count, class_count, count(DISTINCT fn) AS function_count "
+        "WITH r, file_count, lines_of_code, class_count, count(DISTINCT fn) AS function_count "
         # Edge counts
         "OPTIONAL MATCH (r)-[:CONTAINS*1..]->(a)-[:CALLS]->(b) "
-        "WITH r, file_count, class_count, function_count, "
+        "WITH r, file_count, lines_of_code, class_count, function_count, "
         "     count(DISTINCT [a.id, b.id]) AS call_edge_count "
         "OPTIONAL MATCH (r)-[:CONTAINS*1..]->(x)-[:IMPORTS]->(y) "
-        "WITH r, file_count, class_count, function_count, call_edge_count, "
+        "WITH r, file_count, lines_of_code, class_count, function_count, call_edge_count, "
         "     count(DISTINCT [x.id, y.id]) AS import_edge_count "
-        # Nodes that have a non-null summary
-        "OPTIONAL MATCH (r)-[:CONTAINS*1..]->(s) "
-        "WHERE s.summary IS NOT NULL "
         "RETURN "
         "  file_count, "
         "  class_count, "
         "  function_count, "
         "  call_edge_count, "
         "  import_edge_count, "
-        "  count(DISTINCT s) AS summary_count"
+        "  lines_of_code, "
+        "  r.tech_stack AS tech_stack"
     )
     return cypher, {"repo": repo}
 
