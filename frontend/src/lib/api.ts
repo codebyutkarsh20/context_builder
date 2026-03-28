@@ -323,7 +323,8 @@ export interface AgentJobStatus {
       evidence: string[]
     }
     repair?: {
-      patches: { file_path: string; explanation: string }[]
+      patches: { file_path: string; original_code: string; patched_code: string; explanation: string }[]
+      test_patches?: { file_path: string; original_code: string; patched_code: string; explanation: string }[]
       explanation: string
       tests_added: string[]
     }

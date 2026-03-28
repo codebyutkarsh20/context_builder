@@ -161,6 +161,125 @@ function ReviewChecks({ checks }: { checks: { name: string; status: string; comm
   )
 }
 
+// ─── Code Diff Viewer ──────────────────────────────────────────────────────
+
+function CodeDiff({ original, patched, filePath }: { original: string; patched: string; filePath: string }) {
+  const [view, setView] = useState<'diff' | 'original' | 'patched'>('diff')
+
+  const origLines = original.split('\n')
+  const patchedLines = patched.split('\n')
+
+  // Simple line-by-line diff
+  const maxLen = Math.max(origLines.length, patchedLines.length)
+  const diffLines: { type: 'same' | 'removed' | 'added' | 'changed'; orig: string; patched: string; lineNum: number }[] = []
+
+  for (let i = 0; i < maxLen; i++) {
+    const o = origLines[i] ?? ''
+    const p = patchedLines[i] ?? ''
+    if (o === p) {
+      diffLines.push({ type: 'same', orig: o, patched: p, lineNum: i + 1 })
+    } else if (i >= origLines.length) {
+      diffLines.push({ type: 'added', orig: '', patched: p, lineNum: i + 1 })
+    } else if (i >= patchedLines.length) {
+      diffLines.push({ type: 'removed', orig: o, patched: '', lineNum: i + 1 })
+    } else {
+      diffLines.push({ type: 'changed', orig: o, patched: p, lineNum: i + 1 })
+    }
+  }
+
+  return (
+    <div className="rounded-lg bg-zinc-950 border border-zinc-800 overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-2 border-b border-zinc-800 bg-zinc-900/50">
+        <span className="text-xs font-mono text-zinc-400 flex items-center gap-1.5">
+          <FileCode className="w-3 h-3 text-orange-400" />
+          {filePath}
+        </span>
+        <div className="flex gap-1">
+          {(['diff', 'original', 'patched'] as const).map(v => (
+            <button
+              key={v}
+              onClick={() => setView(v)}
+              className={cn('px-2 py-0.5 rounded text-[10px] font-medium transition-colors',
+                view === v ? 'bg-zinc-700 text-zinc-200' : 'text-zinc-600 hover:text-zinc-400'
+              )}
+            >{v === 'diff' ? 'Diff' : v === 'original' ? 'Before' : 'After'}</button>
+          ))}
+        </div>
+      </div>
+      <div className="max-h-80 overflow-y-auto overflow-x-auto">
+        {view === 'diff' ? (
+          <div className="text-[11px] font-mono leading-5">
+            {diffLines.filter(l => l.type !== 'same' || diffLines.filter(d => d.type !== 'same').length < 20).map((line, i) => {
+              if (line.type === 'same') return (
+                <div key={i} className="px-3 py-0 text-zinc-600 flex">
+                  <span className="w-8 text-right text-zinc-700 select-none mr-3 flex-shrink-0">{line.lineNum}</span>
+                  <span className="whitespace-pre">{line.orig}</span>
+                </div>
+              )
+              if (line.type === 'removed' || line.type === 'changed') return (
+                <div key={`r-${i}`} className="px-3 py-0 bg-red-950/30 text-red-300 flex">
+                  <span className="w-8 text-right text-red-800 select-none mr-3 flex-shrink-0">{line.lineNum}</span>
+                  <span className="select-none text-red-600 mr-1">-</span>
+                  <span className="whitespace-pre">{line.orig}</span>
+                </div>
+              )
+              return null
+            })}
+            {diffLines.filter(l => l.type !== 'same').map((line, i) => {
+              if (line.type === 'added' || line.type === 'changed') return (
+                <div key={`a-${i}`} className="px-3 py-0 bg-green-950/30 text-green-300 flex">
+                  <span className="w-8 text-right text-green-800 select-none mr-3 flex-shrink-0">{line.lineNum}</span>
+                  <span className="select-none text-green-600 mr-1">+</span>
+                  <span className="whitespace-pre">{line.patched}</span>
+                </div>
+              )
+              return null
+            })}
+          </div>
+        ) : (
+          <pre className="px-3 py-2 text-[11px] font-mono text-zinc-400 whitespace-pre overflow-x-auto">
+            {view === 'original' ? original : patched}
+          </pre>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function PatchCard({ patch }: { patch: { file_path: string; original_code: string; patched_code: string; explanation: string } }) {
+  const [showDiff, setShowDiff] = useState(false)
+  return (
+    <div className="rounded-lg bg-zinc-800/60 border border-zinc-700/30 overflow-hidden">
+      <div
+        className="flex items-center justify-between px-3 py-2 cursor-pointer hover:bg-zinc-800/80 transition-colors"
+        onClick={() => setShowDiff(!showDiff)}
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <FileCode className="w-3.5 h-3.5 text-orange-400 flex-shrink-0" />
+          <span className="text-xs font-mono text-zinc-300 truncate">{patch.file_path}</span>
+        </div>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <span className="text-[10px] text-zinc-600">
+            {patch.original_code ? `${patch.original_code.split('\n').length} lines` : 'new file'}
+          </span>
+          {showDiff ? <ChevronDown className="w-3 h-3 text-zinc-600" /> : <ChevronRight className="w-3 h-3 text-zinc-600" />}
+        </div>
+      </div>
+      {patch.explanation && (
+        <p className="px-3 pb-2 text-xs text-zinc-500">{patch.explanation}</p>
+      )}
+      {showDiff && patch.original_code && patch.patched_code && (
+        <CodeDiff original={patch.original_code} patched={patch.patched_code} filePath={patch.file_path} />
+      )}
+      {showDiff && !patch.original_code && patch.patched_code && (
+        <pre className="px-3 py-2 text-[11px] font-mono text-green-400 bg-green-950/20 max-h-60 overflow-y-auto whitespace-pre">
+          {patch.patched_code.slice(0, 3000)}
+        </pre>
+      )}
+    </div>
+  )
+}
+
 // ─── Trace Log Panel ────────────────────────────────────────────────────────
 
 type TraceFilter = 'all' | 'llm' | 'tools' | 'tests' | 'stages'
@@ -463,7 +582,7 @@ export default function AgentPage() {
   const [customDesc, setCustomDesc] = useState('')
   const [customComponent, setCustomComponent] = useState('')
   const [customRepoPath, setCustomRepoPath] = useState('')
-  const [showCustom, setShowCustom] = useState(false)
+  // showCustom removed — form is always visible now
 
   useEffect(() => {
     listAgentTickets().then(setTickets).catch((e: Error) => setError(`Failed to load tickets: ${e.message}`))
@@ -597,7 +716,6 @@ export default function AgentPage() {
       setCustomDesc('')
       setCustomComponent('')
       setCustomRepoPath('')
-      setShowCustom(false)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to start agent')
       setRunningTicketId(null)
@@ -712,36 +830,51 @@ export default function AgentPage() {
                 </div>
               )}
 
-              {/* Repair */}
-              {result.repair?.explanation && (
+              {/* Repair — Code Patches */}
+              {(result.repair?.patches?.length ?? 0) > 0 && (
                 <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
-                  <div className="flex items-center gap-2 mb-3">
+                  <div className="flex items-center gap-2 mb-2">
                     <Wrench className="w-4 h-4 text-orange-400" />
-                    <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Proposed Fix</h3>
+                    <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Code Changes</h3>
+                    <span className="text-[10px] text-zinc-600 ml-auto">{result.repair!.patches.length} file(s)</span>
                   </div>
-                  <p className="text-sm text-zinc-300 mb-3">{result.repair.explanation}</p>
-                  {result.repair.patches?.length > 0 && (
-                    <div className="space-y-2">
-                      {result.repair.patches.map((p: { file_path: string; explanation: string }) => (
-                        <div key={p.file_path || p.explanation} className="px-3 py-2 rounded-lg bg-zinc-800/60 border border-zinc-700/30">
-                          <p className="text-xs font-mono text-zinc-400">{p.file_path}</p>
-                          <p className="text-xs text-zinc-500 mt-1">{p.explanation}</p>
-                        </div>
-                      ))}
-                    </div>
+                  {result.repair!.explanation && (
+                    <p className="text-sm text-zinc-300 mb-3">{result.repair!.explanation}</p>
                   )}
-                  {result.repair.tests_added?.length > 0 && (
-                    <div className="mt-3">
-                      <p className="text-[10px] font-bold text-zinc-600 uppercase mb-1">Tests Added</p>
-                      <ul className="space-y-0.5">
-                        {result.repair.tests_added.map((t: string, i: number) => (
-                          <li key={i} className="text-xs text-zinc-500 flex items-center gap-1">
-                            <Shield className="w-3 h-3 text-green-500" />{t}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
+                  <div className="space-y-2">
+                    {result.repair!.patches.map((p) => (
+                      <PatchCard key={p.file_path || p.explanation} patch={p} />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Test Patches */}
+              {(result.repair?.test_patches?.length ?? 0) > 0 && (
+                <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800">
+                  <div className="flex items-center gap-2 mb-2">
+                    <TestTube className="w-4 h-4 text-lime-400" />
+                    <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Test Changes</h3>
+                    <span className="text-[10px] text-zinc-600 ml-auto">{result.repair!.test_patches!.length} test file(s)</span>
+                  </div>
+                  <div className="space-y-2">
+                    {result.repair!.test_patches!.map((p) => (
+                      <PatchCard key={p.file_path || 'test'} patch={p} />
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Test Execution Results */}
+              {result.test_result && (
+                <div className={cn('p-4 rounded-xl border',
+                  result.test_result.includes('passed') ? 'bg-green-950/20 border-green-800/30' : 'bg-red-950/20 border-red-800/30'
+                )}>
+                  <div className="flex items-center gap-2 mb-2">
+                    <Shield className={cn('w-4 h-4', result.test_result.includes('passed') ? 'text-green-400' : 'text-red-400')} />
+                    <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Test Results</h3>
+                  </div>
+                  <pre className="text-xs font-mono text-zinc-300 whitespace-pre-wrap">{result.test_result}</pre>
                 </div>
               )}
 
@@ -781,69 +914,64 @@ export default function AgentPage() {
             </div>
           )}
 
-          {/* Ticket Selection */}
-          <div>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-bold text-zinc-300">Bug Tickets</h2>
-              <button
-                onClick={() => setShowCustom(!showCustom)}
-                className="text-xs text-rose-400 hover:text-rose-300 transition-colors"
-              >
-                {showCustom ? 'Hide custom' : '+ Custom ticket'}
-              </button>
+          {/* Custom Ticket Form — always visible */}
+          <div className="p-4 rounded-xl bg-zinc-900 border border-rose-500/20">
+            <div className="flex items-center gap-2 mb-3">
+              <Bug className="w-4 h-4 text-rose-400" />
+              <h2 className="text-sm font-bold text-zinc-300">Submit Bug Ticket</h2>
             </div>
-
-            {/* Custom ticket form */}
-            {showCustom && (
-              <div className="p-4 rounded-xl bg-zinc-900 border border-zinc-800 mb-3 space-y-3">
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={customTicketId}
-                    onChange={(e) => setCustomTicketId(e.target.value)}
-                    placeholder="Ticket ID (e.g. PROJ-1001)"
-                    className="w-40 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none font-mono"
-                  />
-                  <input
-                    type="text"
-                    value={customTitle}
-                    onChange={(e) => setCustomTitle(e.target.value)}
-                    placeholder="Bug title (e.g., 500 error on checkout) *"
-                    className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none"
-                  />
-                </div>
-                <textarea
-                  value={customDesc}
-                  onChange={(e) => setCustomDesc(e.target.value)}
-                  placeholder="Full bug description — include reproduction steps and expected vs actual behavior..."
-                  rows={4}
-                  className="w-full px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none resize-none"
+            <div className="space-y-3">
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={customTicketId}
+                  onChange={(e) => setCustomTicketId(e.target.value)}
+                  placeholder="Ticket ID (e.g. BUG-001)"
+                  className="w-40 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none font-mono"
                 />
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={customComponent}
-                    onChange={(e) => setCustomComponent(e.target.value)}
-                    placeholder="Affected file/component (e.g. agent/feature_flags.py)"
-                    className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none font-mono"
-                  />
-                  <input
-                    type="text"
-                    value={customRepoPath}
-                    onChange={(e) => setCustomRepoPath(e.target.value)}
-                    placeholder={activeRepoData?.repo_path ?? 'Repo path (overrides default)'}
-                    className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none font-mono"
-                  />
-                </div>
+                <input
+                  type="text"
+                  value={customTitle}
+                  onChange={(e) => setCustomTitle(e.target.value)}
+                  placeholder="Bug title *"
+                  className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none"
+                />
+              </div>
+              <textarea
+                value={customDesc}
+                onChange={(e) => setCustomDesc(e.target.value)}
+                placeholder="Describe the bug: expected behavior, actual behavior, reproduction steps, affected file/function..."
+                rows={3}
+                className="w-full px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none resize-none"
+              />
+              <div className="flex gap-2 items-center">
+                <input
+                  type="text"
+                  value={customComponent}
+                  onChange={(e) => setCustomComponent(e.target.value)}
+                  placeholder="Affected file (e.g. backend/rag/retriever.py)"
+                  className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-rose-500/50 focus:outline-none font-mono"
+                />
                 <button
                   onClick={handleRunCustom}
                   disabled={isRunning || !customTitle.trim() || !activeRepo}
-                  className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-rose-500/20 text-rose-300 hover:bg-rose-500/30 border border-rose-500/30 text-xs font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex items-center gap-1.5 px-5 py-2 rounded-lg bg-rose-600 text-white hover:bg-rose-500 text-xs font-bold transition-all disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
                 >
-                  <Play className="w-3.5 h-3.5" /> Run Agent on Custom Ticket
+                  {isRunning && runningTicketId === 'custom' ? (
+                    <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Running...</>
+                  ) : (
+                    <><Play className="w-3.5 h-3.5" /> Run Agent</>
+                  )}
                 </button>
               </div>
-            )}
+            </div>
+          </div>
+
+          {/* Ticket Selection */}
+          <div>
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-sm font-bold text-zinc-300">Sample Tickets</h2>
+            </div>
 
             {/* Mock tickets */}
             <div className="space-y-2">
@@ -859,14 +987,8 @@ export default function AgentPage() {
               {tickets.length === 0 && (
                 <div className="flex flex-col items-center py-8 px-4 rounded-xl bg-zinc-900 border border-zinc-800 border-dashed">
                   <Bug className="w-8 h-8 text-zinc-700 mb-3" />
-                  <p className="text-sm font-medium text-zinc-400 mb-1">No tickets yet</p>
-                  <p className="text-xs text-zinc-600 mb-4">Create your first bug ticket to run the agent pipeline</p>
-                  <button
-                    onClick={() => setShowCustom(true)}
-                    className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-rose-500/20 text-rose-300 hover:bg-rose-500/30 border border-rose-500/30 text-xs font-medium transition-all"
-                  >
-                    <Play className="w-3.5 h-3.5" /> Create your first ticket
-                  </button>
+                  <p className="text-sm font-medium text-zinc-400 mb-1">No sample tickets loaded</p>
+                  <p className="text-xs text-zinc-600">Use the form above to submit a custom bug ticket</p>
                 </div>
               )}
             </div>
@@ -877,54 +999,70 @@ export default function AgentPage() {
             <div>
               <h2 className="text-sm font-bold text-zinc-300 mb-3">Past Runs</h2>
               <div className="space-y-2">
-                {pastJobs.map((job) => (
-                  <div
-                    key={job.job_id}
-                    onClick={() => { setActiveJob(job); setRunningTicketId(null) }}
-                    className={cn(
-                      "p-3 rounded-xl border cursor-pointer transition-all",
-                      activeJob?.job_id === job.job_id
-                        ? "bg-zinc-800 border-rose-500/40"
-                        : "bg-zinc-900 border-zinc-800 hover:border-zinc-700"
-                    )}
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        {job.status === 'done' && <CheckCircle2 className="w-3.5 h-3.5 text-green-400" />}
-                        {job.status === 'failed' && <XCircle className="w-3.5 h-3.5 text-red-400" />}
-                        {job.status === 'escalated' && <AlertTriangle className="w-3.5 h-3.5 text-yellow-400" />}
-                        {(job.status === 'running' || job.status === 'pending') && <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin" />}
-                        <span className="text-xs font-mono text-zinc-400">{job.job_id.slice(0, 8)}</span>
-                        {job.result?.review?.verdict && (
-                          <span className={cn('text-[10px] px-1.5 py-0.5 rounded border font-medium',
-                            job.result.review.verdict === 'APPROVE' ? 'bg-green-500/10 text-green-400 border-green-500/20' :
-                            job.result.review.verdict === 'ESCALATE' ? 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20' :
-                            'bg-zinc-700 text-zinc-400 border-zinc-600'
-                          )}>{job.result.review.verdict}</span>
+                {pastJobs.map((job) => {
+                  const patches = job.result?.repair?.patches?.length ?? 0
+                  const checks = job.result?.review?.checks ?? []
+                  const passCount = checks.filter((c: { status: string }) => c.status === 'PASS').length
+                  const totalChecks = checks.length
+                  return (
+                    <div
+                      key={job.job_id}
+                      onClick={() => { setActiveJob(job); setRunningTicketId(null) }}
+                      className={cn(
+                        "p-3 rounded-xl border cursor-pointer transition-all",
+                        activeJob?.job_id === job.job_id
+                          ? "bg-zinc-800 border-rose-500/40"
+                          : "bg-zinc-900 border-zinc-800 hover:border-zinc-700"
+                      )}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          {job.status === 'done' && <CheckCircle2 className="w-3.5 h-3.5 text-green-400" />}
+                          {job.status === 'failed' && <XCircle className="w-3.5 h-3.5 text-red-400" />}
+                          {job.status === 'escalated' && <AlertTriangle className="w-3.5 h-3.5 text-yellow-400" />}
+                          {(job.status === 'running' || job.status === 'pending') && <Loader2 className="w-3.5 h-3.5 text-blue-400 animate-spin" />}
+                          <span className="text-xs font-mono text-zinc-500">{job.job_id.slice(0, 8)}</span>
+                          {job.result?.review?.verdict && (
+                            <span className={cn('text-[10px] px-1.5 py-0.5 rounded border font-bold',
+                              job.result.review.verdict === 'APPROVE' ? 'bg-green-500/10 text-green-400 border-green-500/20' :
+                              job.result.review.verdict === 'ESCALATE' ? 'bg-yellow-500/10 text-yellow-400 border-yellow-500/20' :
+                              'bg-zinc-700 text-zinc-400 border-zinc-600'
+                            )}>{job.result.review.verdict}</span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-3 text-[10px] text-zinc-600 font-mono">
+                          {patches > 0 && <span>{patches} patch{patches > 1 ? 'es' : ''}</span>}
+                          {totalChecks > 0 && <span>{passCount}/{totalChecks} checks</span>}
+                          <span>iter {job.iteration_count}</span>
+                        </div>
+                      </div>
+                      {job.result?.repair?.explanation && (
+                        <p className="text-xs text-zinc-400 mt-1.5 truncate">{job.result.repair.explanation}</p>
+                      )}
+                      {!job.result?.repair?.explanation && job.error && (
+                        <p className="text-xs text-zinc-600 mt-1.5 truncate">{job.error}</p>
+                      )}
+                      <div className="flex items-center gap-3 mt-1.5">
+                        {job.result?.localization?.fault_files?.slice(0, 2).map((f: string) => (
+                          <span key={f} className="text-[10px] font-mono text-zinc-600 flex items-center gap-1">
+                            <FileCode className="w-2.5 h-2.5" />{f.split('/').pop()}
+                          </span>
+                        ))}
+                        {job.result?.pr_url && (
+                          <a
+                            href={job.result.pr_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={(e) => e.stopPropagation()}
+                            className="flex items-center gap-1 text-[10px] text-green-500 hover:text-green-400 font-mono hover:underline ml-auto"
+                          >
+                            <GitPullRequest className="w-2.5 h-2.5" /> PR
+                          </a>
                         )}
                       </div>
-                      <span className="text-[10px] text-zinc-600 font-mono">{job.status}</span>
                     </div>
-                    {job.result?.localization?.root_cause_hypothesis && (
-                      <p className="text-xs text-zinc-500 mt-1 truncate">{job.result.localization.root_cause_hypothesis}</p>
-                    )}
-                    {job.result?.repair?.explanation && !job.result?.localization?.root_cause_hypothesis && (
-                      <p className="text-xs text-zinc-500 mt-1 truncate">{job.result.repair.explanation}</p>
-                    )}
-                    {job.result?.pr_url && (
-                      <a
-                        href={job.result.pr_url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        className="mt-1.5 flex items-center gap-1 text-[10px] text-green-500 hover:text-green-400 font-mono hover:underline"
-                      >
-                        <GitPullRequest className="w-3 h-3" />
-                        {job.result.pr_url}
-                      </a>
-                    )}
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             </div>
           )}
