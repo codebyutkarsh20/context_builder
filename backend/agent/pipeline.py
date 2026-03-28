@@ -2862,6 +2862,7 @@ def run_ticket(
         "branch_name": "",
         "base_branch": "",
         "patches_applied": 0,
+        "exploration_log": [],
     }
 
     try:

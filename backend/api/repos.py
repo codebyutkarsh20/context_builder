@@ -72,7 +72,7 @@ def _sanitize_repo_name(name: str) -> str:
     return sanitized or "unnamed"
 
 
-async def run_analysis(job_id: str, req: AnalyzeRequest):
+def run_analysis(job_id: str, req: AnalyzeRequest):
     def update(stage: str, progress: int):
         jobs[job_id].update({"stage": stage, "progress": progress, "status": "running"})
 
@@ -218,15 +218,7 @@ async def run_analysis(job_id: str, req: AnalyzeRequest):
 
             (out / "enriched_nodes.json").write_text(json.dumps(enriched, default=str))
             embedder = NodeEmbedder(repo_name, _DATA_DIR)
-            import concurrent.futures
-            _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            _fut = _pool.submit(embedder.build_embeddings, enriched)
-            try:
-                _fut.result(timeout=120)  # 2-min cap; embeddings are non-fatal
-            except concurrent.futures.TimeoutError:
-                logger.warning("Embedding generation timed out after 120s (non-fatal)")
-            finally:
-                _pool.shutdown(wait=False)  # Don't block on hung embedding thread
+            embedder.build_embeddings(enriched)
         except Exception as emb_err:
             logger.warning("Embedding generation failed (non-fatal): %s", emb_err)
 
