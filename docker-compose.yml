@@ -33,15 +33,19 @@ services:
       SUMMARIZER_MODEL: ${SUMMARIZER_MODEL:-claude-haiku-4-5-20251001}
       DATA_DIR: /data
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
+      ANONYMIZED_TELEMETRY: "False"
+      CHROMA_TELEMETRY: "false"
     volumes:
       - ./backend:/app
       - repo_mounts:/repos
       - context_data:/data
+      - chroma_cache:/root/.cache/chroma
+      - /Users/utkarshpatidar:/Users/utkarshpatidar:ro
     depends_on:
       neo4j:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -68,3 +72,4 @@ volumes:
   neo4j_data:
   repo_mounts:
   context_data:
+  chroma_cache:
