@@ -203,6 +203,140 @@ def _build_search_cmd(
 
 
 # ---------------------------------------------------------------------------
+# Issue #11: Multi-language function extraction helpers
+# ---------------------------------------------------------------------------
+
+def _extract_function_treesitter_js(
+    content: str, function_name: str, suffix: str
+) -> tuple[int, int] | None:
+    """Extract function boundaries from JS/TS using tree-sitter if available.
+
+    Returns (start_line_0indexed, end_line_0indexed_exclusive) or None.
+    """
+    try:
+        import tree_sitter
+    except ImportError:
+        return None
+
+    # Map suffix to tree-sitter language
+    lang_map = {
+        '.js': 'tree_sitter_javascript',
+        '.jsx': 'tree_sitter_javascript',
+        '.ts': 'tree_sitter_typescript',
+        '.tsx': 'tree_sitter_typescript',
+    }
+    lang_module_name = lang_map.get(suffix)
+    if not lang_module_name:
+        return None
+
+    try:
+        lang_mod = __import__(lang_module_name)
+        lang = tree_sitter.Language(lang_mod.language())
+        parser = tree_sitter.Parser(lang)
+        tree = parser.parse(content.encode())
+
+        # Walk tree looking for function declarations / arrow functions / methods
+        def _find_function(node):
+            if node.type in ('function_declaration', 'method_definition', 'function',
+                             'arrow_function', 'generator_function_declaration'):
+                # Check name
+                for child in node.children:
+                    if child.type in ('identifier', 'property_identifier') and child.text.decode() == function_name:
+                        return (node.start_point[0], node.end_point[0] + 1)
+            # Variable declarator with arrow function: const foo = () => {...}
+            if node.type == 'variable_declarator':
+                name_node = node.child_by_field_name('name')
+                value_node = node.child_by_field_name('value')
+                if (name_node and name_node.text.decode() == function_name
+                        and value_node and value_node.type in ('arrow_function', 'function')):
+                    parent = node.parent  # Get the full variable_declaration
+                    if parent and parent.type == 'lexical_declaration':
+                        return (parent.start_point[0], parent.end_point[0] + 1)
+                    return (node.start_point[0], value_node.end_point[0] + 1)
+            # Recurse
+            for child in node.children:
+                result = _find_function(child)
+                if result:
+                    return result
+            return None
+
+        return _find_function(tree.root_node)
+    except Exception:
+        return None
+
+
+def _extract_function_brace_counting(
+    content: str, function_name: str
+) -> tuple[int, int] | None:
+    """Extract function boundaries using brace counting for C-family languages.
+
+    Works for JS/TS/Go/Java/Rust/C/C++/C#/Kotlin/Swift.
+    Returns (start_line_0indexed, end_line_0indexed_exclusive) or None.
+    """
+    lines = content.split("\n")
+    escaped_name = re.escape(function_name)
+
+    # Patterns for function definitions in various languages
+    patterns = [
+        # JS/TS: function foo(...) { / async function foo(...)
+        rf"^\s*(export\s+)?(default\s+)?(async\s+)?function\s+{escaped_name}\s*[\(<]",
+        # JS/TS: const foo = (...) => / const foo = function
+        rf"^\s*(export\s+)?(const|let|var)\s+{escaped_name}\s*=\s*(async\s+)?(function|\()",
+        # Go: func foo(...) / func (r *Receiver) foo(...)
+        rf"^\s*func\s+(\([^)]*\)\s+)?{escaped_name}\s*\(",
+        # Java/C#/Kotlin: public void foo(...) / fun foo(...)
+        rf"^\s*(public|private|protected|internal|static|override|suspend|fun|inline)\s+.*\b{escaped_name}\s*[\(<]",
+        # Rust: fn foo(...) / pub fn foo(...)  / async fn foo(...)
+        rf"^\s*(pub(\s*\([^)]*\))?\s+)?(async\s+)?fn\s+{escaped_name}\s*[\(<]",
+        # C/C++: type foo(...) { — broad catch
+        rf"^\s*[\w:*&<>\[\]]+\s+{escaped_name}\s*\(",
+        # Class method: foo(...) { — inside class body
+        rf"^\s+(async\s+)?{escaped_name}\s*\(",
+    ]
+
+    start_line = None
+    for i, line in enumerate(lines):
+        for pat in patterns:
+            if re.match(pat, line):
+                start_line = i
+                break
+        if start_line is not None:
+            break
+
+    if start_line is None:
+        return None
+
+    # Count braces from the definition line to find the closing brace
+    brace_depth = 0
+    found_open = False
+    end_line = start_line
+
+    for i in range(start_line, len(lines)):
+        line = lines[i]
+        # Strip string literals and comments to avoid counting braces inside them
+        stripped = re.sub(r'"(?:[^"\\]|\\.)*"', '', line)
+        stripped = re.sub(r"'(?:[^'\\]|\\.)*'", '', stripped)
+        stripped = re.sub(r'`(?:[^`\\]|\\.)*`', '', stripped)
+        stripped = re.sub(r'//.*$', '', stripped)
+
+        for ch in stripped:
+            if ch == '{':
+                brace_depth += 1
+                found_open = True
+            elif ch == '}':
+                brace_depth -= 1
+                if found_open and brace_depth <= 0:
+                    return (start_line, i + 1)
+
+        end_line = i
+
+    # If we never found balanced braces, return up to 100 lines as best effort
+    if found_open:
+        return (start_line, min(start_line + 100, len(lines)))
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Tool 1 — grep_repo
 # ---------------------------------------------------------------------------
 
@@ -361,7 +495,41 @@ def read_function(file_path: str, function_name: str) -> str:
                 pass  # Fall through to regex/indent heuristic
 
         # -------------------------------------------------------------------
-        # Regex + indent heuristic fallback (non-Python or parse failure)
+        # Issue #11: Tree-sitter extraction for JS/TS (if parsers available)
+        # -------------------------------------------------------------------
+        if resolved.suffix in ('.js', '.jsx', '.ts', '.tsx'):
+            try:
+                extracted = _extract_function_treesitter_js(content, function_name, resolved.suffix)
+                if extracted:
+                    start, end = extracted
+                    file_lines = content.splitlines(keepends=True)
+                    numbered = "\n".join(
+                        f"{start+1+i:4d} | {ln.rstrip()}"
+                        for i, ln in enumerate(file_lines[start:end])
+                    )
+                    result = (
+                        f"=== {function_name} in {file_path} "
+                        f"(lines {start+1}-{end}) ===\n{numbered}"
+                    )
+                    return _redact_content(_cap(result))
+            except Exception:
+                pass  # Fall through to regex/brace-counting
+
+        # -------------------------------------------------------------------
+        # Brace-counting extraction for C-family languages (JS/TS/Go/Java/Rust/C/C++)
+        # -------------------------------------------------------------------
+        if resolved.suffix in ('.js', '.jsx', '.ts', '.tsx', '.go', '.java', '.rs', '.c', '.cpp', '.cs', '.kt', '.swift'):
+            extracted = _extract_function_brace_counting(content, function_name)
+            if extracted:
+                start, end = extracted
+                file_lines = content.split("\n")
+                selected = file_lines[start:end]
+                numbered = "\n".join(f"{start+1+i:4d} | {ln}" for i, ln in enumerate(selected))
+                result = f"=== {function_name} in {file_path} (lines {start+1}-{end}) ===\n{numbered}"
+                return _redact_content(_cap(result))
+
+        # -------------------------------------------------------------------
+        # Regex + indent heuristic fallback (Ruby, unknown languages)
         # -------------------------------------------------------------------
         lines = content.split("\n")
 

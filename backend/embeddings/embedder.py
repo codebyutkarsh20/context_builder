@@ -1,8 +1,14 @@
 """
 embedder.py — Build and query ChromaDB vector embeddings for code knowledge graph nodes.
 
-Uses ChromaDB's built-in DefaultEmbeddingFunction (all-MiniLM-L6-v2 via onnxruntime)
-so no additional ML dependencies are needed.
+Supports configurable embedding models:
+  - "default"           — ChromaDB's built-in all-MiniLM-L6-v2 (no extra deps)
+  - "codebert"          — microsoft/codebert-base  (requires sentence-transformers)
+  - "unixcoder"         — microsoft/unixcoder-base (requires sentence-transformers)
+  - "codesage-small"    — codesage/codesage-small  (requires sentence-transformers)
+  - Any HuggingFace model name (requires sentence-transformers)
+
+Set EMBEDDING_MODEL env var or pass model_name to NodeEmbedder.
 """
 
 from __future__ import annotations
@@ -10,10 +16,56 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Configurable embedding function
+# ---------------------------------------------------------------------------
+
+# Well-known code embedding models (short alias → HuggingFace model ID)
+_CODE_MODEL_ALIASES: dict[str, str] = {
+    "codebert": "microsoft/codebert-base",
+    "unixcoder": "microsoft/unixcoder-base",
+    "codesage-small": "codesage/codesage-small",
+    "codesage-large": "codesage/codesage-large",
+    "starencoder": "bigcode/starencoder",
+}
+
+
+def _build_embedding_function(model_name: str | None = None):
+    """Build a ChromaDB-compatible embedding function.
+
+    If model_name is "default" or None, uses ChromaDB's built-in DefaultEmbeddingFunction
+    (all-MiniLM-L6-v2 via onnxruntime). Otherwise, loads the specified model
+    via sentence-transformers and wraps it for ChromaDB.
+    """
+    resolved = model_name or os.environ.get("EMBEDDING_MODEL", "default")
+    resolved = resolved.strip().lower()
+
+    if resolved in ("default", "all-minilm-l6-v2", ""):
+        logger.info("Using default embedding model (all-MiniLM-L6-v2)")
+        return None  # ChromaDB uses DefaultEmbeddingFunction when None
+
+    # Resolve alias
+    hf_model_id = _CODE_MODEL_ALIASES.get(resolved, resolved)
+
+    try:
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+        logger.info("Loading code embedding model: %s", hf_model_id)
+        return SentenceTransformerEmbeddingFunction(model_name=hf_model_id)
+    except ImportError:
+        logger.warning(
+            "sentence-transformers not installed — falling back to default model. "
+            "Install with: pip install sentence-transformers"
+        )
+        return None
+    except Exception as e:
+        logger.warning("Failed to load model '%s': %s — falling back to default", hf_model_id, e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -222,15 +274,25 @@ def _content_hash(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 class NodeEmbedder:
-    """Build and query ChromaDB embeddings for code knowledge graph nodes."""
+    """Build and query ChromaDB embeddings for code knowledge graph nodes.
 
-    def __init__(self, repo_name: str, data_dir: Path) -> None:
+    Supports configurable embedding models via model_name parameter or
+    EMBEDDING_MODEL env var. Defaults to all-MiniLM-L6-v2.
+    """
+
+    def __init__(
+        self,
+        repo_name: str,
+        data_dir: Path,
+        model_name: str | None = None,
+    ) -> None:
         self.repo_name = repo_name
         self.data_dir = Path(data_dir)
         self._collection_name = f"context_builder_{repo_name}"
         self._persist_dir = str(self.data_dir / repo_name / "chromadb")
         self._client = None
         self._collection = None
+        self._embedding_fn = _build_embedding_function(model_name)
 
     def _get_collection(self):
         if self._collection is not None:
@@ -239,10 +301,15 @@ class NodeEmbedder:
         import chromadb
 
         self._client = chromadb.PersistentClient(path=self._persist_dir)
-        self._collection = self._client.get_or_create_collection(
-            name=self._collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+
+        create_kwargs: dict[str, Any] = {
+            "name": self._collection_name,
+            "metadata": {"hnsw:space": "cosine"},
+        }
+        if self._embedding_fn is not None:
+            create_kwargs["embedding_function"] = self._embedding_fn
+
+        self._collection = self._client.get_or_create_collection(**create_kwargs)
         return self._collection
 
     def build_embeddings(self, enriched_nodes: dict[str, dict] | None = None) -> int:

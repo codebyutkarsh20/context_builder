@@ -2069,6 +2069,87 @@ def _find_related_tests(modified_files: list[str], sandbox_path: Path) -> list[s
     return list(set(related))
 
 
+# ---------------------------------------------------------------------------
+# Finding #9: Robust trivial-test detection
+# ---------------------------------------------------------------------------
+
+def _is_trivial_test(test_code: str) -> bool:
+    """Detect whether generated test code is a trivial stub.
+
+    A test is trivial if it:
+      - Is empty or nearly empty (< 5 non-blank lines)
+      - Contains only placeholder assertions (assert True, pass, skip, etc.)
+      - Has zero real assertions (assert X == Y, assertEqual, etc.)
+      - Uses only trivial assertion values (assert 1 == 1, assert True)
+    """
+    if not test_code or not test_code.strip():
+        return True
+
+    lines = [l.strip() for l in test_code.splitlines() if l.strip() and not l.strip().startswith("#")]
+
+    # Very short test code is almost certainly a stub
+    if len(lines) < 5:
+        return True
+
+    # Patterns that indicate a placeholder / stub test
+    stub_patterns = [
+        "assert True",
+        "assert 1 == 1",
+        "assert 1",
+        "raise NotImplementedError",
+        "pytest.skip",
+        "unittest.skip",
+        "self.skipTest",
+        "pass",
+        "...",
+        "# TODO",
+        "# FIXME",
+        "# placeholder",
+    ]
+
+    # Count real vs stub lines inside test functions
+    inside_test = False
+    real_assertion_count = 0
+    stub_count = 0
+    test_func_count = 0
+
+    for line in lines:
+        if line.startswith("def test_") or line.startswith("async def test_"):
+            inside_test = True
+            test_func_count += 1
+            continue
+
+        if inside_test:
+            # Check for stub patterns
+            if any(line.startswith(p) or line == p for p in stub_patterns):
+                stub_count += 1
+                continue
+
+            # Count real assertions (assert with comparison operators)
+            if re.match(r"assert\s+.+\s*(==|!=|>=|<=|>|<|in|not\s+in|is\s+not|is)\s+", line):
+                real_assertion_count += 1
+            elif re.match(r"self\.assert(Equal|NotEqual|True|False|In|NotIn|Raises|Greater|Less)", line):
+                real_assertion_count += 1
+            elif re.match(r"assert\s+\w+\.\w+", line):  # assert obj.method() style
+                real_assertion_count += 1
+            elif "pytest.raises" in line or "assertRaises" in line:
+                real_assertion_count += 1
+
+    # Trivial if no test functions found
+    if test_func_count == 0:
+        return True
+
+    # Trivial if no real assertions at all
+    if real_assertion_count == 0:
+        return True
+
+    # Trivial if stubs outnumber real assertions
+    if stub_count > 0 and stub_count >= real_assertion_count:
+        return True
+
+    return False
+
+
 def test_node(state: AgentState) -> AgentState:
     """Stage 5.5: Create sandbox via git worktree, apply patches, run tests."""
     _thread_local.current_stage = "test"
@@ -2379,8 +2460,7 @@ def test_node(state: AgentState) -> AgentState:
                 tp.get("patched_code", "")
                 for tp in (repair.get("test_patches") or [])
             )
-            trivial_patterns = ["assert True", "assert 1 == 1", "assert 1", "pass\n", "raise NotImplementedError", "pytest.skip"]
-            is_trivial = not test_code.strip() or any(p in test_code for p in trivial_patterns)
+            is_trivial = _is_trivial_test(test_code)
 
             if is_trivial:
                 logger.info("Tests appear trivial — NOT auto-upgrading CHANGES_REQUESTED verdict to APPROVE")

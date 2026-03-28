@@ -10,6 +10,7 @@ Verifies:
 """
 
 import sys
+import shutil
 import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -88,7 +89,7 @@ class TestPRCreationWithSandbox:
         }
         result = pr_creation_node(state)
         assert "push failed" in result.get("pr_url", "")
-        sandbox.rmdir()
+        shutil.rmtree(sandbox, ignore_errors=True)
 
     @patch("agent.pipeline.subprocess.run")
     @patch("agent.pipeline._resolve_repo_path")
@@ -132,7 +133,7 @@ class TestPRCreationWithSandbox:
         result = pr_creation_node(state)
         assert result["pr_url"] == "https://github.com/org/repo/pull/42"
         assert result["status"] == PipelineStatus.DONE
-        sandbox.rmdir()
+        shutil.rmtree(sandbox, ignore_errors=True)
 
     @patch("agent.pipeline.subprocess.run")
     @patch("agent.pipeline._resolve_repo_path")
@@ -171,7 +172,7 @@ class TestPRCreationWithSandbox:
         }
         result = pr_creation_node(state)
         assert "PR creation failed" in result.get("pr_url", "")
-        sandbox.rmdir()
+        shutil.rmtree(sandbox, ignore_errors=True)
 
     @patch("agent.pipeline.subprocess.run")
     @patch("agent.pipeline._resolve_repo_path")
@@ -198,7 +199,7 @@ class TestPRCreationWithSandbox:
         }
         result = pr_creation_node(state)
         assert "timed out" in result.get("pr_url", "") or "timed out" in result.get("error", "")
-        sandbox.rmdir()
+        shutil.rmtree(sandbox, ignore_errors=True)
 
 
 class TestPRBody:
@@ -251,4 +252,4 @@ class TestPRBody:
         assert "Tests" in body
         assert "passed" in body
         assert "AI Deploy Agent" in body
-        sandbox.rmdir()
+        shutil.rmtree(sandbox, ignore_errors=True)

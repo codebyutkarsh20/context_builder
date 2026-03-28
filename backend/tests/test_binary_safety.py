@@ -211,7 +211,7 @@ class TestReadSourceNodeBinarySafety:
 
         assert "sk-1234567890abcdefghij" not in content
         assert "SuperSecret123456789" not in content
-        assert "[REDACTED]" in content
+        assert "***REDACTED***" in content
 
     def test_no_repo_path_returns_empty(self):
         """If repo path can't be resolved, return empty source_code."""

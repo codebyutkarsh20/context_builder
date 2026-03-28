@@ -1,8 +1,10 @@
 """
-code_parser.py — AST-based source analysis using tree-sitter-python.
+code_parser.py — AST-based source analysis using tree-sitter.
 
 Primary engine: tree-sitter (fast, incremental).
+Supports Python (tree-sitter-python), JS/TS, Go, Java via multi_lang_parser.
 Fallback: stdlib ast module for docstrings / decorators that tree-sitter may miss.
+Fallback: regex parser for JS/TS when tree-sitter language packages not installed.
 """
 
 from __future__ import annotations
@@ -478,15 +480,31 @@ class CodeParser:
 
     JS_TS_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
 
+    # Issue #15: Additional language extensions supported via tree-sitter
+    MULTI_LANG_EXTENSIONS = {".go", ".java"}
+
+    # All parseable extensions
+    ALL_EXTENSIONS = {".py"} | JS_TS_EXTENSIONS | MULTI_LANG_EXTENSIONS
+
     def parse_all(self) -> list[dict]:
         results: list[dict] = []
+
+        # Lazy import to avoid circular dependency
+        try:
+            from .multi_lang_parser import parse_file_multi_lang, get_available_languages
+            multi_lang_available = True
+            available_langs = get_available_languages()
+            if available_langs:
+                logger.info("Multi-language tree-sitter parsers available: %s", available_langs)
+        except ImportError:
+            multi_lang_available = False
 
         # Collect all candidate files
         candidates: list[Path] = []
         for f in sorted(self.repo_path.rglob("*")):
             if not f.is_file():
                 continue
-            if f.suffix not in (".py", *self.JS_TS_EXTENSIONS):
+            if f.suffix not in self.ALL_EXTENSIONS:
                 continue
             if any(part in self.SKIP_DIRS for part in f.parts):
                 continue
@@ -502,8 +520,22 @@ class CodeParser:
             try:
                 if src_file.suffix == ".py":
                     parsed = self._parse_file(src_file)
+                elif src_file.suffix in self.JS_TS_EXTENSIONS:
+                    # Try tree-sitter first for JS/TS, fall back to regex
+                    parsed = None
+                    if multi_lang_available:
+                        try:
+                            parsed = parse_file_multi_lang(src_file, self.repo_path)
+                        except Exception:
+                            pass
+                    if parsed is None:
+                        parsed = self._parse_js_ts_file(src_file)
+                elif src_file.suffix in self.MULTI_LANG_EXTENSIONS and multi_lang_available:
+                    # Go/Java — tree-sitter only (no regex fallback)
+                    parsed = parse_file_multi_lang(src_file, self.repo_path)
                 else:
-                    parsed = self._parse_js_ts_file(src_file)
+                    parsed = None
+
                 if parsed is not None:
                     results.append(parsed)
             except Exception as exc:  # noqa: BLE001
