@@ -6,6 +6,7 @@ Extracted from pipeline.py to keep each module focused on a single concern.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -14,15 +15,97 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .agent_config import load_agent_config, AgentConfig
+
 logger = logging.getLogger(__name__)
 
 
-def run_tests(worktree_path: Path) -> str:
+def run_tests(
+    worktree_path: Path,
+    repo_path: "str | Path | None" = None,
+    agent_config: "AgentConfig | None" = None,
+) -> str:
     """Auto-detect test runner and execute tests.
 
     Searches both the worktree root and one level of subdirectories so that
     projects with a backend/ or src/ layout are found correctly.
+
+    If a .agent_config.json is present in repo_path (or agent_config is
+    supplied directly), its test_command, test_timeout, test_args, test_env,
+    setup_commands, and test_pattern take precedence over auto-detection.
+
+    Args:
+        worktree_path: Path to the sandbox worktree where tests run.
+        repo_path: Original repo root used to load .agent_config.json when
+            agent_config is not provided explicitly.
+        agent_config: Pre-loaded AgentConfig; if None and repo_path is given,
+            the config is loaded automatically.
+
+    Returns:
+        A human-readable string starting with "passed", "failed", "skipped",
+        or "error".
     """
+    worktree_path = Path(worktree_path)
+
+    # Load per-repo config if not provided
+    if agent_config is None and repo_path:
+        agent_config = load_agent_config(repo_path)
+
+    # ------------------------------------------------------------------ #
+    # Path A — config-driven: .agent_config.json present and non-default  #
+    # ------------------------------------------------------------------ #
+    if agent_config is not None and agent_config._cfg:
+        timeout = agent_config.test_timeout
+        test_cmd_base = agent_config.test_command
+        test_args = agent_config.test_args
+        extra_env = agent_config.test_env
+        setup_commands = agent_config.setup_commands
+        test_pattern = agent_config.test_pattern
+
+        env = {**os.environ, **extra_env}
+
+        # Run setup commands first (e.g., pip install, db migrate)
+        for cmd in setup_commands:
+            logger.info("Running setup command: %s", cmd)
+            try:
+                subprocess.run(
+                    cmd, shell=True, cwd=str(worktree_path),
+                    env=env, timeout=120, capture_output=True,
+                )
+            except Exception as e:
+                logger.warning("Setup command failed: %s — %s", cmd, e)
+
+        # Build test command
+        if test_cmd_base in ("pytest", "python -m pytest"):
+            cmd_parts = [sys.executable, "-m", "pytest"] + test_args
+        else:
+            cmd_parts = test_cmd_base.split()
+
+        if test_pattern:
+            cmd_parts.append(test_pattern)
+
+        logger.info("Running tests (config-driven) in %s: %s", worktree_path, " ".join(cmd_parts))
+        try:
+            result = subprocess.run(
+                cmd_parts,
+                cwd=str(worktree_path),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            raw_output = (result.stdout + "\n" + result.stderr).strip()
+            return _format_test_output(result.returncode, raw_output, timeout)
+        except subprocess.TimeoutExpired:
+            logger.warning("Tests timed out after %ds", timeout)
+            return f"failed: timed out after {timeout}s"
+        except Exception as e:
+            logger.warning("Test execution error: %s", e)
+            return f"error: {e}"
+
+    # ------------------------------------------------------------------ #
+    # Path B — auto-detection (original behaviour, no config file)        #
+    # ------------------------------------------------------------------ #
     pytest_markers = ("pytest.ini", "pyproject.toml", "setup.py", "setup.cfg")
 
     test_cwd = worktree_path
@@ -51,30 +134,66 @@ def run_tests(worktree_path: Path) -> str:
             cmd, cwd=test_cwd, capture_output=True, text=True, timeout=300,
         )
         raw_output = (result.stdout + "\n" + result.stderr).strip()
-
-        if result.returncode == 0:
-            logger.info("Tests passed")
-            summary_lines = [l for l in raw_output.splitlines() if "passed" in l.lower() or "ok" in l.lower()]
-            return "passed\n" + ("\n".join(summary_lines[-5:]) if summary_lines else raw_output[:500])
-        else:
-            logger.warning("Tests failed (exit code %d)", result.returncode)
-            error_lines = []
-            for line in raw_output.splitlines():
-                line_lower = line.lower()
-                if any(kw in line_lower for kw in ("error", "fail", "assert", "exception", "traceback", "syntaxerror", "nameerror", "import")):
-                    error_lines.append(line)
-                elif line.startswith("E ") or line.startswith("> "):
-                    error_lines.append(line)
-                elif line.startswith("FAILED "):
-                    error_lines.append(line)
-            parsed = "\n".join(error_lines[:40]) if error_lines else raw_output[:3000]
-            return f"failed (exit code {result.returncode})\n{parsed}"
+        return _format_test_output(result.returncode, raw_output, timeout=300)
     except subprocess.TimeoutExpired:
         logger.warning("Tests timed out after 5 minutes")
         return "failed: timed out after 5 minutes"
     except Exception as e:
         logger.warning("Test execution error: %s", e)
         return f"error: {e}"
+
+
+def _format_test_output(returncode: int, raw_output: str, timeout: int) -> str:
+    """Format raw subprocess output into a concise test result string."""
+    if returncode == 0:
+        logger.info("Tests passed")
+        summary_lines = [
+            line for line in raw_output.splitlines()
+            if "passed" in line.lower() or "ok" in line.lower()
+        ]
+        return "passed\n" + ("\n".join(summary_lines[-5:]) if summary_lines else raw_output[:500])
+
+    logger.warning("Tests failed (exit code %d)", returncode)
+    error_lines = []
+    for line in raw_output.splitlines():
+        line_lower = line.lower()
+        if any(kw in line_lower for kw in (
+            "error", "fail", "assert", "exception", "traceback",
+            "syntaxerror", "nameerror", "import",
+        )):
+            error_lines.append(line)
+        elif line.startswith("E ") or line.startswith("> "):
+            error_lines.append(line)
+        elif line.startswith("FAILED "):
+            error_lines.append(line)
+    parsed = "\n".join(error_lines[:40]) if error_lines else raw_output[:3000]
+    return f"failed (exit code {returncode})\n{parsed}"
+
+
+def create_agent_config_template(repo_path: "str | Path") -> None:
+    """Write a .agent_config.json.example template to the repo root."""
+    template_path = Path(repo_path) / ".agent_config.json.example"
+    if template_path.exists():
+        return
+    template = {
+        "_comment": "Rename to .agent_config.json to activate. All fields are optional.",
+        "test_command": "pytest",
+        "test_timeout": 300,
+        "test_args": ["--tb=short", "-q"],
+        "test_pattern": None,
+        "setup_commands": [],
+        "env": {
+            "DATABASE_URL": "sqlite:///test.db"
+        },
+        "max_tool_calls": 50,
+        "skip_bug_categories": [],
+        "min_confidence": None,
+    }
+    try:
+        template_path.write_text(json.dumps(template, indent=2))
+        logger.info("Wrote .agent_config.json.example to %s", repo_path)
+    except Exception:
+        pass
 
 
 def cleanup_worktree(repo_path: Path | None, sandbox_path: str) -> None:

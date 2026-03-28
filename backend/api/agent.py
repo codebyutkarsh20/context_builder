@@ -46,6 +46,18 @@ def _init_db() -> None:
                 updated_at TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS human_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                pr_url TEXT,
+                verdict TEXT NOT NULL,
+                comment TEXT,
+                bug_category TEXT,
+                fault_files TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
         conn.commit()
 
 
@@ -174,6 +186,28 @@ class AgentJobStatus(BaseModel):
     debug: bool = False
 
 
+class FeedbackRequest(BaseModel):
+    job_id: str
+    verdict: str          # "approved" | "rejected" | "modified"
+    pr_url: str | None = None
+    comment: str | None = None
+
+
+class FeedbackResponse(BaseModel):
+    ok: bool
+    feedback_id: int
+
+
+class FeedbackStats(BaseModel):
+    total: int
+    approved: int
+    rejected: int
+    modified: int
+    approval_rate: float
+    by_category: dict[str, dict[str, int]]
+    by_fault_file: dict[str, dict[str, int]]
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -279,6 +313,131 @@ def run_mock_ticket(ticket_id: str, debug: bool = Query(False)) -> dict:
     thread.start()
 
     return {"job_id": job_id, "status": "pending", "ticket_id": ticket_id, "debug": debug}
+
+
+# ---------------------------------------------------------------------------
+# Human feedback endpoints
+# ---------------------------------------------------------------------------
+
+@router.post("/agent/feedback", response_model=FeedbackResponse)
+async def submit_feedback(req: FeedbackRequest):
+    """
+    Record a human's review decision on a pipeline PR.
+
+    Call this after a human approves, rejects, or modifies a PR created by the agent.
+    Used to track accuracy over time and improve future runs.
+    """
+    if req.verdict not in ("approved", "rejected", "modified"):
+        raise HTTPException(400, detail="verdict must be 'approved', 'rejected', or 'modified'")
+
+    # Look up the job to get bug_category and fault_files
+    job = _agent_jobs.get(req.job_id)
+    bug_category = None
+    fault_files_json = "[]"
+
+    if job:
+        result = job.get("result") or {}
+        localization = result.get("localization") or {}
+        fault_files_json = json.dumps(localization.get("fault_files", []))
+        # bug_category is stored in work_order inside the job
+        # It may not be directly in the job status — that's ok
+
+    try:
+        with sqlite3.connect(_DB_PATH) as conn:
+            cursor = conn.execute("""
+                INSERT INTO human_feedback (job_id, pr_url, verdict, comment, bug_category, fault_files)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (req.job_id, req.pr_url, req.verdict, req.comment, bug_category, fault_files_json))
+            conn.commit()
+            feedback_id = cursor.lastrowid
+
+        logger.info("Human feedback recorded: job=%s verdict=%s", req.job_id, req.verdict)
+        return FeedbackResponse(ok=True, feedback_id=feedback_id)
+    except Exception as e:
+        logger.error("Failed to store feedback: %s", e)
+        raise HTTPException(500, detail=str(e))
+
+
+@router.get("/agent/feedback/stats", response_model=FeedbackStats)
+async def get_feedback_stats():
+    """
+    Aggregate statistics on human review verdicts.
+
+    Use to track: approval rate over time, which bug categories succeed,
+    which files have the most rejections.
+    """
+    try:
+        with sqlite3.connect(_DB_PATH) as conn:
+            rows = conn.execute("""
+                SELECT verdict, bug_category, fault_files, created_at
+                FROM human_feedback
+                ORDER BY created_at DESC
+                LIMIT 500
+            """).fetchall()
+    except Exception:
+        rows = []
+
+    total = len(rows)
+    approved = sum(1 for r in rows if r[0] == "approved")
+    rejected = sum(1 for r in rows if r[0] == "rejected")
+    modified = sum(1 for r in rows if r[0] == "modified")
+
+    # By category
+    by_category: dict[str, dict[str, int]] = {}
+    for verdict, category, _, _ in rows:
+        if category:
+            cat = by_category.setdefault(category, {"approved": 0, "rejected": 0, "modified": 0})
+            cat[verdict] = cat.get(verdict, 0) + 1
+
+    # By fault file (top 20)
+    file_counts: dict[str, dict[str, int]] = {}
+    for verdict, _, fault_files_json, _ in rows:
+        try:
+            files = json.loads(fault_files_json or "[]")
+        except Exception:
+            files = []
+        for f in files[:3]:  # Don't over-index on large fault sets
+            fname = os.path.basename(f)
+            fc = file_counts.setdefault(fname, {"approved": 0, "rejected": 0, "modified": 0})
+            fc[verdict] = fc.get(verdict, 0) + 1
+
+    # Sort by total activity, keep top 20
+    top_files = dict(
+        sorted(file_counts.items(), key=lambda x: sum(x[1].values()), reverse=True)[:20]
+    )
+
+    return FeedbackStats(
+        total=total,
+        approved=approved,
+        rejected=rejected,
+        modified=modified,
+        approval_rate=approved / total if total > 0 else 0.0,
+        by_category=by_category,
+        by_fault_file=top_files,
+    )
+
+
+@router.get("/agent/feedback")
+async def list_feedback(limit: int = 50):
+    """List recent human feedback entries."""
+    try:
+        with sqlite3.connect(_DB_PATH) as conn:
+            rows = conn.execute("""
+                SELECT id, job_id, pr_url, verdict, comment, bug_category, created_at
+                FROM human_feedback
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+        return [
+            {
+                "id": r[0], "job_id": r[1], "pr_url": r[2],
+                "verdict": r[3], "comment": r[4],
+                "bug_category": r[5], "created_at": r[6],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------

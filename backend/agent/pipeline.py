@@ -294,6 +294,36 @@ def _classify_bug_category(title: str, description: str) -> str:
 # Node functions
 # ---------------------------------------------------------------------------
 
+def _extract_repro_steps(description: str) -> list[str]:
+    """Extract reproduction steps from ticket description."""
+    import re
+    steps = []
+
+    # Look for "Steps to Reproduce", "How to reproduce", "Reproduction steps" sections
+    section_patterns = [
+        r'(?:steps?\s+to\s+reproduce|how\s+to\s+reproduce|reproduction\s+steps?|repro\s+steps?)\s*:?\s*\n([\s\S]+?)(?:\n\n|\n#{1,3}|\Z)',
+        r'(?:to\s+reproduce|reproduce)\s*:?\s*\n([\s\S]+?)(?:\n\n|\n#{1,3}|\Z)',
+    ]
+
+    for pattern in section_patterns:
+        match = re.search(pattern, description, re.IGNORECASE)
+        if match:
+            section = match.group(1)
+            # Extract numbered/bulleted items
+            items = re.findall(r'(?:^|\n)\s*(?:\d+\.|[-*•])\s*(.+)', section)
+            if items:
+                steps = [item.strip() for item in items[:10]]
+                break
+
+    # Fallback: look for numbered list anywhere in description
+    if not steps:
+        numbered = re.findall(r'(?:^|\n)\s*(\d+)\.\s+(.+)', description)
+        if len(numbered) >= 2:  # At least 2 numbered items looks like steps
+            steps = [item for _, item in numbered[:10]]
+
+    return steps
+
+
 def intake_node(state: AgentState) -> AgentState:
     """Stage 1: Translate bug ticket into technical spec via structured output."""
     _thread_local.current_stage = "intake"
@@ -353,6 +383,13 @@ flag name should log a warning message"."""
         )
         intent["notes"] = (existing_notes + "\n" + stack_note).strip() if existing_notes else stack_note
         state["intent"] = intent
+
+    # Extract reproduction steps from the ticket description
+    repro_steps = _extract_repro_steps(description)
+    if repro_steps:
+        work_order["repro_steps"] = repro_steps
+        state["work_order"] = work_order
+        logger.info("Reproduction steps extracted (%d steps)", len(repro_steps))
 
     # Classify the bug to flag automation confidence
     ticket_id = work_order.get("ticket_id", "UNKNOWN")
@@ -705,6 +742,40 @@ config files, or documentation. Test files (test_*.py, conftest.py) are never fa
     return state
 
 
+def _get_file_recency_score(repo_path: str | None, file_path: str) -> float:
+    """Return a recency multiplier for localization: recently changed files are 3x more likely to contain bugs."""
+    if not repo_path:
+        return 1.0
+    try:
+        import subprocess
+        from datetime import datetime, timezone, timedelta
+        result = subprocess.run(
+            ["git", "log", "--follow", "--format=%ai", "-1", "--", file_path],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Parse ISO date like "2026-03-15 14:23:01 +0000"
+            date_str = result.stdout.strip().split('\n')[0]
+            # Try to parse
+            try:
+                last_modified = datetime.fromisoformat(date_str.replace(' +0000', '+00:00').replace(' -0000', '+00:00'))
+                age_days = (datetime.now(timezone.utc) - last_modified).days
+                if age_days <= 7:
+                    return 3.0   # Changed in last week — very likely culprit
+                elif age_days <= 14:
+                    return 2.5
+                elif age_days <= 30:
+                    return 2.0   # Changed in last month — elevated suspicion
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return 1.0
+
+
 def localization_node(state: AgentState) -> AgentState:
     """Stage 3: Localize the fault using structured output."""
     _thread_local.current_stage = "localization"
@@ -718,6 +789,15 @@ def localization_node(state: AgentState) -> AgentState:
     intent = state.get("intent", {})
     context = state.get("context", "")
 
+    # Add git blame hint to localization prompt
+    repo_path_str = state.get("work_order", {}).get("repo_path")
+    recent_files = []
+    if repo_path_str:
+        for candidate_file in intent.get("likely_affected_files", [])[:10]:
+            score = _get_file_recency_score(repo_path_str, candidate_file)
+            if score >= 2.0:
+                recent_files.append(f"{candidate_file} (changed in last {'week' if score >= 3.0 else 'month'})")
+
     prompt = f"""You are a senior developer localizing a bug.
 
 BUG: {intent.get('actual_behavior', '')}
@@ -729,6 +809,9 @@ CODEBASE CONTEXT:
 
 Based on the context above, identify the most likely fault locations.
 Be specific about file paths and function names visible in the context."""
+
+    if recent_files:
+        prompt += f"\n\nGIT BLAME — Recently changed files (higher bug probability):\n" + "\n".join(f"- {f}" for f in recent_files)
 
     try:
         result = _structured_call("claude-sonnet-4-6", 1500, LocalizationResult, prompt)
@@ -743,6 +826,13 @@ Be specific about file paths and function names visible in the context."""
             "confidence": 0.1,
             "evidence": [],
         }
+
+    # Log git blame recency scores for fault files
+    fault_files = state.get("localization", {}).get("fault_files", [])
+    for ff in fault_files[:5]:
+        score = _get_file_recency_score(repo_path_str, ff)
+        if score > 1.0:
+            logger.info("Git blame: %s recently changed (recency multiplier: %.1f)", ff, score)
 
     if trace:
         trace.stage_end("localization")
@@ -1409,6 +1499,39 @@ def _generate_stub_tests(
     }]
 
 
+def _find_similar_fixes(repo_name: str, fault_files: list[str], fault_functions: list[str]) -> list[dict]:
+    """Load fix_history.json and find the most similar past fixes."""
+    try:
+        fixes_path = DATA_DIR / repo_name / "fix_history.json"
+        if not fixes_path.exists():
+            return []
+        history = json.loads(fixes_path.read_text())
+        if not history:
+            return []
+
+        # Score each past fix by overlap with current fault location
+        fault_file_stems = {Path(f).stem for f in fault_files}
+        fault_func_set = set(fault_functions)
+
+        scored = []
+        for fix in history[-50:]:  # Check last 50 fixes
+            fix_file_stems = {Path(f).stem for f in fix.get("fault_files", [])}
+            fix_func_set = set(fix.get("fault_functions", []))
+
+            file_overlap = len(fault_file_stems & fix_file_stems)
+            func_overlap = len(fault_func_set & fix_func_set)
+            score = file_overlap * 2 + func_overlap * 3
+
+            if score > 0:
+                scored.append((score, fix))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [fix for _, fix in scored[:3]]
+    except Exception as e:
+        logger.debug("Failed to load fix history: %s", e)
+        return []
+
+
 def repair_node(state: AgentState) -> AgentState:
     """Stage 4: Agentic repair with per-file verification and sequential patching.
 
@@ -1535,6 +1658,20 @@ def repair_node(state: AgentState) -> AgentState:
             f"and will be rejected. You MUST produce one patch entry for EACH target function.\n"
         )
 
+    # Load past fixes in the same area to guide repair (Change 3: fix history matching)
+    repo_name = work_order.get("repo_name", "")
+    fix_history_context = ""
+    if repo_name:
+        similar_fixes = _find_similar_fixes(repo_name, localization.get("fault_files", []), localization.get("fault_functions", []))
+        if similar_fixes:
+            fix_history_context = "\n\nPAST FIXES IN THE SAME AREA:\n"
+            for fix in similar_fixes:
+                fix_history_context += (
+                    f"- Ticket {fix.get('ticket_id', '?')}: {fix.get('root_cause', '')}\n"
+                    f"  Fix approach: {fix.get('fix_summary', '')}\n"
+                )
+            fix_history_context += "\nUse these as reference — similar bugs in the same files may share root causes.\n"
+
     # End-state prompt style (Research Finding #10 — Claude performs better with end-state descriptions)
     prompt = f"""Fix this bug by producing a RepairResult with correct patches.
 
@@ -1545,6 +1682,7 @@ TARGET FUNCTIONS: {target_fns} in {target_files}
 {completeness_rule}
 {criteria_section}
 {feedback_section}
+{fix_history_context}
 {source_section}
 
 A correct RepairResult has:
@@ -1567,7 +1705,13 @@ The fix is complete when:
 1. original_code is an EXACT substring of the source shown (start from `def`)
 2. patched_code addresses the stated root cause
 3. EVERY target function has a corresponding patch (no partial fixes)
-4. new tests cover the fixed behaviour and the existing ones still pass"""
+4. new tests cover the fixed behaviour and the existing ones still pass
+
+IMPORTANT: Generate 3 alternative patches (patch_alternatives) in order from most to least confident.
+The first should be your primary fix. The second should be an alternative approach (e.g., fix at a different layer).
+The third should be the most conservative fix (minimal change).
+
+If one approach doesn't work, the system will try the next."""
 
     MAX_FILE_REQUESTS = 2
 
@@ -1671,6 +1815,35 @@ Produce the RepairResult with this patch now."""
                 verified = raw_patches
 
             repair_dump["patches"] = verified
+
+            # patch_alternatives fallback: if primary patches all failed to verify,
+            # try each alternative set in order until one produces verified patches.
+            if not verified:
+                alternatives = repair_dump.get("patch_alternatives") or []
+                for alt_idx, alt in enumerate(alternatives[:2]):
+                    alt_patches = alt.get("patches", []) if isinstance(alt, dict) else []
+                    alt_patches = [
+                        p for p in alt_patches
+                        if p.get("original_code", "").strip() != p.get("patched_code", "").strip()
+                    ]
+                    if not alt_patches:
+                        continue
+                    alt_patches = _deduplicate_patches(alt_patches)
+                    if repo_path:
+                        alt_verified = _verify_and_fix_patches(
+                            alt_patches, current_source, repo_path, intent, localization, feedback_section,
+                        )
+                    else:
+                        alt_verified = alt_patches
+                    if alt_verified:
+                        logger.info(
+                            "patch_alternatives[%d] succeeded with %d patches (primary failed)",
+                            alt_idx, len(alt_verified),
+                        )
+                        repair_dump["patches"] = alt_verified
+                        verified = alt_verified
+                        break
+                    logger.info("patch_alternatives[%d] also failed to apply", alt_idx)
 
             # Trace: emit each patch candidate
             for p in verified:
@@ -2136,6 +2309,12 @@ def test_node(state: AgentState) -> AgentState:
             cwd=worktree_path, capture_output=True, text=True, check=True, timeout=30,
         )
         logger.info("Committed %d patches in sandbox", patches_applied)
+
+        # Log repro steps availability for test generation guidance
+        repro_steps = state.get("work_order", {}).get("repro_steps", [])
+        if repro_steps:
+            logger.info("Reproduction steps available (%d steps) — can be used for test generation", len(repro_steps))
+            # Inject into any stub test generation prompts
 
         # Run targeted tests first (faster feedback), then the full suite
         fault_files = state.get("localization", {}).get("fault_files", [])

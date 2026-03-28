@@ -30,6 +30,7 @@ class GraphBuilder:
         *,
         decision_points: list[dict] | None = None,
         domain_concepts: list[dict] | None = None,
+        incremental: bool = True,
     ) -> None:
         """Ingest all repository data into Neo4j.
 
@@ -46,7 +47,17 @@ class GraphBuilder:
             Output of the graph analyser.  Expected keys:
                 ``edges``    – list of {source, target, type} dicts
                 ``hotspots`` – dict mapping node_id → pagerank score
+        incremental:
+            When True (default), snapshot existing node IDs before ingest and
+            delete any nodes that were not seen in this run (i.e. from deleted
+            files/classes/functions).
         """
+        # Reset seen-ID tracking for this run
+        self._seen_ids: dict[str, set[str]] = {"File": set(), "Class": set(), "Function": set()}
+
+        # Snapshot existing nodes before touching the graph (incremental only)
+        snapshot = self._snapshot_existing_node_ids() if incremental else {}
+
         self._upsert_repo(structure)
 
         for parsed_file in parsed:
@@ -62,11 +73,106 @@ class GraphBuilder:
         if domain_concepts:
             self._upsert_domain_concepts(domain_concepts)
 
+        # Remove nodes that disappeared from the repo since the last ingest
+        if incremental and snapshot:
+            deleted = self._delete_stale_nodes(snapshot, self._seen_ids)
+            total_deleted = sum(deleted.values())
+            if total_deleted > 0:
+                logger.info(
+                    "Incremental update: deleted %d stale nodes (%s)",
+                    total_deleted,
+                    ", ".join(f"{v} {k}" for k, v in deleted.items() if v > 0),
+                )
+
         logger.info(
             "Graph ingest complete for repo '%s': %d files processed.",
             self.repo_name,
             len(parsed),
         )
+
+    # ------------------------------------------------------------------
+    # Incremental update helpers
+    # ------------------------------------------------------------------
+
+    def _snapshot_existing_node_ids(self) -> dict[str, set[str]]:
+        """Return all current node IDs grouped by label: {File: {...}, Class: {...}, Function: {...}}"""
+        snapshot: dict[str, set[str]] = {"File": set(), "Class": set(), "Function": set()}
+
+        for label in ("File", "Class", "Function"):
+            query = f"""
+                MATCH (r:Repo {{name: $repo_name}})-[:CONTAINS*1..3]->(n:{label})
+                RETURN n.id AS id
+            """
+            try:
+                results = neo4j_client.run(query, {"repo_name": self.repo_name})
+                for record in (results or []):
+                    nid = record.get("id") or record.get("n.id")
+                    if nid:
+                        snapshot[label].add(str(nid))
+            except Exception as e:
+                logger.warning("Failed to snapshot %s nodes: %s", label, e)
+
+        return snapshot
+
+    def _track_seen(self, label: str, node_id: str) -> None:
+        """Record that this node was seen in the current ingest run."""
+        self._seen_ids.setdefault(label, set()).add(str(node_id))
+
+    def _delete_stale_nodes(
+        self,
+        snapshot: dict[str, set[str]],
+        seen_ids: dict[str, set[str]],
+    ) -> dict[str, int]:
+        """Delete nodes that were in the graph but not seen in this ingest run."""
+        deleted_counts: dict[str, int] = {}
+
+        for label in ("Function", "Class", "File"):  # Delete children before parents
+            stale_ids = snapshot.get(label, set()) - seen_ids.get(label, set())
+            if not stale_ids:
+                deleted_counts[label] = 0
+                continue
+
+            logger.info(
+                "Deleting %d stale %s nodes for repo '%s'",
+                len(stale_ids), label, self.repo_name,
+            )
+
+            # Delete in batches of 100 to avoid large transactions
+            stale_list = list(stale_ids)
+            total_deleted = 0
+            for i in range(0, len(stale_list), 100):
+                batch = stale_list[i:i + 100]
+                try:
+                    # DETACH DELETE removes the node and all its relationships
+                    query = f"""
+                        MATCH (n:{label})
+                        WHERE n.id IN $ids
+                        DETACH DELETE n
+                    """
+                    neo4j_client.run(query, {"ids": batch})
+                    total_deleted += len(batch)
+                except Exception as e:
+                    logger.warning("Failed to delete stale %s batch: %s", label, e)
+
+            deleted_counts[label] = total_deleted
+
+        return deleted_counts
+
+    def get_stale_nodes(self, days_old: int = 7) -> list[dict]:
+        """Return nodes not seen in the last N days (may indicate deleted code)."""
+        query = """
+            MATCH (r:Repo {name: $repo_name})-[:CONTAINS*1..3]->(n)
+            WHERE n.last_seen IS NOT NULL
+              AND n.last_seen < datetime() - duration({days: $days})
+            RETURN labels(n)[0] AS label, n.id AS id, n.name AS name, n.last_seen AS last_seen
+            LIMIT 100
+        """
+        try:
+            results = neo4j_client.run(query, {"repo_name": self.repo_name, "days": days_old})
+            return [dict(r) for r in (results or [])]
+        except Exception as e:
+            logger.warning("Failed to query stale nodes: %s", e)
+            return []
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -106,7 +212,8 @@ class GraphBuilder:
             "SET f.path      = $path, "
             "    f.language  = $language, "
             "    f.loc       = $loc, "
-            "    f.docstring = $docstring "
+            "    f.docstring = $docstring, "
+            "    f.last_seen = datetime() "
             "WITH f "
             "MATCH (r:Repo {name: $repo_name}) "
             "MERGE (r)-[:CONTAINS]->(f)"
@@ -120,6 +227,7 @@ class GraphBuilder:
             "repo_name": self.repo_name,
         }
         neo4j_client.run(query, params)
+        self._track_seen("File", file_id)
 
     # --- Classes -------------------------------------------------------
 
@@ -137,7 +245,8 @@ class GraphBuilder:
                 "SET c.name      = $name, "
                 "    c.file      = $file, "
                 "    c.bases     = $bases, "
-                "    c.docstring = $docstring "
+                "    c.docstring = $docstring, "
+                "    c.last_seen = datetime() "
                 "WITH c "
                 "MATCH (f:File {id: $file_id}) "
                 "MERGE (f)-[:CONTAINS]->(c)"
@@ -151,6 +260,7 @@ class GraphBuilder:
                 "file_id": file_id,
             }
             neo4j_client.run(query, params)
+            self._track_seen("Class", class_id)
 
             # Ingest methods belonging to this class
             for method in cls_dict.get("methods", []) or []:
@@ -175,7 +285,8 @@ class GraphBuilder:
                 "    fn.params      = $params, "
                 "    fn.return_type = $return_type, "
                 "    fn.docstring   = $docstring, "
-                "    fn.decorators  = $decorators "
+                "    fn.decorators  = $decorators, "
+                "    fn.last_seen   = datetime() "
                 "WITH fn "
                 "MATCH (f:File {id: $file_id}) "
                 "MERGE (f)-[:CONTAINS]->(fn)"
@@ -191,6 +302,7 @@ class GraphBuilder:
                 "file_id": file_id,
             }
             neo4j_client.run(query, params)
+            self._track_seen("Function", fn_id)
 
     def _upsert_method(
         self,
@@ -210,7 +322,8 @@ class GraphBuilder:
             "    fn.params      = $params, "
             "    fn.return_type = $return_type, "
             "    fn.docstring   = $docstring, "
-            "    fn.decorators  = $decorators "
+            "    fn.decorators  = $decorators, "
+            "    fn.last_seen   = datetime() "
             "WITH fn "
             "MATCH (c:Class {id: $class_id}) "
             "MERGE (c)-[:CONTAINS]->(fn)"
@@ -226,6 +339,7 @@ class GraphBuilder:
             "class_id": class_id,
         }
         neo4j_client.run(query, params)
+        self._track_seen("Function", fn_id)
 
     # --- Edges ---------------------------------------------------------
 
