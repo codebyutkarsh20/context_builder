@@ -52,7 +52,8 @@ from agent.types import (
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 3
-MIN_CONFIDENCE_TO_REPAIR = 0.3
+MIN_CONFIDENCE_TO_REPAIR = 0.6  # Raised to 0.6 — low-confidence localization produces wrong patches
+INTAKE_MODEL = "claude-haiku-4-5-20251001"  # Intake is a structured translation task — Haiku is sufficient
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 
 # Thread-local storage for per-run progress callback + trace
@@ -216,6 +217,80 @@ def _resolve_repo_path(work_order: dict) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
+# Intake helpers
+# ---------------------------------------------------------------------------
+
+def _extract_stack_trace_hints(text: str) -> list[dict]:
+    """Extract file:line:function hints from stack traces in ticket text."""
+    hints = []
+
+    # Python stack trace lines: File "path/to/file.py", line 123, in function_name
+    python_pattern = re.compile(
+        r'File ["\']([^"\']+\.py)["\'],\s+line\s+(\d+),\s+in\s+(\w+)'
+    )
+    for m in python_pattern.finditer(text):
+        hints.append({"file": m.group(1), "line": int(m.group(2)), "function": m.group(3)})
+
+    # Java/generic: at package.Class.method(File.java:123)
+    java_pattern = re.compile(r'at\s+([\w.]+)\((\w+\.java):(\d+)\)')
+    for m in java_pattern.finditer(text):
+        hints.append({"file": m.group(2), "line": int(m.group(3)), "function": m.group(1).split('.')[-1]})
+
+    # Simple file:line patterns: /path/to/file.py:123
+    file_line_pattern = re.compile(r'([\w/.-]+\.(?:py|js|ts|go|rb|java)):(\d+)')
+    for m in file_line_pattern.finditer(text):
+        hints.append({"file": m.group(1), "line": int(m.group(2)), "function": None})
+
+    # Deduplicate by (file, line)
+    seen: set[tuple[str, int]] = set()
+    deduped = []
+    for h in hints:
+        key = (h["file"], h["line"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(h)
+
+    return deduped[:10]  # Cap at 10 hints
+
+
+def _classify_bug_category(title: str, description: str) -> str:
+    """
+    Classify bug into Category A (can auto-fix), B (might work), C (skip).
+
+    Category A: Off-by-one, null check, string format, wrong variable, missing import,
+                wrong argument, logic inversion, missing return
+    Category B: Business logic, API contract, missing error handling, config issues
+    Category C: Race conditions, performance (N+1, slow query), multi-service,
+                data migration, environment-specific, UI/visual, architecture
+    """
+    text = f"{title} {description}".lower()
+
+    # Category C signals — skip these
+    c_signals = [
+        "race condition", "concurrency", "deadlock", "performance", "slow", "timeout",
+        "n+1", "memory leak", "migration", "database migration", "schema change",
+        "multi-service", "event", "kafka", "rabbitmq", "queue", "environment",
+        "works locally", "works in dev", "only in prod", "ui", "visual", "layout",
+        "animation", "css", "architecture", "redesign", "refactor",
+    ]
+    if any(s in text for s in c_signals):
+        return "C"
+
+    # Category A signals — high confidence
+    a_signals = [
+        "traceback", "exception", "error:", "typeerror", "attributeerror",
+        "none", "null", "undefined", "missing", "import", "not found",
+        "wrong value", "incorrect value", "returns wrong", "should return",
+        "off by one", "index out", "keyerror", "valueerror",
+    ]
+    a_count = sum(1 for s in a_signals if s in text)
+    if a_count >= 2:
+        return "A"
+
+    return "B"
+
+
+# ---------------------------------------------------------------------------
 # Node functions
 # ---------------------------------------------------------------------------
 
@@ -245,7 +320,7 @@ not from guessing the implementation. Example: "calling set_pr_url with a nonexi
 flag name should log a warning message"."""
 
     try:
-        result = _structured_call("claude-sonnet-4-6", 1000, IntentAnalysis, prompt)
+        result = _structured_call(INTAKE_MODEL, 1000, IntentAnalysis, prompt)
         state["intent"] = result.model_dump()
     except Exception as e:
         logger.error("Intent translation failed: %s", e)
@@ -257,6 +332,45 @@ flag name should log a warning message"."""
             "fix_type": "bug_fix",
             "severity": work_order.get("priority", "medium"),
         }
+
+    # Extract stack trace hints from the ticket description
+    description = work_order.get("description", "")
+    stack_hints = _extract_stack_trace_hints(description)
+    if stack_hints:
+        work_order["stack_trace_hints"] = stack_hints
+        state["work_order"] = work_order
+        hint_summary = "; ".join(
+            f"{h['file']} line {h['line']}" + (f" in {h['function']}" if h["function"] else "")
+            for h in stack_hints
+        )
+        logger.info("Stack trace hints extracted (%d): %s", len(stack_hints), hint_summary)
+        # Surface hints in intent so localization can use them as high-confidence signals
+        intent = state.get("intent", {})
+        existing_notes = intent.get("notes", "")
+        stack_note = "Stack trace points to: " + "; ".join(
+            f"{h['file']} line {h['line']}" + (f" in {h['function']} — start here" if h["function"] else "")
+            for h in stack_hints
+        )
+        intent["notes"] = (existing_notes + "\n" + stack_note).strip() if existing_notes else stack_note
+        state["intent"] = intent
+
+    # Classify the bug to flag automation confidence
+    ticket_id = work_order.get("ticket_id", "UNKNOWN")
+    title = work_order.get("title", "")
+    bug_category = _classify_bug_category(title, description)
+    work_order["bug_category"] = bug_category
+    state["work_order"] = work_order
+    logger.info("Bug category: %s for ticket %s", bug_category, ticket_id)
+    if bug_category == "C":
+        intent = state.get("intent", {})
+        existing_notes = intent.get("notes", "")
+        cat_c_note = (
+            "WARNING: Bug category C detected — likely involves concurrency, performance, "
+            "multi-service coordination, or environment-specific issues. Auto-fix success rate "
+            "is low; human review strongly recommended."
+        )
+        intent["notes"] = (existing_notes + "\n" + cat_c_note).strip() if existing_notes else cat_c_note
+        state["intent"] = intent
 
     state["iteration_count"] = 0
     if trace:
@@ -1764,6 +1878,24 @@ A correct review produces:
     return state
 
 
+def _find_related_tests(modified_files: list[str], sandbox_path: Path) -> list[str]:
+    """Find test files related to the modified source files."""
+    related = []
+    for src_file in modified_files:
+        base = Path(src_file).stem
+        # Common test file patterns
+        patterns = [
+            f"test_{base}.py",
+            f"{base}_test.py",
+            f"tests/test_{base}.py",
+            f"test/test_{base}.py",
+        ]
+        for pattern in patterns:
+            matches = list(sandbox_path.rglob(pattern))
+            related.extend(str(m.relative_to(sandbox_path)) for m in matches)
+    return list(set(related))
+
+
 def test_node(state: AgentState) -> AgentState:
     """Stage 5.5: Create sandbox via git worktree, apply patches, run tests."""
     _thread_local.current_stage = "test"
@@ -2005,8 +2137,35 @@ def test_node(state: AgentState) -> AgentState:
         )
         logger.info("Committed %d patches in sandbox", patches_applied)
 
-        # Auto-detect and run tests
-        test_result = _run_tests(worktree_path)
+        # Run targeted tests first (faster feedback), then the full suite
+        fault_files = state.get("localization", {}).get("fault_files", [])
+        related_tests = _find_related_tests(fault_files, worktree_path)
+        run_full_suite = True
+        if related_tests:
+            targeted_cmd = [sys.executable, "-m", "pytest", "--tb=short", "-q"] + related_tests
+            logger.info("Running targeted tests first (%d file(s)): %s", len(related_tests), related_tests)
+            try:
+                targeted_result = subprocess.run(
+                    targeted_cmd,
+                    cwd=worktree_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if targeted_result.returncode != 0:
+                    logger.info("Targeted tests FAILED — skipping full suite")
+                    _emit_trace("info", {"message": f"Targeted tests failed:\n{targeted_result.stdout[-2000:]}"})
+                    test_result = f"failed (targeted): {targeted_result.stdout[-1000:]}"
+                    state["test_result"] = test_result
+                    run_full_suite = False
+                else:
+                    logger.info("Targeted tests pass (%d files). Running full suite...", len(related_tests))
+            except subprocess.TimeoutExpired:
+                logger.warning("Targeted test run timed out — proceeding to full suite")
+
+        # Auto-detect and run tests (full suite, unless targeted run already failed)
+        if run_full_suite:
+            test_result = _run_tests(worktree_path)
         state["test_result"] = test_result
         _emit_trace("test_output", {
             "result": test_result,

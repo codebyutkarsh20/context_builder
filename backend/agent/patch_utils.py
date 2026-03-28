@@ -15,6 +15,111 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def apply_patch_by_line_number(
+    content: str,
+    patch: dict,
+) -> str | None:
+    """Strategy 0: Replace lines [line_start, line_end] with patched_code.
+
+    Uses 1-indexed line numbers. line_end is inclusive.
+    Returns None if line numbers are absent, out of range, or if the result
+    has syntax errors (Python only, best-effort).
+    """
+    line_start = patch.get("line_start")
+    line_end = patch.get("line_end")
+    patched_code = patch.get("patched_code", "")
+
+    if line_start is None or line_end is None:
+        return None  # No line numbers — skip this strategy
+
+    try:
+        line_start = int(line_start)
+        line_end = int(line_end)
+    except (TypeError, ValueError):
+        return None
+
+    lines = content.splitlines(keepends=True)
+    total_lines = len(lines)
+
+    if line_start < 1 or line_end < line_start or line_end > total_lines:
+        logger.warning(
+            "Line-number patch out of range: line_start=%d line_end=%d total=%d",
+            line_start, line_end, total_lines,
+        )
+        return None
+
+    # Preserve trailing newline consistency
+    patched_lines = patched_code.splitlines(keepends=True)
+    if patched_lines and not patched_lines[-1].endswith("\n"):
+        patched_lines[-1] += "\n"
+
+    # Build new content
+    new_lines = lines[: line_start - 1] + patched_lines + lines[line_end:]
+    new_content = "".join(new_lines)
+
+    logger.debug(
+        "Strategy 0 (line-number): lines %d-%d replaced (%d lines → %d lines)",
+        line_start, line_end,
+        line_end - line_start + 1,
+        len(patched_lines),
+    )
+
+    return new_content
+
+
+def apply_patch(
+    content: str,
+    patch: dict,
+    file_path: str | None = None,
+) -> str | None:
+    """Apply a patch dict to *content*, trying strategies in order.
+
+    Strategy 0 (line-number based) is tried first when ``line_start`` /
+    ``line_end`` are present in the patch dict — it is the most reliable
+    because it does not require exact substring matching.  If line numbers are
+    absent, or if the result produces a syntax error in a Python file, the
+    function falls through to the fuzzy-matching strategies (1-5) provided by
+    :func:`fuzzy_match_replace`.
+
+    Args:
+        content:   Full text of the file to be patched.
+        patch:     Patch dict with keys ``original_code``, ``patched_code``,
+                   and optionally ``line_start`` / ``line_end``.
+        file_path: Optional file path used for Python syntax validation.
+
+    Returns:
+        Patched file content, or ``None`` if no strategy succeeded.
+    """
+    original = patch.get("original_code", "")
+    patched_code = patch.get("patched_code", "")
+
+    # Strategy 0: Line-number patching (most reliable when available)
+    result = apply_patch_by_line_number(content, patch)
+    if result is not None:
+        if file_path and file_path.endswith(".py"):
+            try:
+                ast.parse(result)
+            except SyntaxError as e:
+                logger.warning(
+                    "Strategy 0: line-number patch produced invalid Python: %s", e
+                )
+                # Fall through to fuzzy strategies
+            else:
+                logger.debug("Strategy 0 succeeded for %s", file_path or "<unknown>")
+                return result
+        else:
+            logger.debug("Strategy 0 succeeded for %s", file_path or "<unknown>")
+            return result
+
+    # Strategies 1-5: Fuzzy / string-based matching
+    result = fuzzy_match_replace(content, original, patched_code)
+    if result is not None:
+        logger.debug(
+            "Fuzzy strategies (1-5) succeeded for %s", file_path or "<unknown>"
+        )
+    return result
+
+
 def fuzzy_match_replace(content: str, original: str, patched: str) -> str | None:
     """Try multiple matching strategies, from strict to fuzzy.
 

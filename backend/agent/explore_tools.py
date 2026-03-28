@@ -23,6 +23,49 @@ from langchain_core.tools import tool
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Shared read-only JSON cache (mtime-based invalidation).
+# Module-level (not thread-local) because the data is read-only and safe to
+# share across concurrent pipeline runs — avoids re-parsing 10-50 MB files on
+# every tool call.
+# ---------------------------------------------------------------------------
+import shutil as _shutil
+
+_json_file_cache: dict[tuple[str], tuple[float, object]] = {}
+_json_cache_lock = threading.Lock()
+
+
+def _load_json_cached(path: "Path") -> object:
+    """Load JSON from *path* with mtime-based cache invalidation.
+
+    Returns the parsed object, or None if the file doesn't exist or is
+    unreadable.  The cache is keyed on the full resolved path string so
+    different repos never alias each other.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+
+    key = (str(path),)
+    with _json_cache_lock:
+        if key in _json_file_cache:
+            cached_mtime, cached_data = _json_file_cache[key]
+            if cached_mtime == mtime:
+                return cached_data
+
+    # Load from disk outside the lock so we don't block other threads while
+    # doing I/O.
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+
+    with _json_cache_lock:
+        _json_file_cache[key] = (mtime, data)
+
+    return data
+
+# ---------------------------------------------------------------------------
 # Issue #1: Thread-local storage replaces module-level globals so concurrent
 # pipeline runs cannot overwrite each other's context.
 # ---------------------------------------------------------------------------
@@ -115,6 +158,51 @@ def _safe_resolve_rglob(match: Path) -> "Path | None":
 
 
 # ---------------------------------------------------------------------------
+# Ripgrep acceleration — use rg when available (5-10x faster, respects
+# .gitignore automatically).  Falls back to GNU grep otherwise.
+# ---------------------------------------------------------------------------
+
+_HAS_RIPGREP = _shutil.which("rg") is not None
+
+
+def _build_search_cmd(
+    pattern: str,
+    repo_path: "Path",
+    file_glob: str,
+    max_results: int,
+) -> list[str]:
+    """Return a grep or ripgrep command list for the given search parameters."""
+    if _HAS_RIPGREP:
+        cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
+        if file_glob:
+            cmd.extend(["-g", file_glob])
+        else:
+            # Default: common source extensions
+            for ext in ["py", "js", "ts", "go", "java", "rb", "rs"]:
+                cmd.extend(["-g", f"*.{ext}"])
+        # rg respects .gitignore automatically — no --exclude-dir needed.
+        # Cap results at the caller's limit.
+        cmd.extend(["-m", str(max_results)])
+        cmd.extend(["--", pattern, str(repo_path)])
+    else:
+        if file_glob:
+            cmd = ["grep", "-rn", "--color=never", f"--include={file_glob}",
+                   "-m", str(max_results), "--", pattern, str(repo_path)]
+        else:
+            cmd = [
+                "grep", "-rn", "--color=never",
+                "--include=*.py", "--include=*.js", "--include=*.ts",
+                "--include=*.go", "--include=*.java", "--include=*.rb", "--include=*.rs",
+                "-m", str(max_results),
+            ]
+            # Exclude common noise directories
+            for excl in ["node_modules", "__pycache__", ".git", "venv", ".venv", "dist", "build"]:
+                cmd.extend(["--exclude-dir", excl])
+            cmd.extend(["--", pattern, str(repo_path)])
+    return cmd
+
+
+# ---------------------------------------------------------------------------
 # Tool 1 — grep_repo
 # ---------------------------------------------------------------------------
 
@@ -134,15 +222,7 @@ def grep_repo(pattern: str, file_glob: str = "", max_results: int = 25) -> str:
         return "ERROR: repo path not set"
 
     try:
-        cmd = ["grep", "-rn", "--include=*.py", "--include=*.js", "--include=*.ts",
-               "--include=*.go", "--include=*.java", "--include=*.rb", "--include=*.rs",
-               "-m", str(max_results), pattern, str(repo_path)]
-
-        if file_glob:
-            # Replace default includes with user glob
-            cmd = ["grep", "-rn", f"--include={file_glob}",
-                   "-m", str(max_results), pattern, str(repo_path)]
-
+        cmd = _build_search_cmd(pattern, repo_path, file_glob, max_results)
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         output = result.stdout.strip()
         if not output:
@@ -455,9 +535,11 @@ def get_function_info(function_id: str) -> str:
         if not graph_path.exists():
             return f"Graph not found for repo '{repo_name}'. Repo may not be analyzed yet."
 
-        graph = json.loads(graph_path.read_text())
-        enriched = json.loads(enriched_path.read_text()) if enriched_path.exists() else {}
-        rules = json.loads(rules_path.read_text()) if rules_path.exists() else []
+        graph = _load_json_cached(graph_path) or {}
+        enriched = _load_json_cached(enriched_path) if enriched_path.exists() else {}
+        enriched = enriched or {}
+        rules = _load_json_cached(rules_path) if rules_path.exists() else []
+        rules = rules or []
 
         # Find matching node (exact or partial)
         node = enriched.get(function_id)
@@ -529,8 +611,9 @@ def get_file_summary(file_path: str) -> str:
         if not enriched_path.exists():
             return f"Knowledge graph not found for repo '{repo_name}'. Use read_file instead."
 
-        enriched = json.loads(enriched_path.read_text())
-        graph = json.loads(graph_path.read_text()) if graph_path.exists() else {}
+        enriched = _load_json_cached(enriched_path) or {}
+        graph = _load_json_cached(graph_path) if graph_path.exists() else {}
+        graph = graph or {}
 
         # Find file node
         file_node = enriched.get(file_path)
