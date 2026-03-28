@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import sqlite3
 import threading
 import time
 import uuid
@@ -23,8 +24,83 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 
+# ---------------------------------------------------------------------------
+# SQLite-backed job persistence
+# ---------------------------------------------------------------------------
+
+_DB_PATH = Path(os.environ.get("AGENT_DB_PATH", "data/agent_jobs.db"))
+
+
+def _init_db() -> None:
+    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(_DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT,
+                stage TEXT,
+                iteration_count INTEGER,
+                result TEXT,
+                error TEXT,
+                debug INTEGER,
+                updated_at TEXT
+            )
+        """)
+        conn.commit()
+
+
+def _save_job(job: dict) -> None:
+    """Persist a completed job to SQLite."""
+    try:
+        with sqlite3.connect(_DB_PATH) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO agent_jobs
+                (job_id, status, stage, iteration_count, result, error, debug, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            """, (
+                job.get("job_id"),
+                job.get("status"),
+                job.get("stage"),
+                job.get("iteration_count", 0),
+                json.dumps(job.get("result")),
+                job.get("error"),
+                1 if job.get("debug") else 0,
+            ))
+            conn.commit()
+    except Exception as e:
+        logger.warning("Failed to persist job: %s", e)
+
+
+def _load_jobs_from_db() -> dict:
+    """Load completed jobs from SQLite on startup."""
+    if not _DB_PATH.exists():
+        return {}
+    try:
+        with sqlite3.connect(_DB_PATH) as conn:
+            rows = conn.execute("SELECT * FROM agent_jobs").fetchall()
+        jobs = {}
+        for row in rows:
+            job_id, status, stage, iteration_count, result_json, error, debug, _ = row
+            jobs[job_id] = {
+                "job_id": job_id,
+                "status": status,
+                "stage": stage or "",
+                "iteration_count": iteration_count or 0,
+                "result": json.loads(result_json) if result_json else None,
+                "error": error or "",
+                "debug": bool(debug),
+            }
+        return jobs
+    except Exception as e:
+        logger.warning("Failed to load jobs from DB: %s", e)
+        return {}
+
+
 # In-memory job store with cleanup
-_agent_jobs: dict[str, dict] = {}
+# Completed jobs are also persisted to SQLite so they survive restarts.
+# Active/running jobs are memory-only (they'll restart anyway).
+_init_db()
+_agent_jobs: dict[str, dict] = _load_jobs_from_db()
 _agent_jobs_lock = threading.Lock()
 _MAX_AGENT_JOBS = 50
 
@@ -221,6 +297,8 @@ def stream_trace(job_id: str):
             raise HTTPException(status_code=404, detail="Tracing not enabled for this job (pass debug=true)")
 
     def event_generator():
+        import asyncio
+        max_sse_end = time.monotonic() + 3600  # 1-hour max lifetime
         q = trace.subscribe()
         try:
             # Catch up: send all existing events and track last index sent
@@ -232,6 +310,9 @@ def stream_trace(job_id: str):
 
             # Stream new events — deduplicate by index
             while True:
+                if time.monotonic() > max_sse_end:
+                    logger.info("SSE connection reached 1-hour max lifetime, closing (job %s)", job_id)
+                    break
                 try:
                     evt = q.get(timeout=30)
                     if evt is None:  # sentinel = trace complete
@@ -241,9 +322,19 @@ def stream_trace(job_id: str):
                     if evt.index <= last_sent_idx:
                         continue
                     last_sent_idx = evt.index
-                    yield f"data: {json.dumps(evt.to_dict(), default=str)}\n\n"
+                    try:
+                        yield f"data: {json.dumps(evt.to_dict(), default=str)}\n\n"
+                    except (GeneratorExit, asyncio.CancelledError):
+                        logger.info("SSE client disconnected (job %s)", job_id)
+                        return
                 except queue.Empty:
-                    yield f": keepalive\n\n"
+                    try:
+                        yield f": keepalive\n\n"
+                    except (GeneratorExit, asyncio.CancelledError):
+                        logger.info("SSE client disconnected during keepalive (job %s)", job_id)
+                        return
+        except (GeneratorExit, asyncio.CancelledError):
+            logger.info("SSE generator cancelled (job %s)", job_id)
         finally:
             trace.unsubscribe(q)
 
@@ -366,6 +457,10 @@ def _run_pipeline(job_id: str, work_order: dict, debug: bool = False) -> None:
                 },
                 "error": result.get("error", ""),
             })
+            completed_job = {**_agent_jobs[job_id], "job_id": job_id}
+
+        # Persist terminal job to SQLite
+        _save_job(completed_job)
 
         # Save trace report to disk
         if trace:
@@ -390,6 +485,11 @@ def _run_pipeline(job_id: str, work_order: dict, debug: bool = False) -> None:
                 "stage": "Error",
                 "error": str(e),
             })
+            failed_job = {**_agent_jobs[job_id], "job_id": job_id}
+
+        # Persist failed job to SQLite
+        _save_job(failed_job)
+
         if trace:
             trace.emit("error", "pipeline", {"message": f"Pipeline crashed: {e}"})
             trace.complete()

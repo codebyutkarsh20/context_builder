@@ -8,19 +8,25 @@ grep, read, glob etc. The agent decides what to look at — nothing is pushed up
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import re as _re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import tool
 
-# Injected per-run by exploration_node before invoking the agent
-_repo_path: Path | None = None
-_repo_name: str = ""
-_data_dir: Path = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Issue #1: Thread-local storage replaces module-level globals so concurrent
+# pipeline runs cannot overwrite each other's context.
+# ---------------------------------------------------------------------------
+_tls = threading.local()
 
 _BINARY_EXTENSIONS = frozenset({
     '.pyc', '.pyo', '.so', '.dll', '.exe', '.bin', '.o', '.a', '.dylib',
@@ -31,6 +37,32 @@ _BINARY_EXTENSIONS = frozenset({
 
 _MAX_OUTPUT = 8000  # chars — cap any single tool response
 
+# ---------------------------------------------------------------------------
+# Issue #13: Local secret-redaction — avoids circular import from pipeline.py
+# ---------------------------------------------------------------------------
+
+_EXPLORE_SECRETS_RE = _re.compile(
+    r'(?i)(?:password|passwd|secret|api[_-]?key|auth[_-]?token|access[_-]?key)'
+    r'\s*[=:]\s*["\']?([A-Za-z0-9+/=_\-]{8,})["\']?'
+)
+_ADDITIONAL_SECRET_PATTERNS = [
+    _re.compile(r'AKIA[A-Z0-9]{16}'),                              # AWS access keys
+    _re.compile(r'(?:Bearer|token)\s+[A-Za-z0-9\-._~+/]+=*', _re.I),
+    _re.compile(r'eyJ[A-Za-z0-9\-_]+\.eyJ[A-Za-z0-9\-_]+'),      # JWT
+    _re.compile(r'sk-[a-zA-Z0-9]{20,}'),                          # OpenAI/Stripe keys
+    _re.compile(r'ghp_[A-Za-z0-9]{36}'),                          # GitHub PATs
+]
+
+
+def _redact_content(text: str) -> str:
+    """Redact credential-like values from text before returning it to the LLM."""
+    text = _EXPLORE_SECRETS_RE.sub(
+        lambda m: m.group(0).replace(m.group(1), '***REDACTED***'), text
+    )
+    for pat in _ADDITIONAL_SECRET_PATTERNS:
+        text = pat.sub('***REDACTED***', text)
+    return text
+
 
 def _cap(text: str) -> str:
     if len(text) <= _MAX_OUTPUT:
@@ -39,12 +71,47 @@ def _cap(text: str) -> str:
 
 
 def _safe_relpath(p: Path) -> str:
-    if _repo_path:
+    repo_path = getattr(_tls, 'repo_path', None)
+    if repo_path:
         try:
-            return str(p.relative_to(_repo_path))
+            return str(p.relative_to(repo_path))
         except ValueError:
             pass
     return str(p)
+
+
+# ---------------------------------------------------------------------------
+# Issue #4: Path traversal protection helper
+# ---------------------------------------------------------------------------
+
+def _safe_resolve(file_path: str) -> "Path | None":
+    """Resolve file_path relative to repo root, rejecting path traversal."""
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path:
+        return None
+    try:
+        resolved = (repo_path / file_path).resolve()
+        if not str(resolved).startswith(str(repo_path.resolve())):
+            logger.warning("Path traversal attempt blocked: %s", file_path)
+            return None
+        return resolved
+    except Exception:
+        return None
+
+
+def _safe_resolve_rglob(match: Path) -> "Path | None":
+    """Validate that an rglob result is inside the repo root."""
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path:
+        return None
+    try:
+        resolved = match.resolve()
+        if not str(resolved).startswith(str(repo_path.resolve())):
+            logger.warning("Path traversal (rglob) blocked: %s", match)
+            return None
+        return resolved
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -62,18 +129,19 @@ def grep_repo(pattern: str, file_glob: str = "", max_results: int = 25) -> str:
         file_glob: Optional glob filter e.g. '*.py', '*.ts' (default: all source files)
         max_results: Max number of matching lines to return (default 25)
     """
-    if not _repo_path or not _repo_path.exists():
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path or not repo_path.exists():
         return "ERROR: repo path not set"
 
     try:
         cmd = ["grep", "-rn", "--include=*.py", "--include=*.js", "--include=*.ts",
                "--include=*.go", "--include=*.java", "--include=*.rb", "--include=*.rs",
-               "-m", str(max_results), pattern, str(_repo_path)]
+               "-m", str(max_results), pattern, str(repo_path)]
 
         if file_glob:
             # Replace default includes with user glob
             cmd = ["grep", "-rn", f"--include={file_glob}",
-                   "-m", str(max_results), pattern, str(_repo_path)]
+                   "-m", str(max_results), pattern, str(repo_path)]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         output = result.stdout.strip()
@@ -83,8 +151,8 @@ def grep_repo(pattern: str, file_glob: str = "", max_results: int = 25) -> str:
         # Make paths relative
         lines = []
         for line in output.split("\n")[:max_results]:
-            if _repo_path:
-                line = line.replace(str(_repo_path) + "/", "")
+            if repo_path:
+                line = line.replace(str(repo_path) + "/", "")
             lines.append(line)
 
         return _cap(f"Found {len(lines)} matches:\n" + "\n".join(lines))
@@ -110,16 +178,21 @@ def read_file(file_path: str, start_line: int = 1, end_line: int = 100) -> str:
         start_line: First line to read (1-indexed, default 1)
         end_line: Last line to read (default 100 — one focused window at a time)
     """
-    if not _repo_path:
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path:
         return "ERROR: repo path not set"
 
-    resolved = _repo_path / file_path
-    if not resolved.exists():
-        # Try rglob fallback
-        matches = list(_repo_path.rglob(Path(file_path).name))
-        if matches:
-            resolved = matches[0]
-        else:
+    resolved = _safe_resolve(file_path)
+    if resolved is None or not resolved.exists():
+        # Try rglob fallback — only accept results inside the repo
+        matches = list(repo_path.rglob(Path(file_path).name))
+        resolved = None
+        for m in matches:
+            candidate = _safe_resolve_rglob(m)
+            if candidate is not None:
+                resolved = candidate
+                break
+        if resolved is None:
             return f"ERROR: File not found: {file_path}"
 
     if resolved.suffix.lower() in _BINARY_EXTENSIONS:
@@ -140,7 +213,8 @@ def read_file(file_path: str, start_line: int = 1, end_line: int = 100) -> str:
         if e < total:
             footer = f"\n... [{total - e} more lines — call read_file with start_line={e+1}]"
 
-        return _cap(header + numbered + footer)
+        # Issue #13: redact secrets before returning content to the LLM
+        return _redact_content(_cap(header + numbered + footer))
     except Exception as e:
         return f"ERROR reading {file_path}: {e}"
 
@@ -159,19 +233,56 @@ def read_function(file_path: str, function_name: str) -> str:
         file_path: Relative path from repo root
         function_name: Name of the function or method to extract
     """
-    if not _repo_path:
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path:
         return "ERROR: repo path not set"
 
-    resolved = _repo_path / file_path
-    if not resolved.exists():
-        matches = list(_repo_path.rglob(Path(file_path).name))
-        if matches:
-            resolved = matches[0]
-        else:
+    resolved = _safe_resolve(file_path)
+    if resolved is None or not resolved.exists():
+        # Try rglob fallback — only accept results inside the repo
+        matches = list(repo_path.rglob(Path(file_path).name))
+        resolved = None
+        for m in matches:
+            candidate = _safe_resolve_rglob(m)
+            if candidate is not None:
+                resolved = candidate
+                break
+        if resolved is None:
             return f"ERROR: File not found: {file_path}"
 
     try:
         content = resolved.read_text(encoding="utf-8", errors="replace")
+
+        # -------------------------------------------------------------------
+        # Issue #11: AST-based extraction for Python files
+        # -------------------------------------------------------------------
+        if resolved.suffix == '.py':
+            import ast as _ast
+            try:
+                tree = _ast.parse(content)
+                for node in _ast.walk(tree):
+                    if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                        if node.name == function_name:
+                            file_lines = content.splitlines(keepends=True)
+                            start = node.lineno - 1        # 0-indexed
+                            end = node.end_lineno          # end_lineno is 1-indexed inclusive
+                            extracted = "".join(file_lines[start:end])
+                            numbered = "\n".join(
+                                f"{start+1+i:4d} | {ln.rstrip()}"
+                                for i, ln in enumerate(file_lines[start:end])
+                            )
+                            result = (
+                                f"=== {function_name} in {file_path} "
+                                f"(lines {start+1}-{end}) ===\n{numbered}"
+                            )
+                            # Issue #13: redact secrets
+                            return _redact_content(_cap(result))
+            except SyntaxError:
+                pass  # Fall through to regex/indent heuristic
+
+        # -------------------------------------------------------------------
+        # Regex + indent heuristic fallback (non-Python or parse failure)
+        # -------------------------------------------------------------------
         lines = content.split("\n")
 
         # Find function definition line
@@ -208,7 +319,9 @@ def read_function(file_path: str, function_name: str) -> str:
 
         selected = lines[start_line:end_line]
         numbered = "\n".join(f"{start_line+1+i:4d} | {ln}" for i, ln in enumerate(selected))
-        return _cap(f"=== {function_name} in {file_path} (lines {start_line+1}-{end_line}) ===\n{numbered}")
+        result = f"=== {function_name} in {file_path} (lines {start_line+1}-{end_line}) ===\n{numbered}"
+        # Issue #13: redact secrets
+        return _redact_content(_cap(result))
 
     except Exception as e:
         return f"ERROR: {e}"
@@ -228,10 +341,18 @@ def list_files(directory: str = "", extension: str = "") -> str:
         directory: Subdirectory to list e.g. 'app/services' (default: repo root)
         extension: Filter by extension e.g. '.py', '.ts' (default: all source files)
     """
-    if not _repo_path:
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path:
         return "ERROR: repo path not set"
 
-    base = _repo_path / directory if directory else _repo_path
+    if directory:
+        base_resolved = _safe_resolve(directory)
+        if base_resolved is None:
+            return f"ERROR: Directory not found or path traversal blocked: {directory}"
+        base = base_resolved
+    else:
+        base = repo_path
+
     if not base.exists():
         return f"ERROR: Directory not found: {directory}"
 
@@ -242,6 +363,10 @@ def list_files(directory: str = "", extension: str = "") -> str:
         files = []
         for p in sorted(base.rglob("*")):
             if p.is_file():
+                # Validate each result is within the repo
+                candidate = _safe_resolve_rglob(p)
+                if candidate is None:
+                    continue
                 if p.suffix.lower() in _BINARY_EXTENSIONS:
                     continue
                 if "__pycache__" in str(p) or "node_modules" in str(p) or ".git" in str(p):
@@ -279,9 +404,11 @@ def search_code(query: str, limit: int = 10) -> str:
         query: Natural language description e.g. 'payment validation logic'
         limit: Number of results (default 10, max 20)
     """
+    repo_name = getattr(_tls, 'repo_name', None)
+    data_dir = getattr(_tls, 'data_dir', None)
     try:
         from embeddings.embedder import NodeEmbedder
-        embedder = NodeEmbedder(_repo_name, _data_dir)
+        embedder = NodeEmbedder(repo_name, data_dir)
         info = embedder.collection_info()
         if info.get("count", 0) == 0:
             return "Semantic search not available — embeddings not built for this repo. Use grep_repo instead."
@@ -318,13 +445,15 @@ def get_function_info(function_id: str) -> str:
         function_id: Full function ID e.g. 'app/services/payment.py::validate_amount'
                      or just the function name to search broadly.
     """
+    repo_name = getattr(_tls, 'repo_name', None)
+    data_dir = getattr(_tls, 'data_dir', None)
     try:
-        graph_path = _data_dir / _repo_name / "graph.json"
-        enriched_path = _data_dir / _repo_name / "enriched_nodes.json"
-        rules_path = _data_dir / _repo_name / "business_rules.json"
+        graph_path = data_dir / repo_name / "graph.json"
+        enriched_path = data_dir / repo_name / "enriched_nodes.json"
+        rules_path = data_dir / repo_name / "business_rules.json"
 
         if not graph_path.exists():
-            return f"Graph not found for repo '{_repo_name}'. Repo may not be analyzed yet."
+            return f"Graph not found for repo '{repo_name}'. Repo may not be analyzed yet."
 
         graph = json.loads(graph_path.read_text())
         enriched = json.loads(enriched_path.read_text()) if enriched_path.exists() else {}
@@ -391,12 +520,14 @@ def get_file_summary(file_path: str) -> str:
     Args:
         file_path: Relative path e.g. 'app/services/payment.py'
     """
+    repo_name = getattr(_tls, 'repo_name', None)
+    data_dir = getattr(_tls, 'data_dir', None)
     try:
-        enriched_path = _data_dir / _repo_name / "enriched_nodes.json"
-        graph_path = _data_dir / _repo_name / "graph.json"
+        enriched_path = data_dir / repo_name / "enriched_nodes.json"
+        graph_path = data_dir / repo_name / "graph.json"
 
         if not enriched_path.exists():
-            return f"Knowledge graph not found for repo '{_repo_name}'. Use read_file instead."
+            return f"Knowledge graph not found for repo '{repo_name}'. Use read_file instead."
 
         enriched = json.loads(enriched_path.read_text())
         graph = json.loads(graph_path.read_text()) if graph_path.exists() else {}
@@ -453,15 +584,21 @@ def get_file_structure(file_path: str) -> str:
     Args:
         file_path: Relative path from repo root e.g. 'app/services/payment.py'
     """
-    if not _repo_path:
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path:
         return "ERROR: repo path not set"
 
-    resolved = _repo_path / file_path
-    if not resolved.exists():
-        matches = list(_repo_path.rglob(Path(file_path).name))
-        if matches:
-            resolved = matches[0]
-        else:
+    resolved = _safe_resolve(file_path)
+    if resolved is None or not resolved.exists():
+        # Try rglob fallback — only accept results inside the repo
+        matches = list(repo_path.rglob(Path(file_path).name))
+        resolved = None
+        for m in matches:
+            candidate = _safe_resolve_rglob(m)
+            if candidate is not None:
+                resolved = candidate
+                break
+        if resolved is None:
             return f"ERROR: File not found: {file_path}"
 
     if resolved.suffix.lower() in _BINARY_EXTENSIONS:
@@ -534,7 +671,8 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
         old_string: The exact text to replace (must be unique in the file)
         new_string: The replacement text
     """
-    if not _repo_path:
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path:
         return "ERROR: repo path not set"
 
     if not old_string or not old_string.strip():
@@ -543,12 +681,16 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
     if old_string == new_string:
         return "ERROR: old_string and new_string are identical — no change made"
 
-    resolved = _repo_path / file_path
-    if not resolved.exists():
-        matches = list(_repo_path.rglob(Path(file_path).name))
-        if matches:
-            resolved = matches[0]
-        else:
+    resolved = _safe_resolve(file_path)
+    if resolved is None or not resolved.exists():
+        matches = list(repo_path.rglob(Path(file_path).name))
+        resolved = None
+        for m in matches:
+            candidate = _safe_resolve_rglob(m)
+            if candidate is not None:
+                resolved = candidate
+                break
+        if resolved is None:
             return f"ERROR: File not found: {file_path}"
 
     if resolved.suffix.lower() in _BINARY_EXTENSIONS:
@@ -613,15 +755,20 @@ def check_syntax(file_path: str) -> str:
     Args:
         file_path: Relative path from repo root e.g. 'app/services/payment.py'
     """
-    if not _repo_path:
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path:
         return "ERROR: repo path not set"
 
-    resolved = _repo_path / file_path
-    if not resolved.exists():
-        matches = list(_repo_path.rglob(Path(file_path).name))
-        if matches:
-            resolved = matches[0]
-        else:
+    resolved = _safe_resolve(file_path)
+    if resolved is None or not resolved.exists():
+        matches = list(repo_path.rglob(Path(file_path).name))
+        resolved = None
+        for m in matches:
+            candidate = _safe_resolve_rglob(m)
+            if candidate is not None:
+                resolved = candidate
+                break
+        if resolved is None:
             return f"ERROR: File not found: {file_path}"
 
     if resolved.suffix.lower() != ".py":
@@ -659,9 +806,15 @@ ALL_TOOLS = [
 
 
 def set_context(repo_name: str, repo_path: str | Path, data_dir: Path | None = None) -> None:
-    """Set the per-run context so tools know which repo to operate on."""
-    global _repo_path, _repo_name, _data_dir
-    _repo_name = repo_name
-    _repo_path = Path(repo_path) if repo_path else None
+    """Set the per-run context so tools know which repo to operate on.
+
+    Stores values in thread-local storage so concurrent pipeline runs are isolated.
+    """
+    _tls.repo_name = repo_name
+    _tls.repo_path = Path(repo_path) if repo_path else None
     if data_dir:
-        _data_dir = data_dir
+        _tls.data_dir = data_dir
+    else:
+        # Preserve the default only if not already set on this thread
+        if not hasattr(_tls, 'data_dir'):
+            _tls.data_dir = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))

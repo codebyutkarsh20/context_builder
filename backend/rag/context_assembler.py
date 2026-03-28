@@ -16,8 +16,16 @@ logger = logging.getLogger(__name__)
 
 
 def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 chars per token for English/code."""
-    return len(text) // 4
+    """Estimate token count. Uses tiktoken if available, falls back to heuristic."""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")  # Claude uses similar tokenizer
+        return len(enc.encode(text))
+    except ImportError:
+        pass
+    # Better heuristic: code has more short tokens than prose
+    # Average ~3.5 chars/token for mixed code/prose (vs 4.0 for pure prose)
+    return max(1, int(len(text) / 3.5))
 
 
 class ContextAssembler:

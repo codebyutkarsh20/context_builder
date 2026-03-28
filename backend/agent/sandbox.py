@@ -7,7 +7,9 @@ Extracted from pipeline.py to keep each module focused on a single concern.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -76,17 +78,87 @@ def run_tests(worktree_path: Path) -> str:
 
 
 def cleanup_worktree(repo_path: Path | None, sandbox_path: str) -> None:
-    """Clean up a git worktree."""
+    """Clean up git worktree and its directory. Best-effort, never throws."""
     if not sandbox_path or not repo_path:
         return
+    sandbox_path = Path(sandbox_path)
+    repo_path = Path(repo_path)
+
+    # Step 1: Try git worktree remove --force
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "remove", "--force", str(sandbox_path)],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning("git worktree remove failed: %s", result.stderr)
+    except Exception as e:
+        logger.warning("git worktree remove exception: %s", e)
+
+    # Step 2: Always try to remove directory even if git command failed
+    if sandbox_path.exists():
+        try:
+            shutil.rmtree(sandbox_path, ignore_errors=True)
+            logger.info("Removed sandbox directory: %s", sandbox_path)
+        except Exception as e:
+            logger.warning("shutil.rmtree failed: %s", e)
+
+    # Step 3: Prune stale worktree references
     try:
         subprocess.run(
-            ["git", "worktree", "remove", "--force", sandbox_path],
-            cwd=repo_path, capture_output=True, text=True, timeout=30,
+            ["git", "worktree", "prune"],
+            cwd=str(repo_path),
+            capture_output=True,
+            timeout=10,
         )
-        logger.info("Cleaned up worktree %s", sandbox_path)
+    except Exception:
+        pass
+
+
+def cleanup_stale_worktrees(repo_path) -> None:
+    """Periodic cleanup of stale sandbox directories and orphaned branches."""
+    import glob
+    import time
+
+    cutoff = time.time() - 7200  # 2 hours
+    for sandbox_dir in glob.glob("/tmp/agent_sandbox_*"):
+        try:
+            if os.path.getmtime(sandbox_dir) < cutoff:
+                cleanup_worktree(repo_path, sandbox_dir)
+                logger.info("Cleaned stale sandbox: %s", sandbox_dir)
+        except Exception as e:
+            logger.warning("Failed to clean stale sandbox %s: %s", sandbox_dir, e)
+
+    # Delete stale fix/* branches from the repo
+    try:
+        result = subprocess.run(
+            ["git", "branch", "--list", "fix/*"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            for branch in result.stdout.splitlines():
+                branch = branch.strip().lstrip("* ")
+                if not branch:
+                    continue
+                try:
+                    subprocess.run(
+                        ["git", "branch", "-D", branch],
+                        cwd=str(repo_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    logger.info("Deleted stale branch: %s", branch)
+                except Exception as e:
+                    logger.warning("Failed to delete branch %s: %s", branch, e)
     except Exception as e:
-        logger.warning("Failed to clean up worktree %s: %s", sandbox_path, e)
+        logger.warning("Failed to list fix/* branches: %s", e)
 
 
 def append_test_business_context(state: dict, work_order: dict) -> None:

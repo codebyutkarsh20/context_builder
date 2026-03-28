@@ -86,9 +86,44 @@ def fuzzy_match_replace(content: str, original: str, patched: str) -> str | None
                 best_score = ratio
                 best_pos = i
 
-        if best_score >= 0.85 and best_pos >= 0:
+        if best_score >= 0.92 and best_pos >= 0:
+            # Function-name guard: if original starts with a def/async def, verify
+            # the matched region also defines the same function name.
+            first_orig_line = orig_lines[0].strip()
+            fn_def_match = re.match(r'^(?:async\s+)?def\s+(\w+)\s*\(', first_orig_line)
+            if fn_def_match:
+                expected_name = fn_def_match.group(1)
+                first_matched_line = norm_content_lines[best_pos].strip()
+                matched_fn_match = re.match(r'^(?:async\s+)?def\s+(\w+)\s*\(', first_matched_line)
+                if not matched_fn_match or matched_fn_match.group(1) != expected_name:
+                    logger.debug(
+                        "Strategy 4: function-name guard rejected match at line %d "
+                        "(expected def %s, got %s)",
+                        best_pos,
+                        expected_name,
+                        matched_fn_match.group(1) if matched_fn_match else "<none>",
+                    )
+                    return None
+
+            matched_region = '\n'.join(content_lines[best_pos:best_pos + window_size])
+            logger.debug(
+                "Strategy 4: matched region at line %d (score=%.4f):\n%s",
+                best_pos,
+                best_score,
+                matched_region,
+            )
+
             new_lines = content_lines[:best_pos] + patched.splitlines() + content_lines[best_pos + window_size:]
-            return '\n'.join(new_lines)
+            new_content = '\n'.join(new_lines)
+
+            # Verify the result still parses (Python files only)
+            try:
+                ast.parse(new_content)
+            except SyntaxError as e:
+                logger.warning("Strategy 4: fuzzy match produced invalid Python: %s", e)
+                return None
+
+            return new_content
 
     # Strategy 5: Anchor-based matching with adaptive region sizing
     if len(orig_lines) >= 1:
@@ -201,13 +236,49 @@ def deduplicate_patches(patches: list[dict]) -> list[dict]:
     return list(seen.values())
 
 
+def patches_overlap(p1: dict, p2: dict, content: str) -> bool:
+    """Return True if two patches target overlapping regions of content."""
+    loc1 = content.find(p1.get("original_code", ""))
+    loc2 = content.find(p2.get("original_code", ""))
+    if loc1 == -1 or loc2 == -1:
+        return True  # Can't verify — assume overlap (safe default)
+    end1 = loc1 + len(p1.get("original_code", ""))
+    end2 = loc2 + len(p2.get("original_code", ""))
+    # Overlap if ranges intersect
+    return not (end1 <= loc2 or end2 <= loc1)
+
+
+def _compose_patches_for_file(patches: list[dict], content: str) -> list[dict]:
+    """Return a list of non-overlapping patches that can be applied together."""
+    # Sort by position in file (highest offset first to avoid position shifts)
+    positioned = []
+    for p in patches:
+        loc = content.find(p.get("original_code", ""))
+        if loc >= 0:
+            positioned.append((loc, p))
+    positioned.sort(key=lambda x: x[0], reverse=True)
+
+    selected = []
+    covered_ranges: list[tuple[int, int]] = []
+    for loc, p in positioned:
+        end = loc + len(p.get("original_code", ""))
+        # Check against already selected ranges
+        overlap = any(not (end <= s or e <= loc) for s, e in covered_ranges)
+        if not overlap:
+            selected.append(p)
+            covered_ranges.append((loc, end))
+
+    return selected
+
+
 def pick_best_patch_per_file(
     patches: list[dict],
     repo_path: Path | None,
     find_file_fn,
     read_file_fn,
 ) -> list[dict]:
-    """When multiple patches target the same file, pick the most complete one."""
+    """When multiple patches target the same file, compose non-overlapping ones;
+    fall back to picking the single best patch only when patches overlap."""
     if not repo_path:
         return patches
 
@@ -224,6 +295,20 @@ def pick_best_patch_per_file(
         resolved = find_file_fn(repo_path, file_path)
         content = read_file_fn(resolved, max_lines=5000) if resolved else None
 
+        if content:
+            # Try to compose non-overlapping patches that target different regions
+            composed = _compose_patches_for_file(file_patches, content)
+            if len(composed) > 1:
+                logger.info(
+                    "Composing %d non-overlapping patches for %s (out of %d candidates)",
+                    len(composed),
+                    file_path,
+                    len(file_patches),
+                )
+                result.extend(composed)
+                continue
+
+        # Fall back: patches overlap or content unavailable — pick the single best
         best = None
         best_score = -1
         for p in file_patches:
@@ -238,6 +323,11 @@ def pick_best_patch_per_file(
 
         if best:
             result.append(best)
-            logger.info("Picked best patch for %s (%d candidates, score=%d)", file_path, len(file_patches), best_score)
+            logger.info(
+                "Picked best patch for %s (%d candidates, score=%d)",
+                file_path,
+                len(file_patches),
+                best_score,
+            )
 
     return result

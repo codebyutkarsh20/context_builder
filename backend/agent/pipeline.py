@@ -8,6 +8,7 @@ Flow: Intake → Context Assembly → Localization → [Confidence Gate]
 from __future__ import annotations
 
 import ast
+import fcntl
 import json
 import logging
 import os
@@ -85,15 +86,26 @@ _BINARY_EXTENSIONS = frozenset({
 
 # Secrets pattern — redact before sending to LLM
 _SECRETS_RE = re.compile(
-    r'(?i)(?:api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|'
+    r'(?i)((?:api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|'
     r'secret[_-]?key|password|passwd|private[_-]?key|credentials)'
-    r'\s*[=:]\s*["\']?[A-Za-z0-9+/=_\-]{16,}["\']?'
+    r'\s*[=:]\s*["\']?)[A-Za-z0-9+/=_\-]{16,}["\']?'
 )
+
+_ADDITIONAL_SECRET_PATTERNS = [
+    re.compile(r'AKIA[A-Z0-9]{16}'),
+    re.compile(r'(?:Bearer|token)\s+[A-Za-z0-9\-._~+/]+=*', re.I),
+    re.compile(r'eyJ[A-Za-z0-9\-_]+\.eyJ[A-Za-z0-9\-_]+'),
+    re.compile(r'sk-[a-zA-Z0-9]{20,}'),
+    re.compile(r'ghp_[A-Za-z0-9]{36}'),
+]
 
 
 def _redact_secrets(text: str) -> str:
     """Redact potential secrets/tokens from source code before sending to LLM."""
-    return _SECRETS_RE.sub("[REDACTED]", text)
+    text = _SECRETS_RE.sub(r'\1***REDACTED***', text)
+    for pat in _ADDITIONAL_SECRET_PATTERNS:
+        text = pat.sub('***REDACTED***', text)
+    return text
 
 
 def _report_progress(state: AgentState) -> None:
@@ -393,7 +405,11 @@ Find the bug and write your findings summary."""
     MAX_TOOL_CALLS = 30
 
     tool_call_count = 0
+    _exploration_deadline = time.monotonic() + 600  # 10-minute hard cap
     while tool_call_count < MAX_TOOL_CALLS:
+        if time.monotonic() > _exploration_deadline:
+            logger.warning("Exploration hit 10-minute wall-clock time limit after %d tool calls", tool_call_count)
+            break
         try:
             response = llm.invoke(messages)
         except Exception as e:
@@ -1256,7 +1272,7 @@ def _generate_stub_tests(
             f"def test_acceptance_{i + 1}_{safe_name}():",
             f'    """Verify: {criterion}"""',
             f"    # TODO: replace with real assertion",
-            f'    raise NotImplementedError("Stub test — implement assertion for: {criterion}")',
+            f'    pytest.skip("Stub test — implement assertion for: {criterion}")',
             "",
         ])
 
@@ -1267,7 +1283,7 @@ def _generate_stub_tests(
                 f"def test_{fn_name}_fixed():",
                 f'    """Verify {fn_name} works correctly after fix."""',
                 f"    # TODO: replace with real assertion",
-                f'    raise NotImplementedError("Stub test — implement assertion for {fn_name}")',
+                f'    pytest.skip("Stub test — implement assertion for {fn_name}")',
                 "",
             ])
 
@@ -1790,30 +1806,40 @@ def test_node(state: AgentState) -> AgentState:
         ).stdout.strip()
         state["base_branch"] = base_branch
 
-        # Check for dirty repo — ignore untracked files (??) which don't affect worktree
-        porcelain = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=repo_path, capture_output=True, text=True, check=True, timeout=30,
-        ).stdout
-        dirty = "\n".join(
-            l for l in porcelain.splitlines() if l and not l.startswith("??")
-        ).strip()
-        if dirty:
-            logger.error("Repo has uncommitted changes — cannot create sandbox")
-            state["test_result"] = "skipped: repo has uncommitted changes"
-            state["sandbox_path"] = ""
-            state["error"] = "Repository has uncommitted changes. Commit or stash them first."
-            _emit_trace("test_output", {"result": "skipped: repo has uncommitted changes", "passed": False, "patches_applied": 0})
-            if trace:
-                trace.stage_end("test")
-            return state
+        # Acquire per-repo file lock to eliminate the race between dirty check
+        # and worktree creation when multiple agents run against the same repo.
+        _repo_lock_file = open(repo_path / ".agent_lock", 'w')
+        try:
+            fcntl.flock(_repo_lock_file, fcntl.LOCK_EX)
 
-        # Create worktree (safe_ticket_id has no special chars, path is safe)
-        worktree_path = Path(f"/tmp/agent_sandbox_{safe_ticket_id}_{branch_suffix}")
-        subprocess.run(
-            ["git", "worktree", "add", "-b", branch_name, str(worktree_path), base_branch],
-            cwd=repo_path, capture_output=True, text=True, check=True, timeout=30,
-        )
+            # Check for dirty repo — ignore untracked files (??) which don't affect worktree
+            porcelain = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repo_path, capture_output=True, text=True, check=True, timeout=30,
+            ).stdout
+            dirty = "\n".join(
+                l for l in porcelain.splitlines() if l and not l.startswith("??")
+            ).strip()
+            if dirty:
+                logger.error("Repo has uncommitted changes — cannot create sandbox")
+                state["test_result"] = "skipped: repo has uncommitted changes"
+                state["sandbox_path"] = ""
+                state["error"] = "Repository has uncommitted changes. Commit or stash them first."
+                _emit_trace("test_output", {"result": "skipped: repo has uncommitted changes", "passed": False, "patches_applied": 0})
+                if trace:
+                    trace.stage_end("test")
+                return state
+
+            # Create worktree (safe_ticket_id has no special chars, path is safe)
+            worktree_path = Path(f"/tmp/agent_sandbox_{safe_ticket_id}_{branch_suffix}")
+            subprocess.run(
+                ["git", "worktree", "add", "-b", branch_name, str(worktree_path), base_branch],
+                cwd=repo_path, capture_output=True, text=True, check=True, timeout=30,
+            )
+        finally:
+            fcntl.flock(_repo_lock_file, fcntl.LOCK_UN)
+            _repo_lock_file.close()
+
         state["sandbox_path"] = str(worktree_path)
         logger.info("Created worktree at %s on branch %s", worktree_path, branch_name)
 
@@ -2010,20 +2036,31 @@ def test_node(state: AgentState) -> AgentState:
         checks = review.get("checks", [])
         non_test_fails = [c for c in checks if c.get("status") == "FAIL" and c.get("name", "").upper() != "TESTS"]
         if not non_test_fails:
-            review = dict(review)
-            review["verdict"] = "APPROVE"
-            # Also update the TESTS check status so the UI shows green
-            updated_checks = []
-            for c in checks:
-                c = dict(c)
-                if c.get("name", "").upper() == "TESTS" and c.get("status") == "FAIL":
-                    c["status"] = "PASS"
-                    c["comment"] = f"Tests passed after fix: {test_result.splitlines()[0]}"
-                updated_checks.append(c)
-            review["checks"] = updated_checks
-            review["feedback"] = ""
-            state["review"] = review
-            logger.info("Upgraded review verdict to APPROVE — tests now pass")
+            # Guard: don't upgrade if the test patches are trivial stubs
+            test_code = "\n".join(
+                tp.get("patched_code", "")
+                for tp in (repair.get("test_patches") or [])
+            )
+            trivial_patterns = ["assert True", "assert 1 == 1", "assert 1", "pass\n", "raise NotImplementedError", "pytest.skip"]
+            is_trivial = not test_code.strip() or any(p in test_code for p in trivial_patterns)
+
+            if is_trivial:
+                logger.info("Tests appear trivial — NOT auto-upgrading CHANGES_REQUESTED verdict to APPROVE")
+            else:
+                review = dict(review)
+                review["verdict"] = "APPROVE"
+                # Also update the TESTS check status so the UI shows green
+                updated_checks = []
+                for c in checks:
+                    c = dict(c)
+                    if c.get("name", "").upper() == "TESTS" and c.get("status") == "FAIL":
+                        c["status"] = "PASS"
+                        c["comment"] = f"Tests passed after fix: {test_result.splitlines()[0]}"
+                    updated_checks.append(c)
+                review["checks"] = updated_checks
+                review["feedback"] = ""
+                state["review"] = review
+                logger.info("Upgraded review verdict to APPROVE — tests now pass")
 
     if trace:
         trace.stage_end("test")
