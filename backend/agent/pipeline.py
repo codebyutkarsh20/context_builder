@@ -965,6 +965,7 @@ def _find_callers_from_graph(graph_data: dict, fault_files: list[str],
     # Find files that CALL or IMPORT target nodes
     caller_files: set[str] = set()
     fault_file_set = set(fault_files)
+    _caller_noise = ("test_", "conftest", "/tests/", "/test/", "/__pycache__/")
 
     for edge in edges:
         etype = edge.get("type", "")
@@ -978,7 +979,8 @@ def _find_callers_from_graph(graph_data: dict, fault_files: list[str],
             # Extract file path from source node ID (e.g., "file.py::ClassName.method")
             src_file = source.split("::")[0] if "::" in source else source
             if src_file and src_file not in fault_file_set:
-                caller_files.add(src_file)
+                if not any(pat in src_file.lower() for pat in _caller_noise):
+                    caller_files.add(src_file)
 
     return sorted(caller_files)[:8]
 
@@ -987,6 +989,7 @@ def _find_callers_via_grep(repo_path: Path, fault_files: list[str]) -> list[str]
     """Fallback: grep for files that import the fault files."""
     caller_paths: list[str] = []
     seen: set[str] = set()
+    _caller_noise = ("test_", "conftest", "/tests/", "/test/", "/__pycache__/")
 
     for rel_path in fault_files:
         stem = Path(rel_path).stem
@@ -1006,7 +1009,7 @@ def _find_callers_via_grep(repo_path: Path, fault_files: list[str]) -> list[str]
                         continue
                     p = Path(line)
                     if p.exists() and str(p) not in seen:
-                        if '__pycache__' in str(p) or '/test' in str(p).lower():
+                        if any(pat in str(p).lower() for pat in _caller_noise):
                             continue
                         rel = str(p.relative_to(repo_path))
                         if rel not in set(fault_files):
@@ -1814,6 +1817,10 @@ Produce the RepairResult with this patch now."""
             else:
                 verified = raw_patches
 
+            # Dedup again after verify — retry merge can reintroduce duplicates
+            if verified:
+                verified = _deduplicate_patches(verified)
+                logger.info("After verify+dedup: %d patches", len(verified))
             repair_dump["patches"] = verified
 
             # patch_alternatives fallback: if primary patches all failed to verify,
@@ -2706,17 +2713,24 @@ def escalate_node(state: AgentState) -> AgentState:
     trace = _get_trace()
     if trace:
         trace.stage_start("escalate")
-    _emit_trace("info", {
-        "message": "Escalating to human",
-        "iterations": state.get("iteration_count", 0),
-        "last_feedback": state.get("review", {}).get("feedback", ""),
-    })
-    logger.info("=== ESCALATE: Agent cannot fix with confidence ===")
-    state["status"] = PipelineStatus.ESCALATED
-    state["error"] = (
-        f"Escalated after {state.get('iteration_count', 0)} iterations. "
-        f"Last review: {state.get('review', {}).get('feedback', 'no feedback')}"
+    ticket_id = state.get("work_order", {}).get("ticket_id", "UNKNOWN")
+    iterations = state.get("iteration_count", 0)
+    reason = state.get("review", {}).get("feedback", "no feedback")
+    declined_reason = f"Agent declined after {iterations} iterations: {reason}"
+    # Explicit escalation signal — visible in logs and monitoring (BUG-6 instrumentation)
+    logger.error(
+        "AGENT_DECLINED ticket=%s iterations=%d reason=%r",
+        ticket_id, iterations, reason,
     )
+    _emit_trace("escalation", {
+        "ticket_id": ticket_id,
+        "iterations": iterations,
+        "reason": reason,
+        "declined_reason": declined_reason,
+    })
+    state["status"] = PipelineStatus.ESCALATED
+    state["declined_reason"] = declined_reason
+    state["error"] = declined_reason
     _report_progress(state)
     if trace:
         trace.stage_end("escalate")
