@@ -34,3 +34,4 @@ data/
 # Claude Code / gstack skills (vendored tooling)
 .claude/
 AGENTS.md
+.gstack/
