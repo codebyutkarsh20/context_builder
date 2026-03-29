@@ -989,6 +989,7 @@ def _find_callers_via_grep(repo_path: Path, fault_files: list[str]) -> list[str]
     """Fallback: grep for files that import the fault files."""
     caller_paths: list[str] = []
     seen: set[str] = set()
+    _caller_noise = ("test_", "conftest", "/tests/", "/test/", "/__pycache__/")
 
     for rel_path in fault_files:
         stem = Path(rel_path).stem
@@ -1003,7 +1004,6 @@ def _find_callers_via_grep(repo_path: Path, fault_files: list[str]) -> list[str]
                     ["grep", "-rl", "--include=*.py", term, str(repo_path)],
                     capture_output=True, text=True, timeout=10,
                 )
-                _caller_noise = ("test_", "conftest", "/tests/", "/test/", "/__pycache__/")
                 for line in result.stdout.strip().split('\n'):
                     if not line:
                         continue
