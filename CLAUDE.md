@@ -42,7 +42,7 @@ agent/
 └── eval/           # Evaluation suite
 ## Build & Test
 ```bash
-pip install -r requirements.txt
+pip install -r backend/requirements.txt
 pytest tests/ -v                                    # All tests
 pytest tests/test_localization.py -v                # Single module
 python -m agent.run --ticket=PROJ-1234 --dry-run    # Test on one ticket

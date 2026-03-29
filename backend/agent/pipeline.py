@@ -49,6 +49,8 @@ from agent.types import (
     ReviewResult,
 )
 
+from graph.neo4j_client import neo4j_client
+
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 3
@@ -507,8 +509,11 @@ def exploration_node(state: AgentState) -> AgentState:
             import json as _json
             br_data = _json.loads(br_path.read_text())
             if br_data:
-                top_rules = [f"  - [{r.get('rule_type','rule')}] {r.get('content','')[:120]}"
-                             for r in br_data[:10]]
+                top_rules = [
+                    f"  - [{r.get('source', r.get('rule_type', 'rule'))}] "
+                    f"{r.get('description', r.get('content', ''))[:120]}"
+                    for r in br_data[:10]
+                ]
                 business_context = "\nBUSINESS RULES (non-inferable — cannot be discovered from code):\n" + "\n".join(top_rules)
     except Exception:
         pass
@@ -1023,35 +1028,78 @@ def _find_callers_via_grep(repo_path: Path, fault_files: list[str]) -> list[str]
 
 
 def _load_business_rules(repo_name: str, fault_files: list[str]) -> str:
-    """Load stored business rules relevant to the fault files.
+    """Load stored business rules + failure history relevant to the fault files.
 
-    These are rules created from human answers (Step 8/21 of the guide).
-    They contain knowledge the agent literally cannot discover from code alone.
+    Reads auto-extracted and human-submitted rules from business_rules.json.
+    Also queries Neo4j for FailureRecords linked to the fault files when connected.
+    Returns a warning string if no context is found (never returns empty silently).
     """
+    fault_functions = [Path(f).stem for f in fault_files]
+    sections: list[str] = []
+
+    # --- Business rules from flat file ---
     rules_path = DATA_DIR / repo_name / "business_rules.json"
-    if not rules_path.exists():
-        return ""
+    relevant_rules: list[str] = []
+    if rules_path.exists():
+        try:
+            all_rules = json.loads(rules_path.read_text())
+            for rule in all_rules:
+                rule_file = rule.get("file", "")
+                rule_func = rule.get("function_id", "")
+                if any(f in rule_file or f in rule_func for f in fault_files):
+                    severity = rule.get("severity", "medium").upper()
+                    marker = "⚠️ DO NOT VIOLATE" if severity in ("CRITICAL", "HIGH") else ""
+                    relevant_rules.append(
+                        f"  [{severity}] {rule.get('description', '')[:300]} {marker}\n"
+                        f"    Source: {rule.get('source', 'unknown')} | File: {rule_file}"
+                    )
+        except Exception:
+            pass
 
+    if relevant_rules:
+        sections.append(
+            "\n\nBUSINESS RULES (verified knowledge base — DO NOT VIOLATE):\n"
+            + "\n".join(relevant_rules)
+        )
+
+    # --- FailureRecords from Neo4j ---
     try:
-        all_rules = json.loads(rules_path.read_text())
-    except Exception:
-        return ""
+        if neo4j_client.is_connected():
+            for file_path in fault_files:
+                rows = neo4j_client.run(
+                    "MATCH (fr:FailureRecord)-[:RESULTED_IN_CHANGE]->(n) "
+                    "WHERE (n:Function OR n:File) "
+                    "  AND (n.path ENDS WITH $file OR n.name IN $funcs) "
+                    "  AND fr.repo = $repo "
+                    "RETURN fr.message AS message, fr.date AS date, "
+                    "       fr.issue_ref AS issue_ref, fr.severity_hint AS severity "
+                    "ORDER BY fr.date DESC LIMIT 5",
+                    {"file": file_path, "funcs": fault_functions, "repo": repo_name},
+                )
+                if rows:
+                    failure_lines = []
+                    for row in rows:
+                        ref = f" ({row['issue_ref']})" if row.get("issue_ref") else ""
+                        failure_lines.append(
+                            f"  [{row.get('date', '?')}]{ref} {row.get('message', '')[:200]}"
+                        )
+                    sections.append(
+                        f"\n\nPAST FAILURES touching {file_path}:\n"
+                        + "\n".join(failure_lines)
+                    )
+    except Exception as exc:
+        logger.debug("FailureRecord query failed (non-fatal): %s", exc)
 
-    relevant = []
-    for rule in all_rules:
-        rule_file = rule.get("file", "")
-        rule_func = rule.get("function_id", "")
-        if any(f in rule_file or f in rule_func for f in fault_files):
-            severity = rule.get("severity", "medium").upper()
-            marker = "⚠️ DO NOT VIOLATE" if severity in ("CRITICAL", "HIGH") else ""
-            relevant.append(
-                f"  [{severity}] {rule.get('description', '')[:300]} {marker}\n"
-                f"    Source: {rule.get('source', 'unknown')} | File: {rule_file}"
-            )
+    if not sections:
+        # Inject warning so repair agent knows context is absent
+        fault_desc = ", ".join(fault_files[:3]) or "target function"
+        return (
+            "\n\nWARNING: No business rules or failure history found for "
+            f"{fault_desc}. Treat as high-risk — do not remove validation "
+            "logic without explicit confirmation."
+        )
 
-    if not relevant:
-        return ""
-    return "\n\nBUSINESS RULES (from human-verified knowledge base — DO NOT VIOLATE):\n" + "\n".join(relevant)
+    return "".join(sections)
 
 
 def _build_enrichment_context(enriched: dict, fault_files: list[str],

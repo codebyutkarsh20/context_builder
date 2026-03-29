@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import re
 import uuid
@@ -58,6 +59,59 @@ class _BusinessRule:
         # Deterministic ID to keep extractions idempotent across re-runs
         raw = f"{self.source_file}:{self.source_line}:{self.rule_type}"
         return str(uuid.uuid5(uuid.NAMESPACE_URL, raw))
+
+    def to_pipeline_dict(self) -> dict:
+        """Return a dict matching the schema expected by the repair pipeline.
+
+        Maps internal _BusinessRule fields to the schema used by
+        api/knowledge.py and agent/pipeline.py._load_business_rules().
+        """
+        return {
+            "id": self.rule_id,
+            "description": self.content,
+            "file": self.source_file,
+            # Comma-separated to preserve all linked functions (not just first)
+            "function_id": ",".join(self.enforced_by),
+            "severity": "medium",
+            "source": self.rule_type,
+            "created_at": None,
+        }
+
+
+def persist_rules_to_file(rules: list["_BusinessRule"], out_path: Path) -> int:
+    """Write auto-extracted rules to the pipeline-expected flat JSON file.
+
+    Merges with any existing human-submitted rules (keyed by id).
+    Returns the count of newly written rules (0 if all were already present).
+
+    Parameters
+    ----------
+    rules:
+        Auto-extracted _BusinessRule objects to persist.
+    out_path:
+        Path to the ``business_rules.json`` flat file for this repo.
+    """
+    existing: list[dict] = []
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text())
+        except json.JSONDecodeError:
+            logger.warning(
+                "business_rules.json at %s is corrupted — treating as empty", out_path
+            )
+            existing = []
+
+    existing_ids = {r["id"] for r in existing if "id" in r}
+    new_dicts = [r.to_pipeline_dict() for r in rules if r.rule_id not in existing_ids]
+
+    out_path.write_text(json.dumps(existing + new_dicts, indent=2, default=str))
+    logger.info(
+        "persist_rules_to_file: wrote %d new rule(s) to %s (%d existing preserved)",
+        len(new_dicts),
+        out_path,
+        len(existing),
+    )
+    return len(new_dicts)
 
 
 # ---------------------------------------------------------------------------

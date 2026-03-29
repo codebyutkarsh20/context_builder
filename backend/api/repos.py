@@ -134,6 +134,13 @@ def run_analysis(job_id: str, req: AnalyzeRequest):
                     decision_points=decision_points,
                     domain_concepts=domain_concepts,
                 )
+                # Extract + persist business rules (Neo4j + flat file)
+                from enricher.business_logic import BusinessLogicExtractor, persist_rules_to_file as _prf
+                _extractor = BusinessLogicExtractor(repo_name, parsed)
+                _extractor.extract()  # Neo4j persistence
+                _rules = _extractor.extract_all()  # in-memory for file write
+                _prf(_rules, _DATA_DIR / repo_name / "business_rules.json")
+                logger.info("Business rules persisted: %d rule(s)", len(_rules))
             except Exception as exc:
                 logger.warning("Neo4j ingestion failed, continuing without: %s", exc)
                 use_neo4j = False
@@ -150,10 +157,11 @@ def run_analysis(job_id: str, req: AnalyzeRequest):
             compiler = ContextCompiler(repo_name, repo_path=repo_path)
             compiler.compile()
         else:
-            from enricher.business_logic import BusinessLogicExtractor
-            git_data = git_analyzer.analyze()
+            from enricher.business_logic import BusinessLogicExtractor, persist_rules_to_file as _prf2
             extractor = BusinessLogicExtractor(repo_name, parsed)
             rules = extractor.extract_all()
+            # Write auto-extracted rules to flat file so pipeline can read them
+            _prf2(rules, _DATA_DIR / repo_name / "business_rules.json")
             from cli import _compile_without_neo4j
             _compile_without_neo4j(
                 repo_name, structure, parsed, graph_data, rules,
@@ -187,9 +195,17 @@ def run_analysis(job_id: str, req: AnalyzeRequest):
         }
         (out / "graph.json").write_text(json.dumps(cache, default=str))
 
+        # Mine FailureRecords from git history (feature-flagged)
+        try:
+            from graph.business.failure_records import mine_failure_records, persist_failure_records
+            failure_records = mine_failure_records(repo_path)
+            if failure_records and use_neo4j:
+                persist_failure_records(failure_records, repo_name)
+        except Exception as fr_err:
+            logger.warning("FailureRecord mining failed (non-fatal): %s", fr_err)
+
         # Save enriched nodes + build embeddings
         try:
-            from enricher.business_logic import BusinessLogicExtractor as _BLE
             rules_for_enrichment = []
             if not use_neo4j:
                 rules_for_enrichment = rules  # Already extracted above

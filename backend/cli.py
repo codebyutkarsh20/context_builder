@@ -166,14 +166,18 @@ def build(
                     console.print(f"  [green]✓[/green] {enhanced_dc} domain concepts enriched with LLM")
 
         progress.update(task, description="[cyan]Extracting business rules...", completed=80)
-        from enricher.business_logic import BusinessLogicExtractor
+        from enricher.business_logic import BusinessLogicExtractor, persist_rules_to_file
         extractor = BusinessLogicExtractor(repo_name, parsed)
         if no_neo4j:
             rules = extractor.extract_all()
             rules_count = len(rules)
         else:
             rules_count = extractor.extract()
-            rules = []
+            rules = extractor.extract_all()  # get rules for file persistence
+        # Always write to business_rules.json so the pipeline can read them
+        out_dir_br = Path(f"/tmp/context_builder/{repo_name}")
+        out_dir_br.mkdir(parents=True, exist_ok=True)
+        persist_rules_to_file(rules, out_dir_br / "business_rules.json")
         console.print(f"  [green]✓[/green] {rules_count} business rules extracted")
 
         # Save enriched nodes + build embeddings

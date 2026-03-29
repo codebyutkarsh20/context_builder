@@ -141,6 +141,14 @@ class Neo4jClient:
                 "CREATE CONSTRAINT domain_concept_id_unique IF NOT EXISTS "
                 "FOR (dc:DomainConcept) REQUIRE dc.id IS UNIQUE"
             ),
+            (
+                "CREATE CONSTRAINT business_rule_id_unique IF NOT EXISTS "
+                "FOR (br:BusinessRule) REQUIRE br.id IS UNIQUE"
+            ),
+            (
+                "CREATE CONSTRAINT failure_record_id_unique IF NOT EXISTS "
+                "FOR (fr:FailureRecord) REQUIRE fr.id IS UNIQUE"
+            ),
         ]
 
         fulltext_index = (

@@ -179,7 +179,8 @@ class TestReadSourceNodeBinarySafety:
             "status": "",
         }
         result = read_source_node(state)
-        assert len(result["source_code"]) <= 5
+        file_keys = [k for k in result["source_code"] if not k.startswith("__")]
+        assert len(file_keys) <= 5
 
     def test_truncates_long_files(self, tmp_repo):
         """Files longer than the max line limit are truncated."""
