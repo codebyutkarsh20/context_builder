@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -69,7 +70,7 @@ def run_tests(
             logger.info("Running setup command: %s", cmd)
             try:
                 subprocess.run(
-                    cmd, shell=True, cwd=str(worktree_path),
+                    shlex.split(cmd), cwd=str(worktree_path),
                     env=env, timeout=120, capture_output=True,
                 )
             except Exception as e:
