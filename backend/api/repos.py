@@ -295,15 +295,14 @@ def list_repos():
             "name": d.name,
             "has_context": (d / "context.md").exists(),
             "has_summary": (d / "summary.md").exists(),
+            "repo_path": "",
         }
         graph_file = d / "graph.json"
         if graph_file.exists():
             try:
                 data = _json.loads(graph_file.read_text())
                 stats = data.get("stats", {})
-                rp = stats.get("repo_path", "")
-                if rp:
-                    entry["repo_path"] = rp
+                entry["repo_path"] = stats.get("repo_path", "")
                 entry["files"] = stats.get("files", 0)
                 entry["functions"] = stats.get("functions", 0)
                 entry["lines_of_code"] = stats.get("lines_of_code", 0)

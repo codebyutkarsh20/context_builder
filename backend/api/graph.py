@@ -95,7 +95,7 @@ def get_hotspots(
     return []
 
 
-@router.get("/graph/node/{node_id}")
+@router.get("/graph/node/{node_id:path}")
 def get_node_detail(node_id: str, repo: str = Query(...)):
     """Return detailed info for a single node including neighbors."""
     repo = _validate_repo(repo)

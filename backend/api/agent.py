@@ -17,7 +17,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 router = APIRouter(tags=["agent"])
 logger = logging.getLogger(__name__)
@@ -174,6 +174,15 @@ class RunTicketRequest(BaseModel):
     priority: str = "medium"
     comments: list[str] = Field(default_factory=list)
     debug: bool = False  # Enable tracing/observability
+
+    @model_validator(mode="after")
+    def require_ticket_or_description(self) -> "RunTicketRequest":
+        if not self.ticket_id and not self.description:
+            raise ValueError(
+                "Provide either 'ticket_id' (to run an existing ticket) "
+                "or 'description' (to describe the bug inline)."
+            )
+        return self
 
 
 class AgentJobStatus(BaseModel):
