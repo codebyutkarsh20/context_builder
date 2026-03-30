@@ -1,14 +1,15 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   BookOpen, HelpCircle, CheckCircle2, Shield,
   ChevronDown, ChevronRight, FileCode, Send, Loader2, BarChart3, Plus, X, AlertCircle,
+  Search, Link2, FunctionSquare, Boxes, File,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
 import { useRepo } from '../lib/RepoContext'
 import {
   getKnowledgeQuestions, getKnowledgeRules, getKnowledgeStats,
-  submitAnswer, addRule,
-  type KnowledgeQuestion, type KnowledgeRule, type KnowledgeStats,
+  submitAnswer, addRule, searchGraphNodes,
+  type KnowledgeQuestion, type KnowledgeRule, type KnowledgeStats, type GraphNodeSummary,
 } from '../lib/api'
 
 const SEVERITY_COLORS: Record<string, string> = {
@@ -178,12 +179,140 @@ function QuestionCard({ q, repo, onAnswered }: {
   )
 }
 
+// ─── Node type helpers ────────────────────────────────────────────────────────
+
+const NODE_TYPE_META: Record<string, { color: string; icon: React.ReactNode; label: string }> = {
+  Function: { color: 'text-orange-400 bg-orange-500/10 border-orange-500/20', icon: <FunctionSquare className="w-3 h-3" />, label: 'Function' },
+  Class:    { color: 'text-green-400 bg-green-500/10 border-green-500/20',    icon: <Boxes className="w-3 h-3" />,           label: 'Class' },
+  File:     { color: 'text-blue-400 bg-blue-500/10 border-blue-500/20',       icon: <File className="w-3 h-3" />,            label: 'File' },
+}
+
+function NodeTypeBadge({ type }: { type: string }) {
+  const m = NODE_TYPE_META[type]
+  if (!m) return <span className="text-[10px] px-1.5 py-0.5 rounded-full border bg-zinc-800 text-zinc-500 border-zinc-700">{type}</span>
+  return (
+    <span className={cn('flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border font-medium', m.color)}>
+      {m.icon}{m.label}
+    </span>
+  )
+}
+
+// ─── Node search picker ────────────────────────────────────────────────────────
+
+function NodeSearchPicker({
+  repo,
+  value,
+  onChange,
+}: {
+  repo: string
+  value: GraphNodeSummary | null
+  onChange: (node: GraphNodeSummary | null) => void
+}) {
+  const [query, setQuery] = useState('')
+  const [results, setResults] = useState<GraphNodeSummary[]>([])
+  const [searching, setSearching] = useState(false)
+  const [open, setOpen] = useState(false)
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  const doSearch = useCallback((q: string) => {
+    if (!q.trim()) { setResults([]); setOpen(false); return }
+    setSearching(true)
+    searchGraphNodes(repo, q)
+      .then((res) => { setResults(res); setOpen(true) })
+      .catch(() => {})
+      .finally(() => setSearching(false))
+  }, [repo])
+
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(() => doSearch(query), 280)
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current) }
+  }, [query, doSearch])
+
+  // close on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  if (value) {
+    return (
+      <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-800 border border-purple-500/40">
+        <Link2 className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <NodeTypeBadge type={value.type} />
+            <span className="text-xs font-mono text-zinc-200 font-semibold truncate">{value.name}</span>
+          </div>
+          {value.file && value.file !== value.id && (
+            <p className="text-[10px] font-mono text-zinc-600 mt-0.5 truncate">{value.file}</p>
+          )}
+        </div>
+        <button onClick={() => onChange(null)} className="text-zinc-600 hover:text-red-400 transition-colors flex-shrink-0">
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <div className="relative">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600 pointer-events-none" />
+        {searching && <Loader2 className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600 animate-spin" />}
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onFocus={() => results.length > 0 && setOpen(true)}
+          placeholder="Search function, class or file…"
+          className="w-full pl-9 pr-9 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-purple-500/50 focus:outline-none"
+        />
+      </div>
+
+      {open && results.length > 0 && (
+        <div className="absolute top-full left-0 right-0 mt-1 bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl z-50 max-h-56 overflow-y-auto">
+          {results.map((node) => (
+            <button
+              key={node.id}
+              onMouseDown={(e) => { e.preventDefault(); onChange(node); setQuery(''); setOpen(false) }}
+              className="w-full flex items-start gap-2.5 px-3 py-2.5 hover:bg-zinc-800 transition-colors text-left border-b border-zinc-800/60 last:border-0"
+            >
+              <div className="mt-0.5 flex-shrink-0">
+                {NODE_TYPE_META[node.type]?.icon ?? <FileCode className="w-3 h-3 text-zinc-500" />}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <NodeTypeBadge type={node.type} />
+                  <span className="text-xs font-mono text-zinc-200 font-medium truncate">{node.name}</span>
+                </div>
+                {node.file && <p className="text-[10px] font-mono text-zinc-600 mt-0.5 truncate">{node.file}</p>}
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {open && !searching && results.length === 0 && query.trim() && (
+        <div className="absolute top-full left-0 right-0 mt-1 bg-zinc-900 border border-zinc-700 rounded-xl shadow-xl z-50 px-3 py-3 text-xs text-zinc-600 text-center">
+          No nodes found for "{query}"
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Add Rule Modal ───────────────────────────────────────────────────────────
+
 function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () => void; onAdded: () => void }) {
   const [description, setDescription] = useState('')
   const [ruleType, setRuleType] = useState('policy')
   const [severity, setSeverity] = useState('medium')
-  const [file, setFile] = useState('')
   const [constraint, setConstraint] = useState('')
+  const [linkedNode, setLinkedNode] = useState<GraphNodeSummary | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [modalError, setModalError] = useState<string | null>(null)
 
@@ -192,7 +321,16 @@ function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () =>
     setSubmitting(true)
     setModalError(null)
     try {
-      await addRule(repo, { description, rule_type: ruleType, severity, file, constraint })
+      await addRule(repo, {
+        description,
+        rule_type: ruleType,
+        severity,
+        constraint,
+        node_id: linkedNode?.id ?? '',
+        node_type: linkedNode?.type ?? '',
+        node_name: linkedNode?.name ?? '',
+        file: linkedNode?.file ?? '',
+      })
       onAdded()
       onClose()
     } catch (e) {
@@ -214,7 +352,9 @@ function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () =>
             <X className="w-4 h-4" />
           </button>
         </div>
+
         <div className="p-5 space-y-4">
+          {/* Description */}
           <div>
             <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">Rule Description *</label>
             <textarea
@@ -226,6 +366,8 @@ function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () =>
               autoFocus
             />
           </div>
+
+          {/* Constraint */}
           <div>
             <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">Constraint / Enforcement Detail</label>
             <input
@@ -235,15 +377,23 @@ function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () =>
               className="w-full px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-purple-500/50 focus:outline-none"
             />
           </div>
+
+          {/* Node picker */}
           <div>
-            <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">Relevant File (optional)</label>
-            <input
-              value={file}
-              onChange={(e) => setFile(e.target.value)}
-              placeholder="e.g. services/loan_service.py"
-              className="w-full px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-sm text-zinc-200 placeholder-zinc-600 focus:border-purple-500/50 focus:outline-none"
-            />
+            <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">
+              Attach to Node
+              <span className="ml-1.5 text-zinc-700 normal-case font-normal">(links this rule to a function, class or file in the graph)</span>
+            </label>
+            <NodeSearchPicker repo={repo} value={linkedNode} onChange={setLinkedNode} />
+            {!linkedNode && (
+              <p className="text-[10px] text-zinc-700 mt-1.5 flex items-center gap-1">
+                <AlertCircle className="w-3 h-3" />
+                Without a node, the rule is stored but won't appear in the graph as an edge.
+              </p>
+            )}
           </div>
+
+          {/* Type + Severity */}
           <div className="flex gap-3">
             <div className="flex-1">
               <label className="text-[10px] font-bold text-zinc-500 uppercase block mb-1.5">Type</label>
@@ -267,11 +417,13 @@ function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () =>
             </div>
           </div>
         </div>
+
         {modalError && (
           <div className="mx-5 mb-3 flex items-center gap-2 p-2.5 rounded-lg bg-red-950/30 border border-red-800/40 text-red-400 text-xs">
             <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />{modalError}
           </div>
         )}
+
         <div className="flex items-center justify-end gap-2 px-5 py-4 border-t border-zinc-800">
           <button onClick={onClose} className="px-4 py-1.5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors">
             Cancel
@@ -279,7 +431,7 @@ function AddRuleModal({ repo, onClose, onAdded }: { repo: string; onClose: () =>
           <button onClick={handleSubmit} disabled={!description.trim() || submitting}
             className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-purple-500/20 text-purple-300 hover:bg-purple-500/30 border border-purple-500/30 text-xs font-medium transition-all disabled:opacity-50">
             {submitting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
-            Add Rule
+            {linkedNode ? 'Add Rule + Link to Graph' : 'Add Rule'}
           </button>
         </div>
       </div>

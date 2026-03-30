@@ -124,6 +124,59 @@ def _save_answers(repo: str, answers: dict[str, dict]):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+@router.get("/knowledge/{repo}/nodes/search")
+def search_nodes_for_rule(
+    repo: str,
+    q: str = Query("", description="Search query"),
+    node_type: Optional[str] = Query(None, description="Filter: Function | Class | File"),
+    limit: int = Query(20, le=50),
+):
+    """Search graph nodes to attach a rule to. Returns id, name, type, file."""
+    q = q.strip().lower()
+
+    # Try Neo4j first
+    from graph.neo4j_client import neo4j_client
+    if neo4j_client.is_connected():
+        from graph import queries
+        results = neo4j_client.run(*queries.search_nodes(repo, q or "*", limit * 3))
+        out = []
+        for r in results:
+            labels = r.get("labels") or []
+            ntype = labels[0] if labels else "File"
+            if node_type and ntype != node_type:
+                continue
+            nid = r.get("id", "")
+            name = r.get("name") or nid.split("::")[-1]
+            file_ = r.get("path") or (nid.split("::")[0] if "::" in nid else nid)
+            out.append({"id": nid, "name": name, "type": ntype, "file": file_})
+            if len(out) >= limit:
+                break
+        if out:
+            return out
+
+    # Fallback: search graph.json cache
+    graph_path = _DATA_DIR / repo / "graph.json"
+    if not graph_path.exists():
+        raise HTTPException(status_code=404, detail=f"Repository '{repo}' not found")
+
+    data = json.loads(graph_path.read_text())
+    nodes = data.get("nodes", [])
+    out = []
+    for n in nodes:
+        ntype = n.get("type", "")
+        if node_type and ntype.lower() != node_type.lower():
+            continue
+        nid = n.get("id", "")
+        name = n.get("name") or n.get("label") or nid.split("::")[-1]
+        file_ = n.get("file") or n.get("path") or (nid.split("::")[0] if "::" in nid else nid)
+        if q and q not in (name or "").lower() and q not in nid.lower():
+            continue
+        out.append({"id": nid, "name": name, "type": ntype, "file": file_})
+        if len(out) >= limit:
+            break
+    return out
+
+
 @router.get("/knowledge/{repo}/questions")
 def list_questions(
     repo: str,
@@ -299,28 +352,90 @@ class AddRuleRequest(BaseModel):
     file: str = ""
     constraint: str = ""
     added_by: str = ""
+    # Optional: attach rule to a specific graph node
+    node_id: str = ""    # e.g. "app/services/loan.py::calculate_fee"
+    node_type: str = ""  # "Function" | "Class" | "File"
+    node_name: str = ""  # display name for logging
 
 
 @router.post("/knowledge/{repo}/rules")
 def add_rule(repo: str, body: AddRuleRequest):
     """Manually add a business rule directly (no question needed)."""
     rule_id = f"rule_manual_{uuid.uuid4().hex[:8]}"
+
+    # Derive file from node_id when provided
+    file_ = body.file
+    func_id = ""
+    if body.node_id:
+        if body.node_type in ("Function", "Class"):
+            func_id = body.node_id
+            file_ = body.node_id.split("::")[0] if "::" in body.node_id else file_
+        elif body.node_type == "File":
+            file_ = body.node_id
+
     rule = {
         "id": rule_id,
         "description": body.description,
         "rule_type": body.rule_type,
         "severity": body.severity,
         "source": f"manual:{body.added_by or 'developer'}",
-        "function_id": "",
-        "file": body.file,
+        "function_id": func_id,
+        "file": file_,
         "constraint": body.constraint or body.description,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "node_id": body.node_id,
+        "node_type": body.node_type,
+        "node_name": body.node_name,
     }
     rules = _load_rules(repo)
     rules.append(rule)
     _save_rules(repo, rules)
     _inject_rule_into_enriched(repo, rule)
-    logger.info("Manual rule %s added for repo '%s'", rule_id, repo)
+
+    # Write to Neo4j with proper edges when a node is attached
+    if body.node_id:
+        try:
+            from graph.neo4j_client import neo4j_client
+            if neo4j_client.is_connected():
+                # Create BusinessRule node
+                neo4j_client.run(
+                    "MERGE (br:BusinessRule {id: $id}) "
+                    "SET br.description = $description, "
+                    "    br.rule_type = $rule_type, "
+                    "    br.severity = $severity, "
+                    "    br.source = $source, "
+                    "    br.constraint = $constraint, "
+                    "    br.repo = $repo",
+                    {
+                        "id": rule_id,
+                        "description": rule["description"],
+                        "rule_type": rule["rule_type"],
+                        "severity": rule["severity"],
+                        "source": rule["source"],
+                        "constraint": rule["constraint"],
+                        "repo": repo,
+                    },
+                )
+                # Link to Function or Class via GOVERNED_BY
+                if body.node_type in ("Function", "Class"):
+                    label = body.node_type
+                    neo4j_client.run(
+                        f"MATCH (n:{label} {{id: $nid}}), (br:BusinessRule {{id: $rid}}) "
+                        "MERGE (n)-[:GOVERNED_BY]->(br)",
+                        {"nid": body.node_id, "rid": rule_id},
+                    )
+                # Link to File via FOUND_IN
+                if file_:
+                    neo4j_client.run(
+                        "MATCH (f:File {id: $fid}), (br:BusinessRule {id: $rid}) "
+                        "MERGE (br)-[:FOUND_IN]->(f)",
+                        {"fid": file_, "rid": rule_id},
+                    )
+                logger.info("BusinessRule %s written to Neo4j, linked to %s %s", rule_id, body.node_type, body.node_id)
+        except Exception as e:
+            logger.debug("Could not write BusinessRule to Neo4j: %s", e)
+
+    logger.info("Manual rule %s added for repo '%s' (node: %s)", rule_id, repo, body.node_id or "unlinked")
     return {"rule_id": rule_id, "status": "stored"}
 
 

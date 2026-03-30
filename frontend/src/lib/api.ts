@@ -220,12 +220,28 @@ export function getKnowledgeRules(repo: string): Promise<KnowledgeRule[]> {
   return request<KnowledgeRule[]>(`/api/knowledge/${encodeURIComponent(repo)}/rules`)
 }
 
+export interface GraphNodeSummary {
+  id: string
+  name: string
+  type: 'Function' | 'Class' | 'File' | string
+  file: string
+}
+
+export function searchGraphNodes(repo: string, q: string, nodeType?: string): Promise<GraphNodeSummary[]> {
+  const params = new URLSearchParams({ q, limit: '20' })
+  if (nodeType) params.set('node_type', nodeType)
+  return request<GraphNodeSummary[]>(`/api/knowledge/${encodeURIComponent(repo)}/nodes/search?${params}`)
+}
+
 export function addRule(repo: string, rule: {
   description: string
   rule_type: string
   severity: string
   file?: string
   constraint?: string
+  node_id?: string
+  node_type?: string
+  node_name?: string
 }): Promise<{ rule_id: string }> {
   return request<{ rule_id: string }>(`/api/knowledge/${encodeURIComponent(repo)}/rules`, {
     method: 'POST',
