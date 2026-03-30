@@ -432,7 +432,8 @@ class BusinessLogicExtractor:
         )
 
         # Link BusinessRule → File (FOUND_IN)
-        file_id: str = file_record.get("id", "")
+        # Parsed file dicts use "path" as the key; File nodes in Neo4j use path as their id.
+        file_id: str = file_record.get("path", "") or file_record.get("id", "")
         if file_id:
             neo4j_client.run(
                 "MATCH (br:BusinessRule {id: $rid}), (f:File {id: $fid}) "

@@ -118,6 +118,24 @@ def build(
         if git_decisions:
             console.print(f"  [green]✓[/green] Git decisions: {len(git_decisions)} decision-laden commits found")
 
+        if summaries:
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if not api_key:
+                console.print("  [yellow]⚠[/yellow]  ANTHROPIC_API_KEY not set — skipping summaries")
+            else:
+                # LLM-enhanced decision points + domain concepts (before Neo4j write)
+                progress.update(task, description="[cyan]Enhancing decision points (Claude)...", completed=62)
+                from enricher.decision_points import enhance_with_llm as enhance_decisions
+                enhanced_dp = enhance_decisions(decision_points, api_key)
+                if enhanced_dp:
+                    console.print(f"  [green]✓[/green] {enhanced_dp} decision points enhanced with LLM")
+
+                progress.update(task, description="[cyan]Enriching domain concepts (Claude)...", completed=63)
+                from enricher.domain_concepts import enhance_with_llm as enhance_concepts
+                enhanced_dc = enhance_concepts(domain_concepts, parsed, api_key)
+                if enhanced_dc:
+                    console.print(f"  [green]✓[/green] {enhanced_dc} domain concepts enriched with LLM")
+
         if not no_neo4j:
             try:
                 progress.update(task, description="[cyan]Writing to Neo4j...", completed=65)
@@ -135,35 +153,18 @@ def build(
             except Exception as e:
                 console.print(f"  [yellow]⚠[/yellow]  Neo4j unavailable ({e}) — skipping graph DB. Use --no-neo4j to suppress.")
 
-        if summaries:
+        if summaries and os.environ.get("ANTHROPIC_API_KEY"):
             api_key = os.environ.get("ANTHROPIC_API_KEY")
-            if not api_key:
-                console.print("  [yellow]⚠[/yellow]  ANTHROPIC_API_KEY not set — skipping summaries")
-            else:
-                progress.update(task, description="[cyan]Generating LLM file summaries (Claude)...", completed=70)
-                from enricher.summarizer import Summarizer
-                summarizer = Summarizer(repo_name)
-                summarizer.enrich()
-                console.print(f"  [green]✓[/green] LLM file summaries generated")
+            progress.update(task, description="[cyan]Generating LLM file summaries (Claude)...", completed=70)
+            from enricher.summarizer import Summarizer
+            summarizer = Summarizer(repo_name)
+            summarizer.enrich()
+            console.print(f"  [green]✓[/green] LLM file summaries generated")
 
-                progress.update(task, description="[cyan]Generating LLM function summaries (Claude)...", completed=73)
-                fn_count = summarizer.enrich_functions()
-                if fn_count:
-                    console.print(f"  [green]✓[/green] {fn_count} function summaries generated")
-
-                # LLM-enhanced decision points
-                progress.update(task, description="[cyan]Enhancing decision points (Claude)...", completed=76)
-                from enricher.decision_points import enhance_with_llm as enhance_decisions
-                enhanced_dp = enhance_decisions(decision_points, api_key)
-                if enhanced_dp:
-                    console.print(f"  [green]✓[/green] {enhanced_dp} decision points enhanced with LLM")
-
-                # LLM-enhanced domain concepts
-                progress.update(task, description="[cyan]Enriching domain concepts (Claude)...", completed=78)
-                from enricher.domain_concepts import enhance_with_llm as enhance_concepts
-                enhanced_dc = enhance_concepts(domain_concepts, parsed, api_key)
-                if enhanced_dc:
-                    console.print(f"  [green]✓[/green] {enhanced_dc} domain concepts enriched with LLM")
+            progress.update(task, description="[cyan]Generating LLM function summaries (Claude)...", completed=73)
+            fn_count = summarizer.enrich_functions()
+            if fn_count:
+                console.print(f"  [green]✓[/green] {fn_count} function summaries generated")
 
         progress.update(task, description="[cyan]Extracting business rules...", completed=80)
         from enricher.business_logic import BusinessLogicExtractor, persist_rules_to_file

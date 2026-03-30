@@ -115,6 +115,20 @@ def run_analysis(job_id: str, req: AnalyzeRequest):
         decision_points = extract_decision_points(parsed)
         domain_concepts = extract_domain_concepts(parsed)
 
+        # LLM enhancement of decision points + domain concepts (before Neo4j write)
+        _api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if _api_key:
+            try:
+                from enricher.decision_points import enhance_with_llm as _enhance_dp
+                _enhance_dp(decision_points, _api_key)
+            except Exception as _e:
+                logger.debug("Decision point LLM enhancement failed: %s", _e)
+            try:
+                from enricher.domain_concepts import enhance_with_llm as _enhance_dc
+                _enhance_dc(domain_concepts, parsed, _api_key)
+            except Exception as _e:
+                logger.debug("Domain concept LLM enhancement failed: %s", _e)
+
         # Git decision mining
         from analyzer.git_analyzer import GitAnalyzer
         git_analyzer = GitAnalyzer(repo_path)
