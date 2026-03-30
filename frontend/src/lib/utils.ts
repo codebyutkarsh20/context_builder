@@ -17,7 +17,8 @@ export function formatTokens(n: number): string {
   return n + ' tokens'
 }
 
-export function truncate(str: string, maxLen: number): string {
+export function truncate(str: string | null | undefined, maxLen: number): string {
+  if (!str) return ''
   if (str.length <= maxLen) return str
   return str.slice(0, maxLen - 3) + '...'
 }

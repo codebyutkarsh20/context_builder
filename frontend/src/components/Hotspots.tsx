@@ -84,7 +84,7 @@ function DetailPanel({ hotspot, onClose }: DetailPanelProps) {
             <div className="h-2 bg-zinc-700 rounded-full overflow-hidden">
               <div
                 className="h-full rounded-full bg-gradient-to-r from-blue-500 to-blue-400"
-                style={{ width: `${Math.min(100, hotspot.pagerank * 100)}%` }}
+                style={{ width: `${Math.min(100, (hotspot.pagerank ?? 0) * 100)}%` }}
               />
             </div>
           </div>
