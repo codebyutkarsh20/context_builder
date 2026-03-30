@@ -55,14 +55,14 @@ class TestListRepos:
             assert "has_context" in repo
             assert "has_summary" in repo
 
-    def test_crest_be_has_repo_path(self):
-        """crest-be should have repo_path from graph.json."""
+    def test_context_builder_has_repo_path(self):
+        """context_builder (this repo) should have a valid repo_path."""
         repos = api("get", "/api/repos").json()
-        crest = next((r for r in repos if r["name"] == "crest-be"), None)
-        assert crest is not None, "crest-be should be in repos"
-        assert "repo_path" in crest
-        assert crest["repo_path"] != ""
-        assert Path(crest["repo_path"]).exists(), f"repo_path should exist: {crest['repo_path']}"
+        cb = next((r for r in repos if r["name"] == "context_builder"), None)
+        assert cb is not None, "context_builder should be in repos"
+        assert "repo_path" in cb
+        assert cb["repo_path"] != ""
+        assert Path(cb["repo_path"]).exists(), f"repo_path should exist: {cb['repo_path']}"
 
     def test_repo_path_is_absolute(self):
         """repo_path should be an absolute filesystem path."""

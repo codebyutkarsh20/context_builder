@@ -74,8 +74,8 @@ class TestJobSubmission:
         assert data["job_id"]  # Should have auto-generated ID
 
     def test_minimal_submission(self):
-        """Even a nearly empty request succeeds (fields have defaults)."""
-        resp = api("post", "/api/agent/run", json={})
+        """A request with just description succeeds (other fields have defaults)."""
+        resp = api("post", "/api/agent/run", json={"description": "minimal bug report"})
         assert resp.status_code == 200
 
 
@@ -152,9 +152,9 @@ class TestJobsList:
 
     def test_newest_first_ordering(self):
         """Jobs should be ordered newest first."""
-        id1 = api("post", "/api/agent/run", json={"title": "First", "repo_name": "t"}).json()["job_id"]
+        id1 = api("post", "/api/agent/run", json={"title": "First", "description": "bug one", "repo_name": "t"}).json()["job_id"]
         time.sleep(0.1)
-        id2 = api("post", "/api/agent/run", json={"title": "Second", "repo_name": "t"}).json()["job_id"]
+        id2 = api("post", "/api/agent/run", json={"title": "Second", "description": "bug two", "repo_name": "t"}).json()["job_id"]
         time.sleep(0.5)
 
         jobs = api("get", "/api/agent/jobs").json()
@@ -201,6 +201,7 @@ class TestThreadSafety:
         """Mix status checks and submissions concurrently."""
         submit_resp = api("post", "/api/agent/run", json={
             "title": "Anchor job",
+            "description": "anchor for concurrency test",
             "repo_name": "test",
         })
         anchor_id = submit_resp.json()["job_id"]
@@ -214,7 +215,7 @@ class TestThreadSafety:
 
         def submit():
             try:
-                api("post", "/api/agent/run", json={"title": "bg", "repo_name": "t"})
+                api("post", "/api/agent/run", json={"title": "bg", "description": "bg job", "repo_name": "t"})
             except Exception as e:
                 errors.append(str(e))
 
