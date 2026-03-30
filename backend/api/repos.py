@@ -297,7 +297,17 @@ def list_repos():
     from graph.neo4j_client import neo4j_client
     from graph.queries import list_repos_query
     if neo4j_client.is_connected():
-        return neo4j_client.run(list_repos_query())
+        rows = neo4j_client.run(list_repos_query())
+        # Enrich with has_context / has_summary from disk
+        for row in rows:
+            repo_name = row.get("name", "")
+            d = _DATA_DIR / repo_name
+            row["has_context"] = (d / "context.md").exists()
+            row["has_summary"] = (d / "summary.md").exists()
+            # Normalise repo_path field (Neo4j returns 'path')
+            if "repo_path" not in row:
+                row["repo_path"] = row.get("path", "")
+        return rows
     # Fallback: scan DATA_DIR
     base = _DATA_DIR
     if not base.exists():

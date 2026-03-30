@@ -31,13 +31,21 @@ export const EDGE_COLORS: Record<string, string> = {
   IMPORTS: '#eab308',
   INHERITS: '#06b6d4',
   RELATED_TO: '#8b5cf6',
-  HAS_DECISION: '#ef4444',
+  HAS_DECISION: '#f97316',
   GOVERNED_BY: '#a855f7',
   REPRESENTS: '#ec4899',
 }
 
+// Edge types that have direction (get arrow heads)
+const DIRECTED_EDGE_TYPES = new Set(['CALLS', 'IMPORTS', 'INHERITS', 'GOVERNED_BY', 'REPRESENTS', 'HAS_DECISION'])
+
 const NODE_TYPES = Object.keys(NODE_COLORS)
 const EDGE_TYPES = Object.keys(EDGE_COLORS)
+
+// Node radius helper — consistent formula used in both nodeCanvasObject and linkCanvasObject
+function nodeRadius(val: number | undefined): number {
+  return Math.sqrt(val ?? 1) * 4.5 + 4
+}
 
 export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loading = false }: KnowledgeGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -48,9 +56,11 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
   const [visibleEdgeTypes, setVisibleEdgeTypes] = useState<Set<string>>(new Set(EDGE_TYPES))
   const [legendOpen, setLegendOpen] = useState(true)
 
-  // State for React-driven UI (hint text, etc.)
+  // State for React-driven UI
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  const [hoveredNodeData, setHoveredNodeData] = useState<(GraphNode & { x: number; y: number }) | null>(null)
+  const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null)
 
   // Refs for canvas callbacks — stable references, no rerenders
   const hoveredNodeIdRef = useRef<string | null>(null)
@@ -124,7 +134,7 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
     nodes: filteredNodes.map((n) => ({
       ...n,
       id: n.id,
-      val: n.pagerank !== undefined ? Math.max(0.5, n.pagerank * 60) : 1,
+      val: n.pagerank !== undefined ? Math.max(0.8, n.pagerank * 80) : 1,
     })),
     links: filteredEdges.map((e) => ({
       ...e,
@@ -133,15 +143,16 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
     })),
   }), [filteredNodes, filteredEdges]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Apply compact D3 forces whenever graph data changes
+  // Apply improved D3 forces whenever graph data changes
   useEffect(() => {
     if (!graphRef.current) return
-    graphRef.current.d3Force('charge')?.strength(-20).distanceMax(120)
-    graphRef.current.d3Force('link')?.distance(25).strength(0.8)
+    // Strong repulsion + longer links to spread nodes out and prevent overlap
+    graphRef.current.d3Force('charge')?.strength(-250).distanceMax(500)
+    graphRef.current.d3Force('link')?.distance(70).strength(0.3)
     graphRef.current.d3ReheatSimulation()
   }, [graphData])
 
-  // ─── Node rendering — reads from refs, EMPTY deps = stable reference ───────
+  // ─── Node rendering ────────────────────────────────────────────────────────
 
   const nodeCanvasObject = useCallback(
     (node: Record<string, unknown>, ctx: CanvasRenderingContext2D, globalScale: number) => {
@@ -161,68 +172,106 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
       const hasFocus = hoveredId !== null || selectedId !== null
       const isDimmed = hasFocus && !isHovered && !isSelected && !isNeighbor
 
-      const r = Math.sqrt(n.val ?? 1) * 3.8 + 2
+      const r = nodeRadius(n.val)
       const color = NODE_COLORS[n.type] ?? '#94a3b8'
 
+      // Glow for selected/hovered
       if (isHovered || isSelected) {
-        ctx.shadowBlur = isSelected ? 24 : 16
+        ctx.shadowBlur = isSelected ? 28 : 18
         ctx.shadowColor = color
       }
 
+      // Node circle
       ctx.beginPath()
       ctx.arc(n.x, n.y, r, 0, 2 * Math.PI)
       ctx.fillStyle = isDimmed
-        ? color + '30'
+        ? color + '28'
         : isHovered || isSelected
           ? color
           : isNeighbor
-            ? color + 'dd'
-            : color + 'bb'
+            ? color + 'e0'
+            : color + 'cc'
       ctx.fill()
 
+      // Border
       if (isSelected) {
         ctx.strokeStyle = '#ffffff'
-        ctx.lineWidth = 2 / globalScale
+        ctx.lineWidth = 2.5 / globalScale
         ctx.stroke()
       } else if (isHovered) {
-        ctx.strokeStyle = color
+        ctx.strokeStyle = '#ffffffcc'
         ctx.lineWidth = 1.5 / globalScale
+        ctx.stroke()
+      } else if (isNeighbor) {
+        ctx.strokeStyle = color + '80'
+        ctx.lineWidth = 1 / globalScale
         ctx.stroke()
       }
 
       ctx.shadowBlur = 0
 
-      const showLabel = isHovered || isSelected || isNeighbor || (globalScale > 1.8 && r > 4)
+      // Type ring indicator (small colored ring segment for type identification)
+      if (!isDimmed && r > 5) {
+        ctx.beginPath()
+        ctx.arc(n.x, n.y, r + 1.5 / globalScale, -Math.PI / 2, Math.PI * 0.5)
+        ctx.strokeStyle = color + (isSelected || isHovered ? 'ff' : '60')
+        ctx.lineWidth = 1.5 / globalScale
+        ctx.stroke()
+      }
+
+      // Label — show at lower zoom threshold and always for active nodes
+      const showLabel = isHovered || isSelected || isNeighbor || (globalScale > 1.2 && r > 5)
       if (showLabel && !isDimmed) {
         const raw = String(n.name ?? n.id)
         const label = raw.includes('::') ? raw.split('::').pop()! : raw.split('/').pop()!
-        const fontSize = Math.max(9, Math.min(14, r * 1.5)) / globalScale
-        ctx.font = `${isSelected || isHovered ? 'bold ' : ''}${fontSize}px Inter, system-ui, sans-serif`
+        const fontSize = Math.max(9, Math.min(13, r * 1.4)) / globalScale
+        ctx.font = `${isSelected || isHovered ? '600 ' : ''}${fontSize}px Inter, system-ui, sans-serif`
         ctx.textAlign = 'center'
         ctx.textBaseline = 'top'
 
-        const text = label.slice(0, 28)
+        const text = label.slice(0, 30)
         const textW = ctx.measureText(text).width
-        const pad = 2 / globalScale
+        const pad = 2.5 / globalScale
         const bx = n.x - textW / 2 - pad
-        const by = n.y + r + 2 / globalScale
-        ctx.fillStyle = 'rgba(0,0,0,0.65)'
+        const by = n.y + r + 3 / globalScale
+
+        // Label background
+        ctx.fillStyle = 'rgba(0,0,0,0.72)'
         ctx.beginPath()
-        ctx.roundRect?.(bx, by, textW + pad * 2, fontSize + pad * 2, 2 / globalScale)
+        if (ctx.roundRect) {
+          ctx.roundRect(bx, by, textW + pad * 2, fontSize + pad * 2, 3 / globalScale)
+        }
         ctx.fill()
 
-        ctx.fillStyle = isHovered || isSelected ? '#ffffff' : isNeighbor ? '#e4e4e7' : 'rgba(228,228,231,0.75)'
+        ctx.fillStyle = isHovered || isSelected ? '#ffffff' : isNeighbor ? '#e4e4e7' : 'rgba(212,212,216,0.85)'
         ctx.fillText(text, n.x, by + pad)
+
+        // Show type badge below name for hovered/selected
+        if ((isHovered || isSelected) && globalScale > 0.6) {
+          const typeText = n.type
+          const typeFontSize = Math.max(7, fontSize * 0.8)
+          ctx.font = `bold ${typeFontSize}px Inter, system-ui, sans-serif`
+          const typeW = ctx.measureText(typeText).width
+          const tyBy = by + fontSize + pad * 2 + 2 / globalScale
+          ctx.fillStyle = 'rgba(0,0,0,0.65)'
+          ctx.beginPath()
+          if (ctx.roundRect) {
+            ctx.roundRect(n.x - typeW / 2 - pad, tyBy, typeW + pad * 2, typeFontSize + pad * 2, 2 / globalScale)
+          }
+          ctx.fill()
+          ctx.fillStyle = color + 'ee'
+          ctx.fillText(typeText, n.x, tyBy + pad)
+        }
       }
     },
-    [] // stable — reads refs, never recreated
+    [] // stable — reads refs
   )
 
   const nodePointerAreaPaint = useCallback(
     (node: Record<string, unknown>, color: string, ctx: CanvasRenderingContext2D, globalScale: number) => {
       const n = node as GraphNode & { x: number; y: number; val: number }
-      const r = Math.sqrt(n.val ?? 1) * 3.8 + 2
-      const hitR = Math.max(r + 6 / globalScale, 10 / globalScale)
+      const r = nodeRadius(n.val)
+      const hitR = Math.max(r + 8 / globalScale, 12 / globalScale)
       ctx.beginPath()
       ctx.arc(n.x, n.y, hitR, 0, 2 * Math.PI)
       ctx.fillStyle = color
@@ -231,13 +280,13 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
     []
   )
 
-  // ─── Edge rendering — reads from refs, EMPTY deps ──────────────────────────
+  // ─── Edge rendering ─────────────────────────────────────────────────────────
 
   const linkCanvasObject = useCallback(
     (link: Record<string, unknown>, ctx: CanvasRenderingContext2D, globalScale: number) => {
       const l = link as unknown as GraphEdge & {
-        source: { x: number; y: number; id: string }
-        target: { x: number; y: number; id: string }
+        source: { x: number; y: number; id: string; val?: number }
+        target: { x: number; y: number; id: string; val?: number }
       }
       if (!l.source?.x || !l.target?.x) return
 
@@ -256,21 +305,17 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
 
       const hasFocus = hoveredId !== null || selectedId !== null
       const isDimmed = hasFocus && !isActive
-      if (isDimmed) {
-        ctx.beginPath()
-        ctx.moveTo(l.source.x, l.source.y)
-        ctx.lineTo(l.target.x, l.target.y)
-        ctx.strokeStyle = color + '20'
-        ctx.lineWidth = Math.max(0.3 / globalScale, 0.5)
-        ctx.stroke()
-        return
-      }
 
-      const alpha = isActive ? 'ee' : 'bb'
-      const width = isActive ? Math.max(2.5 / globalScale, 2.0) : Math.max(1.0 / globalScale, 1.5)
+      const alpha = isDimmed ? '18' : isActive ? 'ee' : '88'
+      const width = isDimmed
+        ? Math.max(0.3 / globalScale, 0.3)
+        : isActive
+          ? Math.max(2.5 / globalScale, 1.8)
+          : Math.max(1.2 / globalScale, 1.0)
 
-      if (isActive) { ctx.shadowBlur = 4; ctx.shadowColor = color }
+      if (isActive) { ctx.shadowBlur = 6; ctx.shadowColor = color }
 
+      // Edge line
       ctx.beginPath()
       ctx.moveTo(l.source.x, l.source.y)
       ctx.lineTo(l.target.x, l.target.y)
@@ -279,25 +324,58 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
       ctx.stroke()
       ctx.shadowBlur = 0
 
-      if (isActive && globalScale > 0.5) {
+      // Arrow head — show for directed edges at sufficient zoom
+      const isDirected = DIRECTED_EDGE_TYPES.has(l.type)
+      if (isDirected && globalScale > 0.25 && !isDimmed) {
         const dx = l.target.x - l.source.x
         const dy = l.target.y - l.source.y
         const len = Math.sqrt(dx * dx + dy * dy)
-        if (len < 1) return
+        if (len < 2) return
+
         const ux = dx / len, uy = dy / len
-        const arrowSize = 4 / globalScale
-        const ax = l.target.x - ux * arrowSize * 3
-        const ay = l.target.y - uy * arrowSize * 3
+        const tgtR = nodeRadius(l.target.val)
+        const arrowSize = isActive ? 6 / globalScale : 4 / globalScale
+
+        // Place arrow tip just at the node edge
+        const endX = l.target.x - ux * (tgtR + 1 / globalScale)
+        const endY = l.target.y - uy * (tgtR + 1 / globalScale)
+        const ax = endX - ux * arrowSize * 2.2
+        const ay = endY - uy * arrowSize * 2.2
+
         ctx.beginPath()
         ctx.moveTo(ax + uy * arrowSize, ay - ux * arrowSize)
-        ctx.lineTo(l.target.x, l.target.y)
+        ctx.lineTo(endX, endY)
         ctx.lineTo(ax - uy * arrowSize, ay + ux * arrowSize)
-        ctx.strokeStyle = color + 'dd'
-        ctx.lineWidth = 1 / globalScale
-        ctx.stroke()
+        ctx.closePath()
+        ctx.fillStyle = color + (isDimmed ? '18' : isActive ? 'ee' : '88')
+        ctx.fill()
+      }
+
+      // Edge type label — show on active edges at medium zoom
+      if (isActive && globalScale > 0.7) {
+        const midX = (l.source.x + l.target.x) / 2
+        const midY = (l.source.y + l.target.y) / 2
+        const fontSize = Math.max(7, 9 / globalScale)
+        ctx.font = `bold ${fontSize}px Inter, system-ui, sans-serif`
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+
+        const text = l.type.replace(/_/g, ' ')
+        const textW = ctx.measureText(text).width
+        const pad = 3 / globalScale
+
+        ctx.fillStyle = 'rgba(0,0,0,0.82)'
+        ctx.beginPath()
+        if (ctx.roundRect) {
+          ctx.roundRect(midX - textW / 2 - pad, midY - fontSize / 2 - pad, textW + pad * 2, fontSize + pad * 2, 3 / globalScale)
+        }
+        ctx.fill()
+
+        ctx.fillStyle = color + 'f0'
+        ctx.fillText(text, midX, midY)
       }
     },
-    [] // stable — reads refs, never recreated
+    [] // stable — reads refs
   )
 
   // ─── Interactions ──────────────────────────────────────────────────────────
@@ -308,18 +386,29 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
     const next = selectedNodeIdRef.current === id ? null : id
     selectedNodeIdRef.current = next
     setSelectedNodeId(next)
+    setHoveredNodeData(null)
+    setTooltipPos(null)
     if (next !== null) onNodeClick?.(n)
     else onNodeClick?.(null)
   }, [onNodeClick])
 
   const handleNodeHover = useCallback((node: Record<string, unknown> | null) => {
-    const id = node ? String((node as GraphNode).id) : null
+    const n = node as (GraphNode & { x: number; y: number }) | null
+    const id = n ? String(n.id) : null
     hoveredNodeIdRef.current = id
     setHoveredNodeId(id)
     document.body.style.cursor = node ? 'pointer' : 'default'
+
+    if (n && graphRef.current && n.x !== undefined) {
+      const screenPos = graphRef.current.graph2ScreenCoords(n.x, n.y)
+      setTooltipPos(screenPos)
+      setHoveredNodeData(n)
+    } else {
+      setTooltipPos(null)
+      setHoveredNodeData(null)
+    }
   }, [])
 
-  // Reset cursor when component unmounts to avoid a stuck pointer cursor
   useEffect(() => () => { document.body.style.cursor = 'default' }, [])
 
   const handleBackgroundClick = useCallback(() => {
@@ -380,6 +469,60 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
         </div>
       )}
 
+      {/* Hover tooltip — only when not selected */}
+      {hoveredNodeData && tooltipPos && !selectedNodeId && (
+        <div
+          className="absolute z-20 pointer-events-none"
+          style={{
+            left: Math.min(tooltipPos.x + 18, dimensions.width - 220),
+            top: Math.max(tooltipPos.y - 20, 8),
+          }}
+        >
+          <div className="bg-zinc-900/98 border border-zinc-700/70 rounded-xl p-3 shadow-2xl backdrop-blur-sm w-52">
+            <div className="flex items-center gap-2 mb-1.5">
+              <span className="w-2 h-2 rounded-full flex-shrink-0"
+                style={{ backgroundColor: NODE_COLORS[hoveredNodeData.type] ?? '#94a3b8' }} />
+              <span className="text-[10px] text-zinc-500 uppercase tracking-wider font-bold">
+                {hoveredNodeData.type}
+              </span>
+            </div>
+            <p className="text-xs font-mono text-zinc-100 font-semibold break-all leading-snug">
+              {String(hoveredNodeData.name ?? hoveredNodeData.id).split('::').pop() ?? hoveredNodeData.id}
+            </p>
+            {String(hoveredNodeData.name ?? '').includes('::') && (
+              <p className="text-[10px] text-zinc-600 font-mono mt-0.5 break-all leading-snug">
+                {String(hoveredNodeData.name ?? hoveredNodeData.id)}
+              </p>
+            )}
+            {hoveredNodeData.summary && (
+              <p className="text-[11px] text-zinc-400 mt-2 leading-relaxed line-clamp-3">
+                {hoveredNodeData.summary}
+              </p>
+            )}
+            {hoveredNodeData.pagerank !== undefined && (
+              <div className="flex items-center gap-2 mt-2">
+                <div className="flex-1 h-1 bg-zinc-800 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full transition-all"
+                    style={{
+                      width: `${Math.min(100, hoveredNodeData.pagerank * 200)}%`,
+                      backgroundColor: NODE_COLORS[hoveredNodeData.type] ?? '#94a3b8',
+                    }} />
+                </div>
+                <span className="text-[10px] font-mono text-zinc-600 flex-shrink-0">
+                  PR {hoveredNodeData.pagerank.toFixed(4)}
+                </span>
+              </div>
+            )}
+            {hoveredNodeData.file && (
+              <p className="text-[10px] text-zinc-600 font-mono mt-1.5 truncate">
+                {hoveredNodeData.file.split('/').slice(-2).join('/')}
+              </p>
+            )}
+            <p className="text-[10px] text-zinc-700 mt-2">Click to inspect details →</p>
+          </div>
+        </div>
+      )}
+
       {/* Filter panel — collapsible, bottom-right */}
       <div className="absolute bottom-14 right-4 z-10">
         <button
@@ -391,7 +534,7 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
           <span className="text-[11px] text-zinc-500 group-hover:text-zinc-300 transition-colors">Legend</span>
         </button>
         {legendOpen && (
-          <div className="bg-zinc-900/95 backdrop-blur-sm border border-zinc-700/50 rounded-xl p-3 w-40 shadow-2xl">
+          <div className="bg-zinc-900/95 backdrop-blur-sm border border-zinc-700/50 rounded-xl p-3 w-44 shadow-2xl">
             <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest mb-2">Node Types</p>
             <div className="space-y-1.5 mb-3">
               {NODE_TYPES.map((type) => (
@@ -406,9 +549,9 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
                       </svg>
                     )}
                   </div>
-                  <div className="flex items-center gap-1.5 flex-1">
-                    <span className="w-2 h-2 rounded-full flex-shrink-0 opacity-70" style={{ backgroundColor: NODE_COLORS[type] }} />
-                    <span className="text-xs text-zinc-400 group-hover:text-zinc-200 transition-colors">{type}</span>
+                  <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                    <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: NODE_COLORS[type] }} />
+                    <span className="text-xs text-zinc-400 group-hover:text-zinc-200 transition-colors truncate">{type}</span>
                   </div>
                 </label>
               ))}
@@ -418,10 +561,15 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
               {EDGE_TYPES.map((type) => (
                 <label key={type} className="flex items-center gap-2 cursor-pointer group select-none">
                   <input type="checkbox" checked={visibleEdgeTypes.has(type)} onChange={() => toggleEdgeType(type)} className="sr-only" />
-                  <div className={cn('w-5 h-1 rounded-full transition-all flex-shrink-0',
-                    visibleEdgeTypes.has(type) ? 'opacity-100' : 'opacity-20 bg-zinc-600')}
-                    style={visibleEdgeTypes.has(type) ? { backgroundColor: EDGE_COLORS[type] } : {}} />
-                  <span className="text-xs text-zinc-400 group-hover:text-zinc-200 transition-colors">{type}</span>
+                  <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                    <div className={cn('w-5 h-1 rounded-full transition-all flex-shrink-0',
+                      visibleEdgeTypes.has(type) ? 'opacity-100' : 'opacity-20 bg-zinc-600')}
+                      style={visibleEdgeTypes.has(type) ? { backgroundColor: EDGE_COLORS[type] } : {}} />
+                    <span className="text-xs text-zinc-400 group-hover:text-zinc-200 transition-colors truncate">{type}</span>
+                  </div>
+                  {DIRECTED_EDGE_TYPES.has(type) && (
+                    <span className="text-[9px] text-zinc-700 flex-shrink-0">→</span>
+                  )}
                 </label>
               ))}
             </div>
@@ -445,7 +593,7 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
       {nodes.length > 0 && !hoveredNodeId && !selectedNodeId && (
         <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
           <span className="text-[11px] text-zinc-600 bg-zinc-900/80 px-3 py-1 rounded-full border border-zinc-800 backdrop-blur-sm">
-            Click a node to inspect · Scroll to zoom · Drag to pan
+            Hover to preview · Click to inspect · Scroll to zoom · Drag to pan
           </span>
         </div>
       )}
@@ -470,11 +618,11 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
           enableZoomInteraction
           enablePanInteraction
           minZoom={0.05}
-          maxZoom={12}
-          cooldownTicks={150}
-          d3AlphaDecay={0.028}
-          d3VelocityDecay={0.4}
-          warmupTicks={30}
+          maxZoom={16}
+          cooldownTicks={200}
+          d3AlphaDecay={0.022}
+          d3VelocityDecay={0.38}
+          warmupTicks={40}
           onEngineStop={() => {
             if (!initialFitDone.current) {
               initialFitDone.current = true

@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
-import { X, GitGraph, AlertCircle, ChevronRight, FileCode, Hash, Network, ArrowDownToLine, ArrowUpFromLine } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { X, GitGraph, AlertCircle, ChevronRight, FileCode, Hash, Network, ArrowDownToLine, ArrowUpFromLine, Search } from 'lucide-react'
 import { cn, formatNumber, truncate } from '../lib/utils'
 import KnowledgeGraph, { NODE_COLORS, EDGE_COLORS, type KnowledgeGraphControls } from '../components/KnowledgeGraph'
 import { getGraph } from '../lib/api'
@@ -315,6 +315,9 @@ export default function Graph() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const searchInputRef = useRef<HTMLInputElement>(null)
   const jumpToNodeRef = useRef<KnowledgeGraphControls | null>(null)
   // Tracks the latest request so stale responses are ignored
   const reqId = useRef(0)
@@ -335,6 +338,36 @@ export default function Graph() {
   const handleJump = useCallback((node: GraphNode) => {
     setSelectedNode(node)
     jumpToNodeRef.current?.jumpToNode(node)
+  }, [])
+
+  // Search results — filter nodes by name/id
+  const searchResults = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase()
+    if (!q || !graphData) return []
+    return graphData.nodes
+      .filter((n) => String(n.name ?? n.id).toLowerCase().includes(q))
+      .slice(0, 10)
+  }, [searchQuery, graphData])
+
+  const handleSearchSelect = useCallback((node: GraphNode) => {
+    setSearchQuery('')
+    setSearchOpen(false)
+    setSelectedNode(node)
+    jumpToNodeRef.current?.jumpToNode(node)
+  }, [])
+
+  // Open search with Ctrl/Cmd+K
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault()
+        setSearchOpen((v) => !v)
+        setTimeout(() => searchInputRef.current?.focus(), 50)
+      }
+      if (e.key === 'Escape') setSearchOpen(false)
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
   }, [])
 
   if (!activeRepo) {
@@ -358,9 +391,9 @@ export default function Graph() {
   return (
     <div className="flex flex-col h-screen bg-zinc-950">
       {/* Top bar */}
-      <div className="flex-shrink-0 flex items-center justify-between px-5 py-2.5 border-b border-zinc-800/60 bg-zinc-950">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
+      <div className="flex-shrink-0 flex items-center justify-between px-5 py-2.5 border-b border-zinc-800/60 bg-zinc-950 gap-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="flex items-center gap-2 flex-shrink-0">
             <Network className="w-4 h-4 text-purple-400" />
             <h1 className="text-sm font-semibold text-zinc-200">
               Knowledge Graph
@@ -369,7 +402,7 @@ export default function Graph() {
           </div>
 
           {/* Layer tabs */}
-          <div className="flex items-center gap-0.5 bg-zinc-900 border border-zinc-800 rounded-lg p-0.5">
+          <div className="flex items-center gap-0.5 bg-zinc-900 border border-zinc-800 rounded-lg p-0.5 flex-shrink-0">
             {LAYER_OPTIONS.map((opt) => (
               <button key={opt.id} onClick={() => setLayerFilter(opt.id)}
                 className={cn('px-3 py-1.5 rounded-md text-xs font-medium transition-all',
@@ -380,24 +413,101 @@ export default function Graph() {
           </div>
         </div>
 
-        {/* Stats chips — hidden on narrow viewports */}
-        {graphData && (
-          <div className="hidden sm:flex items-center gap-2">
-            {[
-              { label: `${formatNumber(graphData.nodes.length)} nodes`, color: '#a1a1aa' },
-              ...Object.entries(edgeTypeCounts).slice(0, 3).map(([type, count]) => ({
-                label: `${formatNumber(count)} ${type.toLowerCase()}`,
-                color: EDGE_COLORS[type] ?? '#52525b',
-              })),
-            ].map(({ label, color }) => (
-              <span key={label} className="px-2 py-0.5 rounded-md text-[11px] font-mono border border-zinc-800 text-zinc-500"
-                style={{ borderColor: color + '40' }}>
-                {label}
-              </span>
-            ))}
-          </div>
-        )}
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {/* Node type breakdown dots */}
+          {graphData && (
+            <div className="hidden md:flex items-center gap-1.5 mr-1">
+              {Object.entries(
+                graphData.nodes.reduce((acc, n) => { acc[n.type] = (acc[n.type] ?? 0) + 1; return acc }, {} as Record<string, number>)
+              ).slice(0, 5).map(([type, count]) => (
+                <span key={type} className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-zinc-900 border border-zinc-800/60">
+                  <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: NODE_COLORS[type] ?? '#94a3b8' }} />
+                  <span className="text-[10px] font-mono text-zinc-500">{count}</span>
+                </span>
+              ))}
+            </div>
+          )}
+
+          {/* Search button */}
+          {graphData && (
+            <button
+              onClick={() => { setSearchOpen((v) => !v); setTimeout(() => searchInputRef.current?.focus(), 50) }}
+              className={cn(
+                'flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs border transition-all',
+                searchOpen
+                  ? 'bg-zinc-800 border-zinc-600 text-zinc-200'
+                  : 'bg-zinc-900 border-zinc-800 text-zinc-500 hover:text-zinc-300 hover:border-zinc-700'
+              )}
+              title="Search nodes (⌘K)"
+            >
+              <Search className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Search nodes</span>
+              <kbd className="hidden sm:inline text-[10px] text-zinc-600 bg-zinc-800 px-1 rounded">⌘K</kbd>
+            </button>
+          )}
+
+          {/* Stats chips */}
+          {graphData && (
+            <div className="hidden lg:flex items-center gap-2">
+              {[
+                { label: `${formatNumber(graphData.nodes.length)} nodes`, color: '#a1a1aa' },
+                ...Object.entries(edgeTypeCounts).slice(0, 2).map(([type, count]) => ({
+                  label: `${formatNumber(count)} ${type.toLowerCase()}`,
+                  color: EDGE_COLORS[type] ?? '#52525b',
+                })),
+              ].map(({ label, color }) => (
+                <span key={label} className="px-2 py-0.5 rounded-md text-[11px] font-mono border border-zinc-800 text-zinc-500"
+                  style={{ borderColor: color + '40' }}>
+                  {label}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
+
+      {/* Search dropdown */}
+      {searchOpen && graphData && (
+        <div className="flex-shrink-0 px-4 pt-2 pb-1 border-b border-zinc-800/60 bg-zinc-950 relative z-20">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-500 pointer-events-none" />
+            <input
+              ref={searchInputRef}
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search nodes by name…"
+              className="w-full bg-zinc-900 border border-zinc-700/60 rounded-lg pl-9 pr-3 py-2 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-zinc-500 transition-colors"
+            />
+          </div>
+          {searchResults.length > 0 && (
+            <div className="absolute left-4 right-4 top-full mt-1 bg-zinc-900 border border-zinc-700/60 rounded-xl shadow-2xl overflow-hidden z-30">
+              {searchResults.map((node) => (
+                <button
+                  key={node.id}
+                  onClick={() => handleSearchSelect(node)}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 hover:bg-zinc-800 transition-colors text-left border-b border-zinc-800/40 last:border-0"
+                >
+                  <span className="w-2 h-2 rounded-full flex-shrink-0"
+                    style={{ backgroundColor: NODE_COLORS[node.type] ?? '#6b7280' }} />
+                  <span className="text-xs font-mono text-zinc-300 flex-1 truncate">
+                    {String(node.name ?? node.id).split('::').pop()}
+                  </span>
+                  <span className="text-[10px] text-zinc-600 flex-shrink-0">{node.type}</span>
+                  {node.file && (
+                    <span className="text-[10px] text-zinc-700 font-mono flex-shrink-0 hidden sm:inline truncate max-w-32">
+                      {node.file.split('/').slice(-2).join('/')}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+          {searchQuery.trim() && searchResults.length === 0 && (
+            <p className="text-xs text-zinc-600 py-1.5 px-1">No nodes match "{searchQuery}"</p>
+          )}
+        </div>
+      )}
 
       {/* Error */}
       {error && (
@@ -418,7 +528,7 @@ export default function Graph() {
 
         {/* Node detail panel — floats over the graph */}
         {selectedNode && (
-          <div className="absolute top-3 right-3 bottom-3 w-72 z-20 pointer-events-auto">
+          <div className="absolute top-3 right-3 bottom-3 w-80 z-20 pointer-events-auto">
             <NodeDetail
               node={selectedNode}
               allNodes={graphData?.nodes ?? []}

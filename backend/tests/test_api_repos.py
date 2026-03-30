@@ -56,10 +56,12 @@ class TestListRepos:
             assert "has_summary" in repo
 
     def test_context_builder_has_repo_path(self):
-        """context_builder (this repo) should have a valid repo_path."""
+        """context_builder (this repo) should have a valid repo_path.
+        Accepts any name that starts with 'context_builder' (e.g. context_builder_test).
+        """
         repos = api("get", "/api/repos").json()
-        cb = next((r for r in repos if r["name"] == "context_builder"), None)
-        assert cb is not None, "context_builder should be in repos"
+        cb = next((r for r in repos if r["name"].startswith("context_builder")), None)
+        assert cb is not None, "context_builder repo should be in repos (found: " + str([r["name"] for r in repos]) + ")"
         assert "repo_path" in cb
         assert cb["repo_path"] != ""
         assert Path(cb["repo_path"]).exists(), f"repo_path should exist: {cb['repo_path']}"

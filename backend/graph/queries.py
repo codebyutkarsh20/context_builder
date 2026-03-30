@@ -71,7 +71,7 @@ def get_graph_nodes(
             "       n.path AS path, n.language AS language, "
             "       n.docstring AS docstring, n.summary AS summary, "
             "       n.pagerank AS pagerank "
-            "ORDER BY n.pagerank DESC NULLS LAST "
+            "ORDER BY coalesce(n.pagerank, 0.0) DESC "
             "LIMIT $limit"
         )
     elif layer and layer in _LAYER_LABELS:
@@ -85,7 +85,7 @@ def get_graph_nodes(
             "       n.path AS path, n.language AS language, "
             "       n.docstring AS docstring, n.summary AS summary, "
             "       n.pagerank AS pagerank "
-            "ORDER BY n.pagerank DESC NULLS LAST "
+            "ORDER BY coalesce(n.pagerank, 0.0) DESC "
             "LIMIT $limit"
         )
     else:
@@ -95,7 +95,7 @@ def get_graph_nodes(
             "       n.path AS path, n.language AS language, "
             "       n.docstring AS docstring, n.summary AS summary, "
             "       n.pagerank AS pagerank "
-            "ORDER BY n.pagerank DESC NULLS LAST "
+            "ORDER BY coalesce(n.pagerank, 0.0) DESC "
             "LIMIT $limit"
         )
 

@@ -34,9 +34,51 @@ def get_graph(
     if layer is not None and layer not in _VALID_LAYERS:
         raise HTTPException(status_code=400, detail=f"Invalid layer '{layer}'. Must be one of: {sorted(_VALID_LAYERS)}")
     if neo4j_client.is_connected():
-        nodes = neo4j_client.run(queries.get_graph_nodes(repo, layer, node_type, limit))
-        edges = neo4j_client.run(queries.get_graph_edges(repo, layer, limit))
-        return {"nodes": nodes, "edges": edges}
+        raw_nodes = neo4j_client.run(queries.get_graph_nodes(repo, layer, node_type, limit))
+        raw_edges = neo4j_client.run(queries.get_graph_edges(repo, layer, limit))
+
+        # Normalize nodes: extract type from labels list, fill missing name/file
+        _LABEL_ORDER = ["BusinessRule", "DomainConcept", "DecisionPoint", "Class", "Function", "File"]
+        def _pick_type(labels: list) -> str:
+            if not labels:
+                return "File"
+            for preferred in _LABEL_ORDER:
+                if preferred in labels:
+                    return preferred
+            return labels[0]
+
+        nodes = []
+        for n in raw_nodes:
+            labels = n.get("labels") or []
+            node_type_val = _pick_type(labels)
+            node_id = n.get("id", "")
+            name = n.get("name") or n.get("path") or (node_id.split("::")[-1] if "::" in node_id else node_id)
+            nodes.append({
+                "id": node_id,
+                "name": name,
+                "type": node_type_val,
+                "file": n.get("path") or (node_id.split("::")[0] if "::" in node_id else None),
+                "summary": n.get("summary"),
+                "docstring": n.get("docstring"),
+                "pagerank": n.get("pagerank"),
+                "language": n.get("language"),
+            })
+
+        # Normalize edges: rename source_id/target_id → source/target
+        edges = []
+        for e in raw_edges:
+            src = e.get("source_id") or e.get("source")
+            tgt = e.get("target_id") or e.get("target")
+            if src and tgt:
+                edges.append({
+                    "id": e.get("id") or f"{src}_{e.get('type','')}_{tgt}",
+                    "source": src,
+                    "target": tgt,
+                    "type": e.get("type", "RELATED_TO"),
+                    "weight": e.get("weight"),
+                })
+
+        return {"nodes": nodes, "edges": edges, "repo": repo}
     cache = _load_graph_cache(repo)
     if cache:
         _TYPE_MAP = {"file": "File", "class": "Class", "function": "Function",
