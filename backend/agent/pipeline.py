@@ -962,6 +962,36 @@ def _find_file_in_repo(repo_path: Path, rel_path: str) -> Path | None:
     return None
 
 
+def _check_graph_staleness(repo_name: str, repo_path: Path | None) -> int:
+    """Return number of commits made since graph.json was last built.
+
+    Returns 0 if graph doesn't exist, repo_path is None, or git is unavailable.
+    A result > 10 means the blast radius data may miss recently added callers.
+    """
+    if not repo_path:
+        return 0
+    try:
+        graph_path = DATA_DIR / repo_name / "graph.json"
+        if not graph_path.exists():
+            return 0
+        from datetime import datetime
+        graph_mtime = graph_path.stat().st_mtime
+        since_dt = datetime.fromtimestamp(graph_mtime).strftime("%Y-%m-%dT%H:%M:%S")
+        result = subprocess.run(
+            ["git", "log", "--oneline", f"--after={since_dt}"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            lines = [l for l in result.stdout.strip().split("\n") if l.strip()]
+            return len(lines)
+    except Exception:
+        pass
+    return 0
+
+
 def _load_graph_data(repo_name: str) -> tuple[dict, dict]:
     """Load graph.json and enriched_nodes.json for a repo."""
     graph_data: dict = {}
@@ -1541,6 +1571,44 @@ def repair_node(state: AgentState) -> AgentState:
                     if content:
                         source_code[key] = content
 
+    # ── Phase 2B: Blast radius — load caller files for multi-file awareness ──
+    repo_name_for_callers = work_order.get("repo_name", "")
+    fault_files_for_callers = localization.get("fault_files", [])
+    fault_fns_for_callers = localization.get("fault_functions", [])
+    caller_files_loaded: list[str] = []
+    if repo_path and fault_files_for_callers and repo_name_for_callers:
+        # Staleness check: warn if graph is > 10 commits old
+        stale = _check_graph_staleness(repo_name_for_callers, repo_path)
+        if stale > 10:
+            logger.warning(
+                "Graph for %s is %d commits stale — blast radius may miss recent callers. "
+                "Re-index: python -m agent.graph.build --repo=%s",
+                repo_name_for_callers, stale, repo_path,
+            )
+        graph_data_c, _ = _load_graph_data(repo_name_for_callers)
+        caller_paths = _find_callers_from_graph(
+            graph_data_c, fault_files_for_callers, fault_fns_for_callers
+        )
+        if not caller_paths:
+            caller_paths = _find_callers_via_grep(repo_path, fault_files_for_callers)
+        source_code = dict(source_code)  # ensure mutable copy if not already
+        fault_file_set = set(fault_files_for_callers)
+        for cp in caller_paths[:5]:
+            key = f"{cp} (caller)"
+            if key in source_code or cp in fault_file_set:
+                continue
+            resolved = _find_file_in_repo(repo_path, cp)
+            if not resolved:
+                resolved_direct = repo_path / cp
+                resolved = resolved_direct if resolved_direct.exists() else None
+            if resolved and resolved.exists():
+                content = _read_file_safe(resolved, max_lines=400)
+                if content:
+                    source_code[key] = content
+                    caller_files_loaded.append(cp)
+                    logger.info("Loaded caller file for blast radius: %s", cp)
+    state["caller_files"] = caller_files_loaded
+
     # Build focused source section — send only target functions, not entire files (Research #23, #4)
     fault_functions = localization.get("fault_functions", [])
     focused_source: dict = {}
@@ -1621,6 +1689,17 @@ def repair_node(state: AgentState) -> AgentState:
             f"and will be rejected. You MUST produce one patch entry for EACH target function.\n"
         )
 
+    # Multi-file caller awareness (Phase 2B-1)
+    caller_instruction = ""
+    if caller_files_loaded:
+        caller_list = ", ".join(f"`{c}`" for c in caller_files_loaded[:5])
+        caller_instruction = (
+            f"\nMULTI-FILE AWARENESS: The CALL SITES shown above ({caller_list}) call the modified "
+            f"functions. If your fix changes a function signature, adds/removes parameters, or "
+            f"renames something, you MUST ALSO produce patches for those caller files. "
+            f"If your fix is purely internal (same public interface), you can omit caller patches.\n"
+        )
+
     # Load past fixes in the same area to guide repair (Change 3: fix history matching)
     repo_name = work_order.get("repo_name", "")
     fix_history_context = ""
@@ -1643,6 +1722,7 @@ EXPECTED: {intent.get('expected_behavior', '')}
 ROOT CAUSE: {localization.get('root_cause_hypothesis', '')}
 TARGET FUNCTIONS: {target_fns} in {target_files}
 {completeness_rule}
+{caller_instruction}
 {criteria_section}
 {feedback_section}
 {fix_history_context}
@@ -1851,6 +1931,110 @@ Produce the RepairResult with this patch now."""
     return state
 
 
+def multi_file_coordinator_node(state: AgentState) -> AgentState:
+    """Stage 4.5: Verify caller files after repair and patch any that need updating.
+
+    After repair_node produces patches for fault files, checks whether the caller
+    files identified by blast radius also need updates (e.g., changed signatures).
+    Produces additional patches for affected callers and merges them into repair state.
+    Non-blocking — failures are logged and the pipeline continues without coordinator patches.
+    """
+    _thread_local.current_stage = "coordinate"
+    repair = state.get("repair", {})
+    caller_files = state.get("caller_files", [])
+
+    # Early exits — nothing to coordinate
+    if not caller_files or not repair.get("patches"):
+        return state
+
+    patches = repair.get("patches", [])
+    patched_files = {p.get("file_path", "") for p in patches}
+    unpatched_callers = [c for c in caller_files if c not in patched_files]
+
+    if not unpatched_callers:
+        logger.info("Coordinator: all %d caller(s) already covered by patches", len(caller_files))
+        return state
+
+    logger.info("Coordinator: %d unpatched caller(s) to check: %s", len(unpatched_callers), unpatched_callers)
+
+    work_order = state.get("work_order", {})
+    localization = state.get("localization", {})
+    repo_path = _resolve_repo_path(work_order)
+    if not repo_path:
+        return state
+
+    # Load source of unpatched callers (cap at 3 to limit token spend)
+    caller_source: dict[str, str] = {}
+    for cp in unpatched_callers[:3]:
+        resolved = _find_file_in_repo(repo_path, cp)
+        if not resolved:
+            direct = repo_path / cp
+            resolved = direct if direct.exists() else None
+        if resolved and resolved.exists():
+            content = _read_file_safe(resolved, max_lines=400)
+            if content:
+                caller_source[cp] = content
+
+    if not caller_source:
+        return state
+
+    patch_summary = "\n".join(
+        f"- {p.get('file_path', '?')}: {repair.get('explanation', 'see fix')}"
+        for p in patches[:5]
+    )
+    caller_sections = "".join(
+        f"\n--- {path} ---\n{code}\n"
+        for path, code in caller_source.items()
+    )
+
+    prompt = f"""A bug fix was applied to {localization.get('fault_files', [])}.
+
+FIX APPLIED:
+{patch_summary}
+EXPLANATION: {repair.get('explanation', '')}
+
+Check if these caller files need updating due to the fix (e.g., renamed function, changed signature):
+
+CALLER FILES:
+{caller_sections}
+
+Rules:
+- If callers DO NOT need changes (fix is internal, same public interface): return empty patches list.
+- If a caller DOES need updating: return a patch with original_code as an EXACT substring of the
+  caller source shown above, and patched_code with only the necessary change.
+- Do NOT patch callers unless the fix directly breaks their call site."""
+
+    try:
+        result = _structured_call("claude-sonnet-4-6", 3000, RepairResult, prompt)
+        caller_patches = []
+        for p in result.patches:
+            fp = p.get("file_path", "")
+            orig = p.get("original_code", "").strip()
+            patched = p.get("patched_code", "").strip()
+            if not fp or not orig or orig == patched:
+                continue
+            if fp not in caller_source:
+                logger.warning("Coordinator: patch for unknown file %s — skipping", fp)
+                continue
+            if orig in caller_source[fp]:
+                caller_patches.append(p)
+                logger.info("Coordinator: verified caller patch for %s", fp)
+            else:
+                logger.warning("Coordinator: patch for %s failed source verification — skipping", fp)
+
+        if caller_patches:
+            updated = dict(repair)
+            updated["patches"] = patches + caller_patches
+            state["repair"] = updated
+            logger.info("Coordinator: added %d caller patch(es) to repair", len(caller_patches))
+        else:
+            logger.info("Coordinator: no caller patches needed")
+    except Exception as e:
+        logger.warning("multi_file_coordinator failed (non-blocking): %s", e)
+
+    return state
+
+
 def _build_reviewer_context(repo_name: str, modified_files: list[str]) -> str:
     """Build independent reviewer context from graph data.
 
@@ -1961,12 +2145,26 @@ def review_node(state: AgentState) -> AgentState:
             f"If any identified fault function is missing a patch, COMPLETENESS must FAIL.\n"
         )
 
+    # Phase 2B-3: surface caller files that were checked by coordinator
+    caller_files_state = state.get("caller_files", [])
+    patched_file_set = {p.get("file_path", "") for p in clean_patches}
+    unpatched_callers_for_review = [c for c in caller_files_state if c not in patched_file_set]
+    caller_completeness_note = ""
+    if unpatched_callers_for_review:
+        caller_completeness_note = (
+            f"\nCALLER FILES NOT PATCHED: {unpatched_callers_for_review}\n"
+            f"These files call the modified code but have no patches. "
+            f"BLAST_RADIUS should FAIL if the fix changes a public interface (signature/name). "
+            f"BLAST_RADIUS can PASS if the fix is purely internal (no interface change).\n"
+        )
+
     prompt = f"""Review this bug fix as an independent reviewer who has NOT seen the developer's code.
 
 BUG: {intent.get('actual_behavior', '')}
 EXPECTED: {intent.get('expected_behavior', '')}
 IDENTIFIED FAULT LOCATIONS: functions={fault_functions} in files={fault_files}
 {completeness_data}
+{caller_completeness_note}
 {criteria_section}
 
 PROPOSED PATCHES:
@@ -1988,7 +2186,9 @@ A correct review produces:
 - COMPLETENESS: FAIL if localization identified {n_fault} fault function(s) but patches cover fewer.
   Count the patches: do they fix ALL of {fault_functions}? If ANY fault function is missing a patch,
   COMPLETENESS = FAIL and verdict MUST be CHANGES_REQUESTED with feedback naming the missing function(s).
-- BLAST_RADIUS passes when downstream consumers (listed above) are not broken
+- BLAST_RADIUS: FAIL if the fix changes a public interface (function signature, parameter names,
+  return type) AND caller files listed in CALLER FILES NOT PATCHED are present but have no patches.
+  PASS if the fix is purely internal (same public interface) OR all affected callers are patched.
 - TESTS passes when test_patches contains real test code covering the fix
 - verdict: APPROVE only if ALL checks pass. CHANGES_REQUESTED if any check is FAIL. ESCALATE if too complex."""
 
@@ -2769,6 +2969,7 @@ def build_agent_graph():
     graph.add_node("intake", intake_node)
     graph.add_node("exploration", exploration_node)
     graph.add_node("repair", repair_node)
+    graph.add_node("multi_file_coordinator", multi_file_coordinator_node)
     graph.add_node("review", review_node)
     graph.add_node("test", test_node)
     graph.add_node("create_pr", pr_creation_node)
@@ -2777,7 +2978,8 @@ def build_agent_graph():
 
     graph.add_edge("intake", "exploration")
     graph.add_edge("exploration", "repair")
-    graph.add_edge("repair", "review")
+    graph.add_edge("repair", "multi_file_coordinator")
+    graph.add_edge("multi_file_coordinator", "review")
     graph.add_conditional_edges(
         "review",
         should_iterate,
@@ -2833,6 +3035,7 @@ def run_ticket(
         "base_branch": "",
         "patches_applied": 0,
         "exploration_log": [],
+        "caller_files": [],
     }
 
     try:

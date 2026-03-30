@@ -15,6 +15,7 @@ from agent.pipeline import (
     should_iterate,
     MAX_ITERATIONS,
     build_agent_graph,
+    multi_file_coordinator_node,
 )
 from agent.types import PipelineStatus
 
@@ -85,7 +86,10 @@ class TestGraphStructure:
             node_names = set(graph.nodes.keys()) if isinstance(graph.nodes, dict) else set()
             if not node_names:
                 return  # LangGraph version doesn't expose nodes dict — skip
-            expected = ["intake", "exploration", "repair", "review", "test", "create_pr", "escalate"]
+            expected = [
+                "intake", "exploration", "repair", "multi_file_coordinator",
+                "review", "test", "create_pr", "escalate",
+            ]
             for node in expected:
                 assert node in node_names, f"Missing node: {node}"
             # RAG-mode nodes must not exist
@@ -133,3 +137,62 @@ class TestPipelineStatus:
 
     def test_failed(self):
         assert PipelineStatus.FAILED.value == "failed"
+
+
+# ── Multi-File Coordinator ────────────────────────────────────────────
+
+class TestMultiFileCoordinator:
+    """multi_file_coordinator_node: early-return paths that don't require LLM calls."""
+
+    def _base_state(self, **overrides):
+        state = {
+            "repair": {"patches": [{"file_path": "service.py", "original_code": "x", "patched_code": "y"}], "explanation": "fix"},
+            "caller_files": [],
+            "work_order": {},
+            "localization": {},
+        }
+        state.update(overrides)
+        return state
+
+    def test_no_caller_files_returns_unchanged(self):
+        """Empty caller_files → coordinator is a no-op."""
+        state = self._base_state(caller_files=[])
+        result = multi_file_coordinator_node(state)
+        assert result["repair"] == state["repair"]
+
+    def test_no_patches_returns_unchanged(self):
+        """Empty repair (no patches) → coordinator is a no-op."""
+        state = self._base_state(repair={}, caller_files=["router.py"])
+        result = multi_file_coordinator_node(state)
+        assert result.get("repair", {}) == {}
+
+    def test_all_callers_already_patched_returns_unchanged(self):
+        """All caller files have patches → coordinator is a no-op, no LLM call."""
+        state = self._base_state(
+            repair={
+                "patches": [
+                    {"file_path": "service.py", "original_code": "x", "patched_code": "y"},
+                    {"file_path": "router.py",  "original_code": "a", "patched_code": "b"},
+                ],
+                "explanation": "renamed fn",
+            },
+            caller_files=["router.py"],  # already in patches
+        )
+        result = multi_file_coordinator_node(state)
+        assert len(result["repair"]["patches"]) == 2  # no additions
+
+    def test_multiple_callers_all_patched_returns_unchanged(self):
+        """Multiple callers, all covered — still a no-op."""
+        state = self._base_state(
+            repair={
+                "patches": [
+                    {"file_path": "service.py", "original_code": "x", "patched_code": "y"},
+                    {"file_path": "router.py",  "original_code": "a", "patched_code": "b"},
+                    {"file_path": "views.py",   "original_code": "c", "patched_code": "d"},
+                ],
+                "explanation": "fix",
+            },
+            caller_files=["router.py", "views.py"],
+        )
+        result = multi_file_coordinator_node(state)
+        assert len(result["repair"]["patches"]) == 3

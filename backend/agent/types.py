@@ -123,3 +123,4 @@ class AgentState(TypedDict, total=False):
     base_branch: str          # Original branch for PR base
     patches_applied: int      # Number of patches applied
     exploration_log: list     # Tool calls + results from exploration phase
+    caller_files: list        # Caller file paths discovered for blast radius (Phase 2B)
