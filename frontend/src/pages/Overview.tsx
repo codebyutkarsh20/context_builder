@@ -382,7 +382,7 @@ export default function Overview() {
                               </span>
                             </div>
                           </div>
-                          <span className="text-xs font-mono text-zinc-500 shrink-0">{h.pagerank.toFixed(3)}</span>
+                          <span className="text-xs font-mono text-zinc-500 shrink-0">{(h.pagerank ?? 0).toFixed(3)}</span>
                         </div>
                       ))}
                     </div>

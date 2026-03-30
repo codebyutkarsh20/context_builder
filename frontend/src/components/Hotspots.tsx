@@ -75,10 +75,10 @@ function DetailPanel({ hotspot, onClose }: DetailPanelProps) {
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-2xl font-bold text-zinc-100 font-mono">
-                {hotspot.pagerank.toFixed(4)}
+                {(hotspot.pagerank ?? 0).toFixed(4)}
               </span>
               <span className="text-xs text-zinc-500">
-                {(hotspot.pagerank * 100).toFixed(2)}%
+                {((hotspot.pagerank ?? 0) * 100).toFixed(2)}%
               </span>
             </div>
             <div className="h-2 bg-zinc-700 rounded-full overflow-hidden">
@@ -126,7 +126,7 @@ export default function Hotspots({ hotspots, loading, error }: HotspotsProps) {
     )
   }
 
-  const maxPagerank = Math.max(...hotspots.map((h) => h.pagerank), 0.001)
+  const maxPagerank = Math.max(...hotspots.map((h) => h.pagerank ?? 0), 0.001)
 
   return (
     <>
@@ -186,11 +186,11 @@ export default function Hotspots({ hotspots, loading, error }: HotspotsProps) {
                     <div className="flex-1 h-1.5 bg-zinc-700 rounded-full overflow-hidden">
                       <div
                         className="h-full rounded-full bg-gradient-to-r from-blue-600 to-blue-400"
-                        style={{ width: `${(h.pagerank / maxPagerank) * 100}%` }}
+                        style={{ width: `${((h.pagerank ?? 0) / maxPagerank) * 100}%` }}
                       />
                     </div>
                     <span className="text-xs text-zinc-400 font-mono w-14 text-right">
-                      {h.pagerank.toFixed(4)}
+                      {(h.pagerank ?? 0).toFixed(4)}
                     </span>
                   </div>
                 </td>

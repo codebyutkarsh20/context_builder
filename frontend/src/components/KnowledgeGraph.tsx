@@ -499,7 +499,7 @@ export default function KnowledgeGraph({ nodes, edges, onNodeClick, onMount, loa
                 {hoveredNodeData.summary}
               </p>
             )}
-            {hoveredNodeData.pagerank !== undefined && (
+            {hoveredNodeData.pagerank != null && (
               <div className="flex items-center gap-2 mt-2">
                 <div className="flex-1 h-1 bg-zinc-800 rounded-full overflow-hidden">
                   <div className="h-full rounded-full transition-all"

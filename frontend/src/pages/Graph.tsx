@@ -143,7 +143,7 @@ function NodeDetail({ node, allNodes, allEdges, onClose, onJump }: NodeDetailPro
           )}
 
           {/* PageRank */}
-          {node.pagerank !== undefined && (
+          {node.pagerank != null && (
             <div>
               <p className="text-[10px] font-bold text-zinc-600 uppercase tracking-widest mb-1.5">PageRank Score</p>
               <div className="flex items-center gap-3">
