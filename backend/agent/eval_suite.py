@@ -126,7 +126,7 @@ def _run_single_case(work_order: dict) -> dict:
     from agent.trace import RunTrace
 
     trace = RunTrace(job_id=work_order["ticket_id"])
-    result = run_ticket(work_order, trace=trace)
+    result = run_ticket(work_order, trace=trace, dry_run=True)
     result["_trace"] = trace.to_report()
     return result
 

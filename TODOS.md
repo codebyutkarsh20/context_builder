@@ -2,12 +2,6 @@
 
 ## Active
 
-### P1 — Jira project prefix must be configurable
-**What:** `mine_failure_records()` uses `PROJ-\d+` regex as Jira reference pattern placeholder. The actual project prefix for any target repo is unknown until configured.
-**Why:** Without the correct prefix, all Jira-referenced FailureRecords are missed — only keyword-classified commits (hotfix/incident/bug) survive. Destroys precision of the feature.
-**Context:** In `backend/graph/business/failure_records.py` (Phase 2). Make configurable via `JIRA_PROJECT_PREFIX` env var or per-repo config. Default to no-op if unset (keyword-only mode).
-**Depends on:** Phase 2 shipped.
-
 ### P2 — Validate ENFORCED_BY edge precision before production use
 **What:** Run `BusinessLogicExtractor` on 20 manually annotated functions, measure precision/recall of ENFORCED_BY edges. Gate business context injection on >80% precision.
 **Why:** The extractor links rules to functions by docstring keyword matching. If precision is low (<80%), repair prompts get noisy rule context that degrades fix quality (-3% per research findings).
@@ -26,7 +20,17 @@
 **Context:** Explicitly deferred (Approach C) in design doc — cold start requires 5-10 real agent PRs to produce useful data. Completeness 7/10 vs Approach B's 9/10 because of cold start.
 **Depends on:** Wedge demo shipped + 5-10 real agent PRs merged via Phase 3.
 
+### P5 — Extract external side effects behind interface (dependency inversion)
+**What:** `pr_creation_node()` has multiple external side effects (git push, gh pr create, feature flags, _enrich_from_fix) each guarded by `if not dry_run`. Extract behind a thin interface and no-op in test/eval mode.
+**Why:** The boolean-flag approach works for 3-4 calls but creates maintenance burden as new side effects are added. Forgetting a guard is a silent bug.
+**Context:** Identified by outside voice during eng review (2026-03-30). Current dry_run guards are: git push, feature flag creation, PR creation, enrichment. Each new external call needs a manual guard. Standard dependency inversion pattern.
+**Depends on:** Production validation shipped (current sprint).
+
 ## Completed
+
+### P1 — Jira project prefix must be configurable
+**Completed:** Already implemented (discovered 2026-03-30 during eng review)
+`failure_records.py:37`: `JIRA_PROJECT_PREFIX` env var with default `PROJ`. Tests at `test_failure_records.py:54`.
 
 ### P0 — Bug: `repo_path` missing from `/api/repos` response
 **Completed:** v0.1.1.0 (2026-03-29)

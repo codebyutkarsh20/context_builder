@@ -124,3 +124,4 @@ class AgentState(TypedDict, total=False):
     patches_applied: int      # Number of patches applied
     exploration_log: list     # Tool calls + results from exploration phase
     caller_files: list        # Caller file paths discovered for blast radius (Phase 2B)
+    dry_run: bool             # Skip PR creation + feature flags, return patch + PR body only

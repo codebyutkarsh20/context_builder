@@ -174,6 +174,7 @@ class RunTicketRequest(BaseModel):
     priority: str = "medium"
     comments: list[str] = Field(default_factory=list)
     debug: bool = False  # Enable tracing/observability
+    dry_run: bool = False  # Run pipeline but skip PR creation + feature flags
 
     @model_validator(mode="after")
     def require_ticket_or_description(self) -> "RunTicketRequest":
@@ -249,11 +250,11 @@ def run_agent(req: RunTicketRequest) -> dict:
         }
 
     thread = threading.Thread(
-        target=_run_pipeline, args=(job_id, work_order, req.debug), daemon=True,
+        target=_run_pipeline, args=(job_id, work_order, req.debug, req.dry_run), daemon=True,
     )
     thread.start()
 
-    return {"job_id": job_id, "status": "pending", "debug": req.debug}
+    return {"job_id": job_id, "status": "pending", "debug": req.debug, "dry_run": req.dry_run}
 
 
 @router.get("/agent/status/{job_id}")
@@ -573,7 +574,7 @@ def _make_progress_callback(job_id: str):
     return callback
 
 
-def _run_pipeline(job_id: str, work_order: dict, debug: bool = False) -> None:
+def _run_pipeline(job_id: str, work_order: dict, debug: bool = False, dry_run: bool = False) -> None:
     """Run the LangGraph pipeline in a background thread."""
     trace = None
     try:
@@ -591,7 +592,7 @@ def _run_pipeline(job_id: str, work_order: dict, debug: bool = False) -> None:
         from agent.pipeline import run_ticket
 
         progress_cb = _make_progress_callback(job_id)
-        result = run_ticket(work_order, progress_cb=progress_cb, trace=trace)
+        result = run_ticket(work_order, progress_cb=progress_cb, trace=trace, dry_run=dry_run)
 
         # Determine final status from pipeline outcome
         pipeline_status = result.get("status", "done")

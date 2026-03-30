@@ -46,7 +46,7 @@ pip install -r backend/requirements.txt
 pytest tests/ -v                                    # All tests
 pytest tests/test_localization.py -v                # Single module
 python -m agent.run --ticket=PROJ-1234 --dry-run    # Test on one ticket
-python -m agent.graph.build --repo=/path/to/repo    # Build knowledge graph
+cd backend && python cli.py build /path/to/repo       # Build knowledge graph
 python -m agent.eval.run --dataset=eval/bugs.json   # Run eval suite
 ```
 ## Key Design Rules

@@ -181,6 +181,17 @@ def build(
         persist_rules_to_file(rules, out_dir_br / "business_rules.json")
         console.print(f"  [green]✓[/green] {rules_count} business rules extracted")
 
+        # Mine failure records from git history
+        progress.update(task, description="[cyan]Mining failure records...", completed=82)
+        from graph.business.failure_records import mine_failure_records, persist_failure_records
+        fr = mine_failure_records(path)
+        if fr:
+            if not no_neo4j:
+                persist_failure_records(fr, repo_name)
+            console.print(f"  [green]✓[/green] {len(fr)} failure records mined from git history")
+        else:
+            console.print(f"  [dim]  ℹ Failure records: 0 (set ENABLE_FAILURE_RECORDS=true to enable)[/dim]")
+
         # Save enriched nodes + build embeddings
         progress.update(task, description="[cyan]Building enriched node cache...", completed=85)
         from embeddings.embedder import build_enriched_nodes, NodeEmbedder
