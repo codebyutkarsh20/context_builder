@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent.pipeline import _BINARY_EXTENSIONS, read_source_node, _redact_secrets
+from agent.pipeline import _BINARY_EXTENSIONS, _read_file_safe, _redact_secrets
 from agent.types import PipelineStatus
 
 
@@ -134,102 +134,62 @@ class TestBinaryExtensions:
         assert '.md' not in _BINARY_EXTENSIONS
 
 
-class TestReadSourceNodeBinarySafety:
-    """read_source_node skips binary files and handles UnicodeDecodeError."""
+class TestReadFileSafeBinarySafety:
+    """_read_file_safe skips binary files and handles errors gracefully."""
 
     def test_skips_binary_by_extension(self, tmp_repo):
-        """Binary files listed in localization are skipped."""
-        state = {
-            "work_order": {"repo_name": "test", "repo_path": str(tmp_repo)},
-            "localization": {"fault_files": ["binary_file.pyc", "image.png", "app.py"]},
-            "status": "",
-        }
-        result = read_source_node(state)
-        source = result["source_code"]
+        """Binary files return None from _read_file_safe."""
+        pyc_file = tmp_repo / "compiled.pyc"
+        pyc_file.write_bytes(b"fake pyc content")
+        assert _read_file_safe(pyc_file) is None
 
-        assert "binary_file.pyc" not in source
-        assert "image.png" not in source
-        assert "app.py" in source
+        png_file = tmp_repo / "image.png"
+        png_file.write_bytes(b"\x89PNG\r\n")
+        assert _read_file_safe(png_file) is None
+
+    def test_reads_valid_python_file(self, tmp_repo):
+        """Normal Python files are read successfully."""
+        py_file = tmp_repo / "app.py"
+        py_file.write_text("def hello():\n    return 'world'\n")
+        result = _read_file_safe(py_file)
+        assert result is not None
+        assert "def hello" in result
 
     def test_handles_unicode_decode_error(self, tmp_repo):
-        """Files that fail UTF-8 decode are skipped gracefully."""
-        # Write a file with invalid UTF-8
+        """Files with invalid UTF-8 return None gracefully."""
         bad_file = tmp_repo / "broken.py"
         bad_file.write_bytes(b'\x80\x81\x82\x83' * 100)
-
-        state = {
-            "work_order": {"repo_name": "test", "repo_path": str(tmp_repo)},
-            "localization": {"fault_files": ["broken.py", "app.py"]},
-            "status": "",
-        }
-        result = read_source_node(state)
-        source = result["source_code"]
-
-        assert "broken.py" not in source  # skipped due to decode error
-        assert "app.py" in source  # still read successfully
-
-    def test_caps_at_5_files(self, tmp_repo):
-        """Only first 5 files are read."""
-        for i in range(10):
-            (tmp_repo / f"file{i}.py").write_text(f"x = {i}")
-
-        state = {
-            "work_order": {"repo_name": "test", "repo_path": str(tmp_repo)},
-            "localization": {"fault_files": [f"file{i}.py" for i in range(10)]},
-            "status": "",
-        }
-        result = read_source_node(state)
-        file_keys = [k for k in result["source_code"] if not k.startswith("__")]
-        assert len(file_keys) <= 5
+        result = _read_file_safe(bad_file)
+        assert result is None
 
     def test_truncates_long_files(self, tmp_repo):
-        """Files longer than the max line limit are truncated."""
-        # read_source_node uses max_lines=3000, so file must exceed that
-        long_content = "\n".join(f"line_{i} = {i}" for i in range(4000))
-        (tmp_repo / "long.py").write_text(long_content)
-
-        state = {
-            "work_order": {"repo_name": "test", "repo_path": str(tmp_repo)},
-            "localization": {"fault_files": ["long.py"]},
-            "status": "",
-        }
-        result = read_source_node(state)
-        content = result["source_code"]["long.py"]
-        lines = content.strip().split("\n")
-        # Should be truncated below the original 4000 lines
+        """Files over max_lines are truncated."""
+        long_file = tmp_repo / "long.py"
+        long_file.write_text("\n".join(f"line_{i} = {i}" for i in range(4000)))
+        result = _read_file_safe(long_file, max_lines=500)
+        assert result is not None
+        lines = result.strip().split("\n")
         assert len(lines) < 4000
-        assert "truncated" in content or "omitted" in content
+        assert "truncated" in result
 
     def test_redacts_secrets_in_source(self, tmp_repo):
-        """Secrets in source code are redacted."""
-        state = {
-            "work_order": {"repo_name": "test", "repo_path": str(tmp_repo)},
-            "localization": {"fault_files": ["utils.py"]},
-            "status": "",
-        }
-        result = read_source_node(state)
-        content = result["source_code"]["utils.py"]
+        """Secrets in source files are redacted before return."""
+        utils_file = tmp_repo / "utils.py"
+        utils_file.write_text(
+            'api_key = "sk-1234567890abcdefghij"\npassword = "SuperSecret123456789"\n'
+        )
+        result = _read_file_safe(utils_file)
+        assert result is not None
+        assert "sk-1234567890abcdefghij" not in result
+        assert "SuperSecret123456789" not in result
+        assert "***REDACTED***" in result
 
-        assert "sk-1234567890abcdefghij" not in content
-        assert "SuperSecret123456789" not in content
-        assert "***REDACTED***" in content
-
-    def test_no_repo_path_returns_empty(self):
-        """If repo path can't be resolved, return empty source_code."""
-        state = {
-            "work_order": {"repo_name": "nonexistent", "repo_path": "/does/not/exist"},
-            "localization": {"fault_files": ["app.py"]},
-            "status": "",
-        }
-        result = read_source_node(state)
-        assert result["source_code"] == {}
-
-    def test_file_search_with_glob(self, tmp_repo):
-        """Files found via rglob when exact path doesn't match."""
-        state = {
-            "work_order": {"repo_name": "test", "repo_path": str(tmp_repo)},
-            "localization": {"fault_files": ["models.py"]},  # actually in src/models.py
-            "status": "",
-        }
-        result = read_source_node(state)
-        assert "models.py" in result["source_code"]
+    def test_focus_lines_windowing(self, tmp_repo):
+        """Focus lines produce windowed output with gap markers."""
+        content = "\n".join(f"line_{i} = {i}" for i in range(1000))
+        f = tmp_repo / "big.py"
+        f.write_text(content)
+        result = _read_file_safe(f, max_lines=100, focus_lines=[500])
+        assert result is not None
+        # Should contain lines near 500, not the full file
+        assert "line_500" in result

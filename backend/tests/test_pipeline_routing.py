@@ -12,55 +12,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.pipeline import (
-    should_read_source_or_escalate,
     should_iterate,
-    MIN_CONFIDENCE_TO_REPAIR,
     MAX_ITERATIONS,
     build_agent_graph,
 )
 from agent.types import PipelineStatus
 
-
-# ── Confidence Gate ──────────────────────────────────────────────────
-
-class TestConfidenceGate:
-    """Localization confidence gate routing."""
-
-    def test_high_confidence_proceeds(self):
-        state = {"localization": {"confidence": 0.9, "fault_files": ["app.py"]}}
-        assert should_read_source_or_escalate(state) == "read_source"
-
-    def test_threshold_confidence_proceeds(self):
-        state = {"localization": {"confidence": MIN_CONFIDENCE_TO_REPAIR, "fault_files": ["app.py"]}}
-        assert should_read_source_or_escalate(state) == "read_source"
-
-    def test_low_confidence_escalates(self):
-        state = {"localization": {"confidence": 0.1, "fault_files": ["app.py"]}}
-        assert should_read_source_or_escalate(state) == "escalate"
-
-    def test_zero_confidence_escalates(self):
-        state = {"localization": {"confidence": 0.0, "fault_files": ["app.py"]}}
-        assert should_read_source_or_escalate(state) == "escalate"
-
-    def test_no_fault_files_escalates(self):
-        state = {"localization": {"confidence": 0.9, "fault_files": []}}
-        assert should_read_source_or_escalate(state) == "escalate"
-
-    def test_missing_localization_escalates(self):
-        state = {"localization": {}}
-        assert should_read_source_or_escalate(state) == "escalate"
-
-    def test_empty_state_escalates(self):
-        state = {}
-        assert should_read_source_or_escalate(state) == "escalate"
-
-    def test_just_below_threshold_escalates(self):
-        state = {"localization": {"confidence": MIN_CONFIDENCE_TO_REPAIR - 0.01, "fault_files": ["f.py"]}}
-        assert should_read_source_or_escalate(state) == "escalate"
-
-    def test_just_above_threshold_proceeds(self):
-        state = {"localization": {"confidence": MIN_CONFIDENCE_TO_REPAIR + 0.01, "fault_files": ["f.py"]}}
-        assert should_read_source_or_escalate(state) == "read_source"
 
 
 # ── Review Loop ──────────────────────────────────────────────────────
@@ -124,27 +81,16 @@ class TestGraphStructure:
 
     def test_graph_has_all_nodes(self):
         graph = build_agent_graph()
-        # LangGraph compiled graph stores nodes internally.
-        # The exact node set depends on AGENT_MODE:
-        #   "explore"      → exploration node replaces context_assembly/localization/read_source
-        #   anything else  → classic context_assembly + localization + read_source nodes
         if hasattr(graph, 'nodes'):
             node_names = set(graph.nodes.keys()) if isinstance(graph.nodes, dict) else set()
             if not node_names:
                 return  # LangGraph version doesn't expose nodes dict — skip
-
-            # Nodes common to both modes
-            common = ["intake", "repair", "review", "test", "create_pr", "escalate"]
-            for expected in common:
-                assert expected in node_names, f"Missing node: {expected}"
-
-            # Mode-dependent nodes
-            is_explore_mode = "exploration" in node_names
-            if is_explore_mode:
-                assert "exploration" in node_names
-            else:
-                for expected in ["context_assembly", "localization", "read_source"]:
-                    assert expected in node_names, f"Missing node: {expected}"
+            expected = ["intake", "exploration", "repair", "review", "test", "create_pr", "escalate"]
+            for node in expected:
+                assert node in node_names, f"Missing node: {node}"
+            # RAG-mode nodes must not exist
+            for removed in ["context_assembly", "localization", "read_source"]:
+                assert removed not in node_names, f"Removed node still present: {removed}"
 
 
 # ── PipelineStatus Enum ──────────────────────────────────────────────

@@ -54,7 +54,6 @@ from graph.neo4j_client import neo4j_client
 logger = logging.getLogger(__name__)
 
 MAX_ITERATIONS = 3
-MIN_CONFIDENCE_TO_REPAIR = 0.6  # Raised to 0.6 — low-confidence localization produces wrong patches
 INTAKE_MODEL = "claude-haiku-4-5-20251001"  # Intake is a structured translation task — Haiku is sufficient
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 
@@ -417,68 +416,177 @@ flag name should log a warning message"."""
     return state
 
 
-def context_assembly_node(state: AgentState) -> AgentState:
-    """Stage 2: Query Graph RAG to assemble targeted context."""
-    _thread_local.current_stage = "context_assembly"
-    trace = _get_trace()
-    if trace:
-        trace.stage_start("context_assembly")
-    logger.info("=== CONTEXT ASSEMBLY: Building targeted context via Graph RAG ===")
-    state["status"] = PipelineStatus.CONTEXT
-    _report_progress(state)
 
-    work_order = state.get("work_order", {})
-    intent = state.get("intent", {})
-    repo_name = work_order.get("repo_name", "")
+def _build_kickstart_context(
+    repo_name: str,
+    repo_path: str | None,
+    intent: dict,
+    data_dir: Path,
+) -> str:
+    """Build orientation context for exploration from graph + vector + failure signals.
 
-    search_terms = []
-    search_terms.append(intent.get("actual_behavior", ""))
-    search_terms.extend(intent.get("likely_affected_modules", []))
-    search_terms.extend(intent.get("likely_affected_functions", []))
-    query = " ".join(search_terms)
+    Non-prescriptive: orients the agent on the terrain without telling it where the bug is.
+    All sections are best-effort — any individual signal failing is silently skipped.
+    """
+    sections: list[str] = []
+    hint_files = [f for f in intent.get("likely_affected_modules", [])[:5] if f]
+    hint_functions = [f for f in intent.get("likely_affected_functions", [])[:5] if f]
+    bug_query = " ".join(filter(None, [
+        intent.get("actual_behavior", ""),
+        intent.get("expected_behavior", ""),
+    ]))
 
+    # 1. Vector search — semantically similar code to the bug description
     try:
-        from rag.retriever import GraphRAGRetriever
-        from rag.context_assembler import ContextAssembler
+        from embeddings.embedder import NodeEmbedder
+        embedder = NodeEmbedder(repo_name, data_dir)
+        results = embedder.query(bug_query, n_results=5)
+        if results:
+            lines = []
+            for r in results:
+                meta = r.get("metadata", {})
+                name = meta.get("name") or r.get("id", "?")
+                file_ = meta.get("file", "")
+                doc = (meta.get("docstring") or "")[:80]
+                lines.append(f"  - {file_}::{name}" + (f" — {doc}" if doc else ""))
+            sections.append(
+                "SEMANTICALLY SIMILAR CODE (vector search on bug description):\n" + "\n".join(lines)
+            )
+    except Exception:
+        pass
 
-        retriever = GraphRAGRetriever(repo_name, DATA_DIR)
-        result = retriever.retrieve(query, max_nodes=40)
+    # 2. Graph neighbors of hint area — Neo4j first, fallback to graph.json
+    try:
+        neighbors: list[str] = []
+        queried_via_neo4j = False
 
-        assembler = ContextAssembler(repo_name, DATA_DIR)
-        context = assembler.assemble(
-            primary_ids=result.primary_nodes,
-            expanded_ids=result.expanded_nodes,
-            edges=result.edges,
-            scores=result.scores,
-            token_budget=20000,
-        )
+        if neo4j_client.is_connected() and (hint_files or hint_functions):
+            try:
+                rows = neo4j_client.run(
+                    "MATCH (a)-[r:CALLS|IMPORTS]->(b) "
+                    "WHERE (a.path IN $files OR b.path IN $files "
+                    "       OR a.name IN $funcs OR b.name IN $funcs) "
+                    "RETURN a.path AS src_file, a.name AS src_name, "
+                    "       b.path AS tgt_file, b.name AS tgt_name, type(r) AS rel "
+                    "LIMIT 15",
+                    {"files": hint_files, "funcs": hint_functions},
+                )
+                if rows:
+                    queried_via_neo4j = True
+                    for row in rows:
+                        src = f"{row.get('src_file', '?')}::{row.get('src_name', '?')}"
+                        tgt = f"{row.get('tgt_file', '?')}::{row.get('tgt_name', '?')}"
+                        neighbors.append(f"  - {src} —[{row.get('rel','CALLS')}]→ {tgt}")
+            except Exception:
+                pass
 
-        state["context"] = context
-        state["context_nodes"] = len(result.all_node_ids)
-        logger.info("Context assembled: %d nodes, ~%d tokens", len(result.all_node_ids), len(context) // 4)
+        if not queried_via_neo4j:
+            graph_data, _ = _load_graph_data(repo_name)
+            for f in _find_callers_from_graph(graph_data, hint_files, hint_functions)[:8]:
+                neighbors.append(f"  - {f}")
 
-    except Exception as e:
-        logger.warning("Graph RAG failed, falling back to summary: %s", e)
-        summary_path = DATA_DIR / repo_name / "summary.md"
-        if summary_path.exists():
-            state["context"] = summary_path.read_text()
-        else:
-            state["context"] = "No context available."
-        state["context_nodes"] = 0
+        if neighbors:
+            sections.append(
+                "GRAPH NEIGHBORS of hint area (callers / callees):\n" + "\n".join(neighbors[:12])
+            )
+    except Exception:
+        pass
 
-    if trace:
-        trace.stage_end("context_assembly")
-    return state
+    # 3. Past failures scoped to hint files
+    try:
+        failure_lines: list[str] = []
+        if neo4j_client.is_connected() and hint_files:
+            for file_path in hint_files[:3]:
+                rows = neo4j_client.run(
+                    "MATCH (fr:FailureRecord)-[:RESULTED_IN_CHANGE]->(n) "
+                    "WHERE (n:Function OR n:File) "
+                    "  AND n.path ENDS WITH $file AND fr.repo = $repo "
+                    "RETURN fr.message AS message, fr.date AS date, fr.issue_ref AS ref "
+                    "ORDER BY fr.date DESC LIMIT 3",
+                    {"file": file_path, "repo": repo_name},
+                )
+                for row in rows:
+                    ref = f" ({row['ref']})" if row.get("ref") else ""
+                    failure_lines.append(
+                        f"  - [{row.get('date', '?')}]{ref} {row.get('message', '')[:120]}"
+                    )
+        if failure_lines:
+            sections.append("PAST FAILURES in hint area:\n" + "\n".join(failure_lines))
+    except Exception:
+        pass
+
+    # 4. Business rules linked to hint files/functions
+    try:
+        rules_path = data_dir / repo_name / "business_rules.json"
+        if rules_path.exists():
+            all_rules = json.loads(rules_path.read_text())
+            relevant = [
+                r for r in all_rules
+                if any(
+                    h in r.get("file", "") or h in r.get("function_id", "")
+                    for h in hint_files + hint_functions
+                )
+            ][:8]
+            if relevant:
+                lines = [
+                    f"  - [{r.get('severity', '?').upper()}] {r.get('description', '')[:120]}"
+                    for r in relevant
+                ]
+                sections.append(
+                    "BUSINESS RULES (linked to hint area — keep in mind while exploring):\n"
+                    + "\n".join(lines)
+                )
+    except Exception:
+        pass
+
+    # 5. PageRank hotspots — most central functions in this repo (orientation map)
+    try:
+        graph_data, _ = _load_graph_data(repo_name)
+        hotspots = sorted(
+            [n for n in graph_data.get("nodes", [])
+             if n.get("type") == "function" and n.get("pagerank", 0) > 0],
+            key=lambda n: n.get("pagerank", 0),
+            reverse=True,
+        )[:8]
+        if hotspots:
+            lines = [
+                f"  - {h.get('id', '?')} (rank: {h.get('pagerank', 0):.3f})"
+                for h in hotspots
+            ]
+            sections.append(
+                "REPO HOTSPOTS (most central functions — not necessarily the bug):\n"
+                + "\n".join(lines)
+            )
+    except Exception:
+        pass
+
+    # 6. Git recency for hint files
+    try:
+        if repo_path and hint_files:
+            recent: list[str] = []
+            for f in hint_files:
+                score = _get_file_recency_score(repo_path, f)
+                if score >= 2.0:
+                    label = "last week" if score >= 3.0 else "last month"
+                    recent.append(f"  - {f} (changed in {label})")
+            if recent:
+                sections.append("RECENTLY CHANGED (higher bug probability):\n" + "\n".join(recent))
+    except Exception:
+        pass
+
+    if not sections:
+        return ""
+    return (
+        "\n\nORIENTATION (starting map — explore freely, don't be constrained by this):\n\n"
+        + "\n\n".join(sections)
+    )
 
 
 def exploration_node(state: AgentState) -> AgentState:
-    """Stage 2b: Agentic exploration — agent uses tools to find the bug itself.
+    """Stage 2: Agentic exploration — agent uses tools to find the bug itself.
 
-    Like Claude Code: the agent gets grep, read_file, read_function, list_files,
-    search_code, get_function_info. It explores until confident, then summarises
-    what it found (fault files, functions, source snippets) into state.
-
-    Replaces the old context_assembly + localization + read_source combo.
+    Kick-started with graph + vector + failure signals as orientation context,
+    then explores freely with grep/read/search tools.
     """
     _thread_local.current_stage = "exploration"
     trace = _get_trace()
@@ -494,31 +602,26 @@ def exploration_node(state: AgentState) -> AgentState:
     repo_path = _resolve_repo_path(work_order)
 
     if not repo_path:
-        logger.warning("No repo_path — falling back to context_assembly")
-        return context_assembly_node(state)
+        logger.warning("No repo_path in work order — exploration requires a local repo path")
+        state["localization"] = {
+            "fault_files": [],
+            "fault_functions": intent.get("likely_affected_functions", []),
+            "fault_classes": [],
+            "root_cause_hypothesis": "Could not explore: no repo_path provided.",
+            "confidence": 0.0,
+            "evidence": [],
+        }
+        return state
 
     # Set per-run context for tools
     from agent.explore_tools import set_context, ALL_TOOLS
     set_context(repo_name, repo_path, DATA_DIR)
 
-    # Load non-inferable business rules for this repo (Finding #4: only non-inferable context helps)
-    business_context = ""
-    try:
-        br_path = DATA_DIR / repo_name / "business_rules.json"
-        if br_path.exists():
-            import json as _json
-            br_data = _json.loads(br_path.read_text())
-            if br_data:
-                top_rules = [
-                    f"  - [{r.get('source', r.get('rule_type', 'rule'))}] "
-                    f"{r.get('description', r.get('content', ''))[:120]}"
-                    for r in br_data[:10]
-                ]
-                business_context = "\nBUSINESS RULES (non-inferable — cannot be discovered from code):\n" + "\n".join(top_rules)
-    except Exception:
-        pass
+    # Build orientation context from graph + vector + failure signals
+    kickstart_context = _build_kickstart_context(
+        repo_name, str(repo_path), intent, DATA_DIR
+    )
 
-    # End-state prompt (Findings #5, #7, #10: no file tree, no step-by-step, describe outcome)
     system_prompt = f"""You are debugging a production bug in repo `{repo_name}` at `{repo_path}`.
 
 You have tools: grep_repo, read_file, read_function, list_files, search_code, get_function_info, get_file_structure.
@@ -529,7 +632,7 @@ A successful exploration ends with you writing a summary that contains:
 - The relevant source code of the buggy function(s) and their callers
 
 Stop exploring as soon as you have enough evidence. Do not read files you don't need.
-{business_context}
+{kickstart_context}
 """
 
     user_message = f"""Bug: {work_order.get('title', '')}
@@ -780,68 +883,6 @@ def _get_file_recency_score(repo_path: str | None, file_path: str) -> float:
         pass
     return 1.0
 
-
-def localization_node(state: AgentState) -> AgentState:
-    """Stage 3: Localize the fault using structured output."""
-    _thread_local.current_stage = "localization"
-    trace = _get_trace()
-    if trace:
-        trace.stage_start("localization")
-    logger.info("=== LOCALIZATION: Finding the fault site ===")
-    state["status"] = PipelineStatus.LOCALIZING
-    _report_progress(state)
-
-    intent = state.get("intent", {})
-    context = state.get("context", "")
-
-    # Add git blame hint to localization prompt
-    repo_path_str = state.get("work_order", {}).get("repo_path")
-    recent_files = []
-    if repo_path_str:
-        for candidate_file in intent.get("likely_affected_files", [])[:10]:
-            score = _get_file_recency_score(repo_path_str, candidate_file)
-            if score >= 2.0:
-                recent_files.append(f"{candidate_file} (changed in last {'week' if score >= 3.0 else 'month'})")
-
-    prompt = f"""You are a senior developer localizing a bug.
-
-BUG: {intent.get('actual_behavior', '')}
-EXPECTED: {intent.get('expected_behavior', '')}
-HINTS: modules={intent.get('likely_affected_modules', [])}, functions={intent.get('likely_affected_functions', [])}
-
-CODEBASE CONTEXT:
-{context}
-
-Based on the context above, identify the most likely fault locations.
-Be specific about file paths and function names visible in the context."""
-
-    if recent_files:
-        prompt += f"\n\nGIT BLAME — Recently changed files (higher bug probability):\n" + "\n".join(f"- {f}" for f in recent_files)
-
-    try:
-        result = _structured_call("claude-sonnet-4-6", 1500, LocalizationResult, prompt)
-        state["localization"] = result.model_dump()
-    except Exception as e:
-        logger.error("Localization failed: %s", e)
-        state["localization"] = {
-            "fault_files": intent.get("likely_affected_modules", []),
-            "fault_functions": intent.get("likely_affected_functions", []),
-            "fault_classes": [],
-            "root_cause_hypothesis": "Could not determine root cause.",
-            "confidence": 0.1,
-            "evidence": [],
-        }
-
-    # Log git blame recency scores for fault files
-    fault_files = state.get("localization", {}).get("fault_files", [])
-    for ff in fault_files[:5]:
-        score = _get_file_recency_score(repo_path_str, ff)
-        if score > 1.0:
-            logger.info("Git blame: %s recently changed (recency multiplier: %.1f)", ff, score)
-
-    if trace:
-        trace.stage_end("localization")
-    return state
 
 
 def _read_file_safe(file_path: Path, max_lines: int = 500, focus_lines: list[int] | None = None) -> str | None:
@@ -1144,135 +1185,6 @@ def _build_enrichment_context(enriched: dict, fault_files: list[str],
     return "\n\nENRICHED SYMBOL INFO (from knowledge graph):\n" + "\n".join(sections)
 
 
-def read_source_node(state: AgentState) -> AgentState:
-    """Stage 3.5: Read source code using the knowledge graph for smart discovery.
-
-    Strategy:
-    1. Read fault files from disk
-    2. Use graph CALLS/IMPORTS edges to discover call sites (callers)
-    3. Read caller files (where the fix needs to be wired in)
-    4. Add enriched symbol info (docstrings, params, call chains)
-    """
-    _thread_local.current_stage = "read_source"
-    trace = _get_trace()
-    if trace:
-        trace.stage_start("read_source")
-    logger.info("=== READ SOURCE: Loading code via knowledge graph ===")
-    state["status"] = PipelineStatus.READING_SOURCE
-    _report_progress(state)
-
-    work_order = state.get("work_order", {})
-    localization = state.get("localization", {})
-    fault_files = localization.get("fault_files", [])
-    fault_functions = localization.get("fault_functions", [])
-    repo_name = work_order.get("repo_name", "")
-
-    repo_path = _resolve_repo_path(work_order)
-    if repo_path and not work_order.get("repo_path"):
-        work_order = dict(work_order)
-        work_order["repo_path"] = str(repo_path)
-        state["work_order"] = work_order
-
-    if not repo_path:
-        logger.warning("Could not resolve repo path for %s — using context only", repo_name)
-        state["source_code"] = {}
-        if trace:
-            trace.stage_end("read_source")
-        return state
-
-    # Load the knowledge graph for smart caller discovery
-    graph_data, enriched = _load_graph_data(repo_name)
-    has_graph = bool(graph_data.get("edges"))
-
-    source_code: dict[str, str] = {}
-
-    # 1. Read the fault files themselves (with focus on fault functions)
-    #    Use graph node line_start/line_end for precise function extraction
-    for rel_path in fault_files[:5]:
-        resolved = _find_file_in_repo(repo_path, rel_path)
-        if resolved:
-            # Collect focus lines from multiple sources:
-            focus_lines: list[int] = []
-
-            # a) Graph nodes with line numbers for fault functions in this file
-            for node in graph_data.get("nodes", []):
-                nid = node.get("id", "")
-                if node.get("type") != "function":
-                    continue
-                nfile = nid.split("::")[0] if "::" in nid else ""
-                if nfile != rel_path:
-                    continue
-                # Check if this function is in the fault_functions list
-                short_name = nid.split("::")[-1]
-                if any(short_name == ff or short_name in ff or ff in nid for ff in fault_functions):
-                    ls = node.get("line_start", 0)
-                    le = node.get("line_end", 0)
-                    if ls:
-                        focus_lines.append(ls)
-                    if le:
-                        focus_lines.append(le)
-
-            # b) Decision points in this file
-            for dp in graph_data.get("decision_points", []):
-                if dp.get("file", "") == rel_path or rel_path in dp.get("function_id", ""):
-                    line = dp.get("line", 0)
-                    if line:
-                        focus_lines.append(line)
-
-            # c) Line hints from the root cause text (e.g. "line 688")
-            root_cause = localization.get("root_cause_hypothesis", "")
-            import re as _re
-            for m in _re.finditer(r'lines?\s+(\d+)', root_cause):
-                focus_lines.append(int(m.group(1)))
-
-            content = _read_file_safe(resolved, max_lines=3000, focus_lines=focus_lines or None)
-            if content:
-                # Strip gap markers so LLM sees only real source lines it can copy from
-                content = _strip_gap_markers(content)
-                source_code[rel_path] = content
-                logger.info("Read fault file: %s (%d lines, %d focus points)",
-                           rel_path, len(content.split('\n')), len(focus_lines))
-
-    # 2. Discover callers — graph first, grep fallback
-    if has_graph:
-        caller_files = _find_callers_from_graph(graph_data, fault_files, fault_functions)
-        logger.info("Graph found %d caller files: %s", len(caller_files), caller_files)
-    else:
-        caller_files = _find_callers_via_grep(repo_path, fault_files)
-        logger.info("Grep found %d caller files: %s", len(caller_files), caller_files)
-
-    # 3. Read caller files
-    for rel in caller_files:
-        if rel in source_code:
-            continue
-        resolved = _find_file_in_repo(repo_path, rel)
-        if resolved:
-            content = _read_file_safe(resolved, max_lines=3000)
-            if content:
-                content = _strip_gap_markers(content)
-                source_code[f"{rel} (caller)"] = content
-                logger.info("Read caller: %s (%d lines)", rel, len(content.split('\n')))
-
-    # 4. Add enriched context (function signatures, docstrings, call chains)
-    enrichment = _build_enrichment_context(enriched, fault_files, fault_functions)
-    if enrichment:
-        source_code["__enrichment__"] = enrichment
-        logger.info("Added enriched symbol info for %d fault functions", len(fault_functions))
-
-    # 5. Load business rules from human answers (Step 8/21)
-    business_rules = _load_business_rules(repo_name, fault_files)
-    if business_rules:
-        source_code["__business_rules__"] = business_rules
-        logger.info("Loaded business rules for fault files")
-
-    state["source_code"] = source_code
-    logger.info("Loaded %d files total (%d fault + %d callers) using %s",
-                len(source_code) - (1 if enrichment else 0),
-                min(len(fault_files), 5), len(caller_files),
-                "knowledge graph" if has_graph else "grep fallback")
-    if trace:
-        trace.stage_end("read_source")
-    return state
 
 
 def _extract_function_source(source: str, function_name: str, context_lines: int = 2) -> str | None:
@@ -2789,16 +2701,6 @@ def escalate_node(state: AgentState) -> AgentState:
 # Routing logic
 # ---------------------------------------------------------------------------
 
-def should_read_source_or_escalate(state: AgentState) -> Literal["read_source", "escalate"]:
-    """Confidence gate: proceed only if localization is confident enough."""
-    confidence = state.get("localization", {}).get("confidence", 0)
-    fault_files = state.get("localization", {}).get("fault_files", [])
-
-    if confidence < MIN_CONFIDENCE_TO_REPAIR or not fault_files:
-        logger.info("Low confidence (%.0f%%) or no fault files — escalating", confidence * 100)
-        return "escalate"
-    return "read_source"
-
 
 def should_iterate(state: AgentState) -> Literal["test", "retry_fix", "escalate"]:
     """Decide whether to test+PR, retry, or escalate."""
@@ -2858,16 +2760,14 @@ def should_retry_after_test(state: AgentState) -> str:
 def build_agent_graph():
     """Build and compile the LangGraph state machine.
 
-    AGENT_MODE env var controls exploration strategy:
-      'explore'  — agentic tool loop (grep/read/search), agent finds context itself (new)
-      'rag'      — Graph RAG push context upfront (legacy default)
+    Pipeline: intake → exploration → repair → review → test → PR
+    Exploration is kick-started with graph + vector + failure signals,
+    then the agent explores freely with grep/read/search tools.
     """
-    mode = os.environ.get("AGENT_MODE", "explore")
-    logger.info("Building agent graph in mode: %s", mode)
-
     graph = StateGraph(AgentState)
 
     graph.add_node("intake", intake_node)
+    graph.add_node("exploration", exploration_node)
     graph.add_node("repair", repair_node)
     graph.add_node("review", review_node)
     graph.add_node("test", test_node)
@@ -2875,25 +2775,8 @@ def build_agent_graph():
     graph.add_node("escalate", escalate_node)
     graph.set_entry_point("intake")
 
-    if mode == "explore":
-        # New: agentic exploration replaces context_assembly + localization + read_source
-        graph.add_node("exploration", exploration_node)
-        graph.add_edge("intake", "exploration")
-        graph.add_edge("exploration", "repair")
-    else:
-        # Legacy: push context upfront via Graph RAG
-        graph.add_node("context_assembly", context_assembly_node)
-        graph.add_node("localization", localization_node)
-        graph.add_node("read_source", read_source_node)
-        graph.add_edge("intake", "context_assembly")
-        graph.add_edge("context_assembly", "localization")
-        graph.add_conditional_edges(
-            "localization",
-            should_read_source_or_escalate,
-            {"read_source": "read_source", "escalate": "escalate"},
-        )
-        graph.add_edge("read_source", "repair")
-
+    graph.add_edge("intake", "exploration")
+    graph.add_edge("exploration", "repair")
     graph.add_edge("repair", "review")
     graph.add_conditional_edges(
         "review",
