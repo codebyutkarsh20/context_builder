@@ -582,12 +582,11 @@ def _run_pipeline(job_id: str, work_order: dict, debug: bool = False, dry_run: b
             _agent_jobs[job_id]["status"] = "running"
             _agent_jobs[job_id]["stage"] = "Starting pipeline"
 
-        # Create trace if debug mode
-        if debug:
-            from agent.trace import RunTrace
-            trace = RunTrace(job_id=job_id, enabled=True)
-            with _agent_jobs_lock:
-                _agent_jobs[job_id]["_trace"] = trace
+        # Always create trace for token tracking and observability
+        from agent.trace import RunTrace
+        trace = RunTrace(job_id=job_id, enabled=True)
+        with _agent_jobs_lock:
+            _agent_jobs[job_id]["_trace"] = trace
 
         from agent.pipeline import run_ticket
 
