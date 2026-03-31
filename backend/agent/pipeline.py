@@ -2346,9 +2346,15 @@ def test_node(state: AgentState) -> AgentState:
     # paths or git branch names.
     safe_ticket_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", ticket_id).lower()
 
-    # Generate unique branch name
-    branch_suffix = uuid.uuid4().hex[:6]
-    branch_name = f"fix/{safe_ticket_id}-{branch_suffix}"
+    # Reuse branch across retry iterations — one branch per ticket.
+    # On retries, reset the branch to base and recommit the new patch.
+    existing_branch = state.get("branch_name", "")
+    if existing_branch:
+        branch_name = existing_branch
+        branch_suffix = existing_branch.rsplit("-", 1)[-1]
+    else:
+        branch_suffix = uuid.uuid4().hex[:6]
+        branch_name = f"fix/{safe_ticket_id}-{branch_suffix}"
     state["branch_name"] = branch_name
 
     try:
@@ -2385,6 +2391,17 @@ def test_node(state: AgentState) -> AgentState:
 
             # Create worktree (safe_ticket_id has no special chars, path is safe)
             worktree_path = Path(f"/tmp/agent_sandbox_{safe_ticket_id}_{branch_suffix}")
+
+            # On retry iterations, clean up previous worktree and delete the
+            # old branch so we can recreate it fresh from base.
+            if existing_branch:
+                _cleanup_worktree(repo_path, str(worktree_path))
+                # Delete the branch if it exists (leftover from prior iteration)
+                subprocess.run(
+                    ["git", "branch", "-D", branch_name],
+                    cwd=repo_path, capture_output=True, text=True, timeout=30,
+                )
+
             subprocess.run(
                 ["git", "worktree", "add", "-b", branch_name, str(worktree_path), base_branch],
                 cwd=repo_path, capture_output=True, text=True, check=True, timeout=30,

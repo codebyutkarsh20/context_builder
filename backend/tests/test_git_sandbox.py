@@ -197,3 +197,86 @@ class TestAutoDetectTestRunner:
         import inspect
         src = inspect.getsource(_run_tests)
         assert "timeout=300" in src
+
+
+class TestBranchReuseOnRetry:
+    """On retry iterations, test_node reuses the same branch instead of creating a new one."""
+
+    def test_retry_reuses_branch_name(self, tmp_repo):
+        """When state already has branch_name, the same name is reused."""
+        state = {
+            "work_order": {"ticket_id": "TEST-R", "repo_path": str(tmp_repo), "repo_name": "test"},
+            "repair": {"patches": [{
+                "file_path": "app.py",
+                "original_code": "return email.lower().strip()",
+                "patched_code": "return email.lower().strip() if email else ''",
+            }]},
+            "status": "",
+        }
+
+        # First run — creates a new branch
+        result1 = sandbox_test_node(state)
+        branch1 = result1.get("branch_name", "")
+        assert branch1.startswith("fix/test-r-"), f"First run creates branch: {branch1}"
+
+        # Simulate retry: pass the branch_name back in state (as the pipeline does)
+        state2 = {
+            "work_order": {"ticket_id": "TEST-R", "repo_path": str(tmp_repo), "repo_name": "test"},
+            "repair": {"patches": [{
+                "file_path": "app.py",
+                "original_code": "return email.lower().strip()",
+                "patched_code": "return email.lower().strip() if email else None",
+            }]},
+            "branch_name": branch1,  # reuse from first run
+            "status": "",
+        }
+        result2 = sandbox_test_node(state2)
+        branch2 = result2.get("branch_name", "")
+
+        assert branch2 == branch1, f"Retry should reuse branch: {branch2} != {branch1}"
+        assert result2.get("patches_applied", 0) == 1
+
+        # Clean up
+        if result2.get("sandbox_path"):
+            _cleanup_worktree(tmp_repo, result2["sandbox_path"])
+
+    def test_retry_does_not_create_extra_branches(self, tmp_repo):
+        """After a retry, only one fix/ branch should exist for the ticket."""
+        state = {
+            "work_order": {"ticket_id": "TEST-RB", "repo_path": str(tmp_repo), "repo_name": "test"},
+            "repair": {"patches": [{
+                "file_path": "app.py",
+                "original_code": "return email.lower().strip()",
+                "patched_code": "return email.lower().strip() if email else ''",
+            }]},
+            "status": "",
+        }
+
+        result1 = sandbox_test_node(state)
+        branch1 = result1.get("branch_name", "")
+
+        # Retry with same branch
+        state2 = {
+            "work_order": {"ticket_id": "TEST-RB", "repo_path": str(tmp_repo), "repo_name": "test"},
+            "repair": {"patches": [{
+                "file_path": "app.py",
+                "original_code": "return email.lower().strip()",
+                "patched_code": "return email.lower().strip() if email else None",
+            }]},
+            "branch_name": branch1,
+            "status": "",
+        }
+        result2 = sandbox_test_node(state2)
+
+        # Count fix/ branches
+        branches = subprocess.run(
+            ["git", "branch", "--list", "fix/*"],
+            cwd=tmp_repo, capture_output=True, text=True,
+        ).stdout.strip().splitlines()
+        fix_branches = [b.strip() for b in branches if b.strip()]
+
+        assert len(fix_branches) <= 1, f"Expected at most 1 fix branch, got {len(fix_branches)}: {fix_branches}"
+
+        # Clean up
+        if result2.get("sandbox_path"):
+            _cleanup_worktree(tmp_repo, result2["sandbox_path"])
