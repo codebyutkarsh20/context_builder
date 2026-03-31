@@ -1,0 +1,67 @@
+[
+  {
+    "ticket_id": "FLASK-2651",
+    "title": "get_json silent option caches None and causes weird side-effect",
+    "description": "When request.get_json(silent=True) is called first and returns None (because the body is not valid JSON), the result is cached. A subsequent call to request.get_json() (without silent) also returns None instead of raising a 400 Bad Request, because it reads from the cache. Invalid JSON should not be cached, or the cache should distinguish between silent and non-silent calls.\n\nReproduction:\n1. Send a POST request with invalid JSON body\n2. Call request.get_json(silent=True) — returns None (expected)\n3. Call request.get_json() — returns None instead of raising 400 Bad Request\n\nExpected: The second call should raise a 400 Bad Request since silent=False by default.",
+    "repo_url": "https://github.com/pallets/flask",
+    "repo_sha": "8c0d8c1c147a2534c8ed60f7dc62080371126c18",
+    "fix_sha": "171eb28c950969260863cacefa2f08d1590ce839",
+    "expected_files": ["flask/wrappers.py"],
+    "expected_root_cause": "get_json caching None result silent parameter cache invalidation",
+    "difficulty": "single-file",
+    "source": "open-source",
+    "priority": "high"
+  },
+  {
+    "ticket_id": "CLICK-3039",
+    "title": "Pager Popen() should not use shell=True with list argument",
+    "description": "A previous commit changed the pager Popen() command argument from a string to a list, but left shell=True. Per the Python subprocess docs, when shell=True and args is a sequence, only the first item is treated as the command string and additional items become arguments to the shell itself (not to the command). This causes pager arguments to be silently swallowed.\n\nThe fix is to remove shell=True from the Popen call.\n\nThis bug was causing failures in the mycli test suite where pager arguments were being ignored.",
+    "repo_url": "https://github.com/pallets/click",
+    "repo_sha": "35e6a78646c58a8cc1ba3cda603a6bd4fb87f9d5",
+    "fix_sha": "3f5eea3438946b9ad51e5f7a22b405f910f2261b",
+    "expected_files": ["src/click/_termui_impl.py"],
+    "expected_root_cause": "shell=True subprocess Popen list argument pager command",
+    "difficulty": "single-file",
+    "source": "open-source",
+    "priority": "medium"
+  },
+  {
+    "ticket_id": "RICH-2187",
+    "title": "Markup Escaping Regression in Rich v12",
+    "description": "Between Rich v11.2 and v12.0, rich.markup.escape() broke for nested bracket expressions. For example:\n\nrich.print(rich.markup.escape('[nil, [nil]]'))\n\nOutputs: [nil, ]\nExpected: [nil, [nil]]\n\nThe inner [nil] is being consumed by the markup parser even after escaping. This is a regression likely introduced in a recent PR that changed the markup parsing logic.\n\nReproduction:\nfrom rich.markup import escape\nresult = escape('[nil, [nil]]')\n# Expected: '\\[nil, \\[nil]]' or similar that renders correctly\n# Actual: nested brackets are not properly escaped",
+    "repo_url": "https://github.com/Textualize/rich",
+    "repo_sha": "e3fdf3304341e8930ad913be6c67b40ef0e64457",
+    "fix_sha": "8c337784385d03f8ede4e03d42dac21d21eab2b1",
+    "expected_files": ["rich/markup.py"],
+    "expected_root_cause": "markup escape regex nested brackets parsing regression",
+    "difficulty": "single-file",
+    "source": "open-source",
+    "priority": "high"
+  },
+  {
+    "ticket_id": "FLASK-4037",
+    "title": "Blueprint url_prefix parameter not working with nested blueprints",
+    "description": "When a child blueprint is registered on a parent blueprint, and both have url_prefix set via the constructor, the URL prefix is completely ignored.\n\nReproduction:\nparent = Blueprint('parent', __name__, url_prefix='/parent')\nchild = Blueprint('child', __name__, url_prefix='/child')\n\n@child.route('/hello')\ndef hello():\n    return 'Hello'\n\nparent.register_blueprint(child)\napp.register_blueprint(parent)\n\nExpected: GET /parent/child/hello returns 'Hello'\nActual: The route is registered at / or /hello, ignoring both prefixes.\n\nThe prefix only works if passed via register_blueprint(url_prefix=...) instead of the constructor argument. The constructor-set url_prefix should be respected as the default when no explicit url_prefix is given to register_blueprint.",
+    "repo_url": "https://github.com/pallets/flask",
+    "repo_sha": "08e459e823235eecd86c635653f4bd6d6003c2b3",
+    "fix_sha": "e93704fbfd5f40e48f8fe9034b6b0fe420d28fb3",
+    "expected_files": ["src/flask/blueprints.py"],
+    "expected_root_cause": "blueprint url_prefix nested register_blueprint constructor default prefix",
+    "difficulty": "single-file",
+    "source": "open-source",
+    "priority": "medium"
+  },
+  {
+    "ticket_id": "WERKZEUG-2364",
+    "title": "ResponseCacheControl.s_maxage raises TypeError when set to int",
+    "description": "Setting Response().cache_control.s_maxage = 1 raises:\nTypeError: 'NoneType' object is not callable\n\nThe cache_control_property for s_maxage calls type(value) to convert the value, but the type parameter is None for s_maxage (it should be int). This worked in werkzeug 2.0.3 but broke in 2.1.0.\n\nReproduction:\nfrom werkzeug.datastructures import ResponseCacheControl\ncc = ResponseCacheControl()\ncc.s_maxage = 1  # TypeError: 'NoneType' object is not callable\n\nExpected: s_maxage should accept integer values just like max_age does.",
+    "repo_url": "https://github.com/pallets/werkzeug",
+    "repo_sha": "2b05281c5ccfe6ae01b14598091399ef838ea11d",
+    "fix_sha": "74948bc7c47811aa5d384e65c3b961acc1d3fe56",
+    "expected_files": ["src/werkzeug/datastructures.py"],
+    "expected_root_cause": "cache_control_property s_maxage type None int setter",
+    "difficulty": "single-file",
+    "source": "open-source",
+    "priority": "medium"
+  }
+]

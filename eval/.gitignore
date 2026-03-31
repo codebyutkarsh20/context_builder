@@ -1,0 +1,5 @@
+# Cloned repos (large, transient)
+repos/
+
+# Results (regenerated on each run)
+results/
