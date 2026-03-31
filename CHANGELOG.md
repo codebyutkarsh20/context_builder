@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.1.2.2] - 2026-03-31
+
+### Changed
+
+- Backend uvicorn now runs with `--reload` flag so code changes via Docker volume mount are picked up automatically without container restart.
+
+### Added
+
+- Debug logging for branch reuse check in `test_node` to diagnose retry iteration behavior.
+
 ## [0.1.2.1] - 2026-03-31
 
 ### Fixed
