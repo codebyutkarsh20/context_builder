@@ -605,6 +605,22 @@ class CodeParser:
                     return jsdocs[lineno - offset]
             return None
 
+        def _estimate_func_end(start_line: int) -> int:
+            """Estimate function end by counting braces from the start line."""
+            brace_depth = 0
+            started = False
+            for i in range(start_line - 1, len(lines)):
+                line = lines[i]
+                for ch in line:
+                    if ch == "{":
+                        brace_depth += 1
+                        started = True
+                    elif ch == "}":
+                        brace_depth -= 1
+                if started and brace_depth <= 0:
+                    return i + 1  # 1-indexed
+            return min(start_line + 50, len(lines))  # fallback
+
         # Extract functions
         functions: list[dict] = []
         for pattern in (self._JS_FUNC_RE, self._JS_ARROW_RE):
@@ -612,6 +628,7 @@ class CodeParser:
                 lineno = source[:m.start()].count("\n") + 1
                 name = m.group(1)
                 params = [p.strip().split(":")[0].strip() for p in m.group(2).split(",") if p.strip()]
+                line_end = _estimate_func_end(lineno)
                 functions.append({
                     "name": name,
                     "id": f"{rel_path}::{name}",
@@ -619,6 +636,8 @@ class CodeParser:
                     "return_type": None,
                     "docstring": _find_jsdoc(lineno),
                     "lineno": lineno,
+                    "line_start": lineno,
+                    "line_end": line_end,
                     "decorators": [],
                     "calls": [],
                 })
@@ -646,6 +665,7 @@ class CodeParser:
                 if method_match and method_match.group(1) not in self._JS_CONTROL_FLOW:
                     mname = method_match.group(1)
                     mparams = [p.strip().split(":")[0].strip() for p in method_match.group(2).split(",") if p.strip()]
+                    method_end = _estimate_func_end(i)
                     methods.append({
                         "name": mname,
                         "id": f"{rel_path}::{cls_name}.{mname}",
@@ -653,6 +673,8 @@ class CodeParser:
                         "return_type": None,
                         "docstring": _find_jsdoc(i),
                         "lineno": i,
+                        "line_start": i,
+                        "line_end": method_end,
                         "decorators": [],
                         "calls": [],
                     })

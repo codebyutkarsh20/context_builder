@@ -104,6 +104,7 @@ def persist_rules_to_file(rules: list["_BusinessRule"], out_path: Path) -> int:
     existing_ids = {r["id"] for r in existing if "id" in r}
     new_dicts = [r.to_pipeline_dict() for r in rules if r.rule_id not in existing_ids]
 
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(existing + new_dicts, indent=2, default=str))
     logger.info(
         "persist_rules_to_file: wrote %d new rule(s) to %s (%d existing preserved)",

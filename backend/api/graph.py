@@ -78,6 +78,19 @@ def get_graph(
                     "weight": e.get("weight"),
                 })
 
+        # If Neo4j returned no non-CONTAINS edges, supplement from graph.json cache
+        # (JS/TS repos may only have CONTAINS edges in Neo4j but full edges in cache)
+        non_contains = [e for e in edges if e.get("type") != "CONTAINS"]
+        if not non_contains:
+            cache = _load_graph_cache(repo)
+            if cache:
+                cached_edges = cache.get("edges", [])
+                node_ids = {n["id"] for n in nodes}
+                for e in cached_edges:
+                    if e.get("source") in node_ids and e.get("target") in node_ids:
+                        if e not in edges:
+                            edges.append(e)
+
         return {"nodes": nodes, "edges": edges, "repo": repo}
     cache = _load_graph_cache(repo)
     if cache:
