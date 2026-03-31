@@ -259,6 +259,95 @@ def _resolve_repo_path(work_order: dict) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
+# Repo-aware linter execution
+# ---------------------------------------------------------------------------
+
+def _run_repo_linters(worktree_path: Path, patches: list[dict]) -> str:
+    """Discover and run the target repo's linters on patched files.
+
+    Checks for pre-commit config, flake8, ruff, pylint — in that order.
+    Returns error string if linting fails, empty string if OK.
+    """
+    patched_files = []
+    for p in patches:
+        fpath = p.get("file_path", "")
+        if fpath and (worktree_path / fpath).exists():
+            patched_files.append(fpath)
+    if not patched_files:
+        return ""
+
+    # Strategy 1: Run pre-commit on staged files (most reliable — uses repo's own config)
+    precommit_cfg = worktree_path / ".pre-commit-config.yaml"
+    if precommit_cfg.exists():
+        try:
+            # Stage only the patched files
+            subprocess.run(
+                ["git", "add"] + patched_files,
+                cwd=worktree_path, capture_output=True, text=True, timeout=30,
+            )
+            result = subprocess.run(
+                ["pre-commit", "run", "--files"] + patched_files,
+                cwd=worktree_path, capture_output=True, text=True, timeout=120,
+            )
+            if result.returncode != 0:
+                # Filter for actual errors (skip "Passed" lines)
+                output = result.stdout + result.stderr
+                error_lines = [
+                    line for line in output.splitlines()
+                    if line.strip() and "Passed" not in line and "Skipped" not in line
+                ]
+                if error_lines:
+                    logger.warning("pre-commit failed on patched files:\n%s", "\n".join(error_lines[-20:]))
+                    return "\n".join(error_lines[-20:])
+        except FileNotFoundError:
+            logger.debug("pre-commit not installed — falling back to direct linter")
+        except subprocess.TimeoutExpired:
+            logger.debug("pre-commit timed out — falling back to direct linter")
+        except Exception as e:
+            logger.debug("pre-commit failed: %s — falling back to direct linter", e)
+
+    py_files = [f for f in patched_files if f.endswith(".py")]
+    if not py_files:
+        return ""
+
+    # Strategy 2: Run ruff (fast, modern Python linter)
+    try:
+        result = subprocess.run(
+            ["ruff", "check", "--no-fix"] + py_files,
+            cwd=worktree_path, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            errors = result.stdout.strip()
+            if errors:
+                logger.warning("ruff errors:\n%s", errors[:500])
+                return errors[:500]
+    except FileNotFoundError:
+        pass  # ruff not installed
+    except Exception as e:
+        logger.debug("ruff check failed: %s", e)
+
+    # Strategy 3: Run flake8
+    try:
+        result = subprocess.run(
+            ["flake8", "--max-line-length=120"] + py_files,
+            cwd=worktree_path, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            errors = result.stdout.strip()
+            # Only block on syntax errors (E999) and critical issues, not style
+            critical = [l for l in errors.splitlines() if "E999" in l or "F" in l.split(":")[3] if len(l.split(":")) > 3]
+            if critical:
+                logger.warning("flake8 critical errors:\n%s", "\n".join(critical[:10]))
+                return "\n".join(critical[:10])
+    except FileNotFoundError:
+        pass  # flake8 not installed
+    except Exception as e:
+        logger.debug("flake8 check failed: %s", e)
+
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Intake helpers
 # ---------------------------------------------------------------------------
 
@@ -1769,8 +1858,39 @@ def repair_node(state: AgentState) -> AgentState:
                 )
             fix_history_context += "\nUse these as reference — similar bugs in the same files may share root causes.\n"
 
+    # Load project conventions from context (linters, formatters, line length, etc.)
+    conventions_section = ""
+    data_dir = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
+    conventions_file = data_dir / repo_name / "project_conventions.json"
+    if conventions_file.exists():
+        try:
+            import json as _json
+            convs = _json.loads(conventions_file.read_text())
+            rules = []
+            if convs.get("linters"):
+                rules.append(f"Linters: {', '.join(convs['linters'])} — code MUST pass these")
+            if convs.get("formatters"):
+                rules.append(f"Formatters: {', '.join(convs['formatters'])} — code MUST match style")
+            if convs.get("line_length"):
+                rules.append(f"Max line length: {convs['line_length']}")
+            if convs.get("import_sorting"):
+                rules.append(f"Import sorting: {convs['import_sorting']} — imports MUST be sorted")
+            if convs.get("type_checking"):
+                rules.append(f"Type checking: {convs['type_checking']} — add type annotations")
+            if convs.get("pre_commit_hooks"):
+                rules.append(f"Pre-commit hooks: {', '.join(convs['pre_commit_hooks'][:10])}")
+            if rules:
+                conventions_section = (
+                    "\nPROJECT CONVENTIONS (generated code MUST follow these):\n"
+                    + "\n".join(f"- {r}" for r in rules)
+                    + "\n"
+                )
+        except Exception:
+            pass
+
     # End-state prompt style (Research Finding #10 — Claude performs better with end-state descriptions)
     prompt = f"""Fix this bug by producing a RepairResult with correct patches.
+{conventions_section}
 
 BUG: {intent.get('actual_behavior', '')}
 EXPECTED: {intent.get('expected_behavior', '')}
@@ -2609,9 +2729,10 @@ def test_node(state: AgentState) -> AgentState:
                 trace.stage_end("test")
             return state
 
-        # Syntax validation — check patched Python files compile
+        # Syntax validation — check ALL patched Python files (fix + tests)
         syntax_errors = []
-        for patch in repair.get("patches", []):
+        all_patches = list(repair.get("patches", [])) + list(repair.get("test_patches", []))
+        for patch in all_patches:
             fpath = patch.get("file_path", "")
             full_path = worktree_path / fpath
             if full_path.exists() and full_path.suffix == ".py":
@@ -2627,6 +2748,19 @@ def test_node(state: AgentState) -> AgentState:
             state["test_result"] = "failed: syntax errors in patched files\n" + "\n".join(syntax_errors)
             state["error"] = "Patches introduced syntax errors: " + "; ".join(syntax_errors)
             _emit_trace("test_output", {"result": "failed: syntax errors", "passed": False, "patches_applied": patches_applied})
+            if trace:
+                trace.stage_end("test")
+            return state
+
+        # Run target repo's pre-commit hooks / linters if available
+        precommit_errors = _run_repo_linters(worktree_path, all_patches)
+        if precommit_errors:
+            logger.error("Linter/pre-commit errors — routing back to repair")
+            _cleanup_worktree(repo_path, str(worktree_path))
+            state["sandbox_path"] = ""
+            state["test_result"] = "failed: linter errors\n" + precommit_errors
+            state["error"] = "Patches failed linting: " + precommit_errors[:300]
+            _emit_trace("test_output", {"result": "failed: linter errors", "passed": False, "patches_applied": patches_applied})
             if trace:
                 trace.stage_end("test")
             return state

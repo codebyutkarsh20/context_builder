@@ -152,6 +152,8 @@ class ContextCompiler:
         domain_concepts = self._fetch_domain_concepts()
         # Batch-fetch imports/exports for all files (replaces N+1 per-file queries)
         all_ie = self._fetch_all_imports_exports()
+        # Extract project conventions (linters, CI, coding standards)
+        project_conventions = self._extract_project_conventions()
 
         # ---- Render sections -------------------------------------------------
         generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -171,6 +173,7 @@ class ContextCompiler:
             readme=readme,
             generated_at=generated_at,
             all_ie=all_ie,
+            project_conventions=project_conventions,
         )
 
         summary_md = self._render_summary(
@@ -186,12 +189,213 @@ class ContextCompiler:
         context_path.write_text(context_md, encoding="utf-8")
         summary_path.write_text(summary_md, encoding="utf-8")
 
+        # Persist project conventions as JSON for pipeline use
+        if project_conventions and any(project_conventions.get(k) for k in ("linters", "formatters", "pre_commit_hooks")):
+            import json as _json
+            conventions_path = self._out_dir / "project_conventions.json"
+            conventions_path.write_text(_json.dumps(project_conventions, indent=2))
+            logger.info("Saved project conventions → %s", conventions_path)
+
         logger.info(
             "Compiled context docs for '%s' → %s",
             self.repo_name,
             self._out_dir,
         )
         return context_path, summary_path
+
+    # ------------------------------------------------------------------
+    # Project conventions extraction
+    # ------------------------------------------------------------------
+
+    def _extract_project_conventions(self) -> dict[str, Any]:
+        """Extract linting, CI, and coding standards from repo config files.
+
+        Reads .pre-commit-config.yaml, pyproject.toml, setup.cfg, .flake8,
+        tox.ini, .github/workflows/, and other convention-defining files.
+        Returns a dict describing the project's quality gates.
+        """
+        if not self.repo_path or not self.repo_path.exists():
+            return {}
+
+        conventions: dict[str, Any] = {
+            "linters": [],
+            "formatters": [],
+            "ci_checks": [],
+            "test_framework": None,
+            "python_version": None,
+            "line_length": None,
+            "import_sorting": None,
+            "type_checking": None,
+            "pre_commit_hooks": [],
+            "raw_configs": {},
+        }
+
+        rp = self.repo_path
+
+        # --- Pre-commit config ---
+        precommit = rp / ".pre-commit-config.yaml"
+        if precommit.exists():
+            try:
+                import yaml
+                cfg = yaml.safe_load(precommit.read_text())
+                for repo in (cfg or {}).get("repos", []):
+                    for hook in repo.get("hooks", []):
+                        hook_id = hook.get("id", "")
+                        conventions["pre_commit_hooks"].append(hook_id)
+                        if hook_id in ("flake8", "ruff", "pylint", "pyflakes"):
+                            conventions["linters"].append(hook_id)
+                        elif hook_id in ("black", "autopep8", "yapf", "ruff-format"):
+                            conventions["formatters"].append(hook_id)
+                        elif hook_id in ("isort",):
+                            conventions["import_sorting"] = "isort"
+                        elif hook_id in ("mypy", "pyright", "pytype"):
+                            conventions["type_checking"] = hook_id
+            except Exception:
+                # yaml not available or parse error — read raw
+                raw = precommit.read_text()[:2000]
+                conventions["raw_configs"]["pre-commit"] = raw
+                # Basic extraction via string matching
+                for linter in ("flake8", "ruff", "pylint", "black", "isort", "mypy"):
+                    if linter in raw:
+                        conventions["linters" if linter in ("flake8", "ruff", "pylint") else "formatters"].append(linter)
+
+        # --- pyproject.toml ---
+        pyproject = rp / "pyproject.toml"
+        if pyproject.exists():
+            try:
+                import tomllib
+            except ImportError:
+                try:
+                    import tomli as tomllib  # type: ignore
+                except ImportError:
+                    tomllib = None  # type: ignore
+
+            if tomllib:
+                try:
+                    with open(pyproject, "rb") as f:
+                        cfg = tomllib.load(f)
+                    tool = cfg.get("tool", {})
+                    # Ruff config
+                    if "ruff" in tool:
+                        conventions["linters"].append("ruff")
+                        ruff_cfg = tool["ruff"]
+                        if "line-length" in ruff_cfg:
+                            conventions["line_length"] = ruff_cfg["line-length"]
+                    # Black config
+                    if "black" in tool:
+                        conventions["formatters"].append("black")
+                        if "line-length" in tool["black"]:
+                            conventions["line_length"] = tool["black"]["line-length"]
+                    # isort config
+                    if "isort" in tool:
+                        conventions["import_sorting"] = "isort"
+                    # mypy config
+                    if "mypy" in tool:
+                        conventions["type_checking"] = "mypy"
+                    # pytest config
+                    if "pytest" in tool:
+                        conventions["test_framework"] = "pytest"
+                    # Python version
+                    requires = cfg.get("project", {}).get("requires-python", "")
+                    if requires:
+                        conventions["python_version"] = requires
+                except Exception:
+                    pass
+
+        # --- setup.cfg ---
+        setup_cfg = rp / "setup.cfg"
+        if setup_cfg.exists():
+            try:
+                import configparser
+                cfg = configparser.ConfigParser()
+                cfg.read(setup_cfg)
+                if cfg.has_section("flake8"):
+                    conventions["linters"].append("flake8")
+                    ml = cfg.get("flake8", "max-line-length", fallback=None)
+                    if ml:
+                        conventions["line_length"] = int(ml)
+                if cfg.has_section("isort"):
+                    conventions["import_sorting"] = "isort"
+                if cfg.has_section("mypy"):
+                    conventions["type_checking"] = "mypy"
+                if cfg.has_section("tool:pytest.ini_options"):
+                    conventions["test_framework"] = "pytest"
+            except Exception:
+                pass
+
+        # --- .flake8 ---
+        flake8_cfg = rp / ".flake8"
+        if flake8_cfg.exists():
+            conventions["linters"].append("flake8")
+
+        # --- tox.ini ---
+        tox_ini = rp / "tox.ini"
+        if tox_ini.exists():
+            try:
+                content = tox_ini.read_text()[:2000]
+                if "flake8" in content:
+                    conventions["linters"].append("flake8")
+                if "pytest" in content:
+                    conventions["test_framework"] = "pytest"
+                if "mypy" in content:
+                    conventions["type_checking"] = "mypy"
+            except Exception:
+                pass
+
+        # --- CI workflows ---
+        gh_workflows = rp / ".github" / "workflows"
+        if gh_workflows.exists():
+            for wf in gh_workflows.glob("*.yml"):
+                try:
+                    content = wf.read_text()[:3000]
+                    conventions["ci_checks"].append(wf.name)
+                except Exception:
+                    pass
+
+        # --- Test framework detection ---
+        if not conventions["test_framework"]:
+            if (rp / "pytest.ini").exists() or (rp / "conftest.py").exists():
+                conventions["test_framework"] = "pytest"
+            elif (rp / "tests").exists():
+                conventions["test_framework"] = "unknown"
+
+        # Deduplicate
+        conventions["linters"] = sorted(set(conventions["linters"]))
+        conventions["formatters"] = sorted(set(conventions["formatters"]))
+
+        return conventions
+
+    def _render_project_conventions(self, conventions: dict[str, Any]) -> str:
+        """Render Layer 0 — Project Conventions."""
+        if not conventions or not any(conventions.get(k) for k in ("linters", "formatters", "pre_commit_hooks", "ci_checks")):
+            return ""
+
+        lines = ["## 0. Project Conventions & Quality Gates\n"]
+        lines.append("> **IMPORTANT: All generated code MUST comply with these rules.**\n")
+
+        if conventions.get("linters"):
+            lines.append(f"**Linters:** {', '.join(conventions['linters'])}")
+        if conventions.get("formatters"):
+            lines.append(f"**Formatters:** {', '.join(conventions['formatters'])}")
+        if conventions.get("line_length"):
+            lines.append(f"**Max line length:** {conventions['line_length']}")
+        if conventions.get("import_sorting"):
+            lines.append(f"**Import sorting:** {conventions['import_sorting']}")
+        if conventions.get("type_checking"):
+            lines.append(f"**Type checking:** {conventions['type_checking']}")
+        if conventions.get("test_framework"):
+            lines.append(f"**Test framework:** {conventions['test_framework']}")
+        if conventions.get("python_version"):
+            lines.append(f"**Python version:** {conventions['python_version']}")
+
+        if conventions.get("pre_commit_hooks"):
+            lines.append(f"\n**Pre-commit hooks (all must pass):** {', '.join(conventions['pre_commit_hooks'])}")
+
+        if conventions.get("ci_checks"):
+            lines.append(f"\n**CI workflows:** {', '.join(conventions['ci_checks'])}")
+
+        lines.append("")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Neo4j data fetchers
@@ -808,11 +1012,13 @@ class ContextCompiler:
         readme: str = "",
         generated_at: str,
         all_ie: dict[str, dict[str, list[str]]] | None = None,
+        project_conventions: dict[str, Any] | None = None,
     ) -> str:
         sections = [
             f"# Repository Context: {self.repo_name}\n",
             f"> Generated by Context Builder on {generated_at}\n",
-            f"> **Layers:** Structure | File Index | Symbol Map | Hotspots | Data Models | Business Summaries | Business Rules | Call Flow | Decision Points | Source Code\n",
+            f"> **Layers:** Conventions | Structure | File Index | Symbol Map | Hotspots | Data Models | Business Summaries | Business Rules | Call Flow | Decision Points | Source Code\n",
+            self._render_project_conventions(project_conventions or {}),
             self._render_layer1(repo_info, files, readme=readme),
             self._render_layer2(files, all_ie=all_ie),
             self._render_layer3(classes, functions),
