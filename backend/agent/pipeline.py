@@ -2349,6 +2349,7 @@ def test_node(state: AgentState) -> AgentState:
     # Reuse branch across retry iterations — one branch per ticket.
     # On retries, reset the branch to base and recommit the new patch.
     existing_branch = state.get("branch_name", "")
+    logger.info("Branch reuse check: existing_branch=%r, state keys=%s", existing_branch, list(state.keys()))
     if existing_branch:
         branch_name = existing_branch
         branch_suffix = existing_branch.rsplit("-", 1)[-1]
