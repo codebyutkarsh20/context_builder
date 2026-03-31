@@ -2392,14 +2392,42 @@ def test_node(state: AgentState) -> AgentState:
             # Create worktree (safe_ticket_id has no special chars, path is safe)
             worktree_path = Path(f"/tmp/agent_sandbox_{safe_ticket_id}_{branch_suffix}")
 
-            # On retry iterations, clean up previous worktree and delete the
-            # old branch so we can recreate it fresh from base.
+            # On retry iterations, aggressively clean up ALL worktrees and
+            # branches for this ticket so we start from a clean slate.
             if existing_branch:
+                # Clean up known worktree paths
                 _cleanup_worktree(repo_path, str(worktree_path))
-                # Delete the branch if it exists (leftover from prior iteration)
+                old_sandbox = state.get("sandbox_path", "")
+                if old_sandbox and old_sandbox != str(worktree_path):
+                    _cleanup_worktree(repo_path, old_sandbox)
+                # Prune ALL stale worktree refs
+                subprocess.run(
+                    ["git", "worktree", "prune"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                )
+                # Force-remove directory if cleanup missed it
+                if worktree_path.exists():
+                    import shutil
+                    shutil.rmtree(worktree_path, ignore_errors=True)
+                # Delete the branch (may fail if already gone — that's ok)
                 subprocess.run(
                     ["git", "branch", "-D", branch_name],
                     cwd=repo_path, capture_output=True, text=True, timeout=30,
+                )
+                # Also scan for any other worktrees/branches for this ticket
+                wt_list = subprocess.run(
+                    ["git", "worktree", "list", "--porcelain"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
+                ).stdout
+                for line in wt_list.splitlines():
+                    if line.startswith("worktree ") and safe_ticket_id in line:
+                        stale_wt = line.split(" ", 1)[1]
+                        if stale_wt != str(repo_path):
+                            _cleanup_worktree(repo_path, stale_wt)
+                # Final prune after cleaning stale worktrees
+                subprocess.run(
+                    ["git", "worktree", "prune"],
+                    cwd=repo_path, capture_output=True, text=True, timeout=10,
                 )
 
             subprocess.run(
