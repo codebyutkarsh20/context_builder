@@ -120,6 +120,39 @@ def _report_progress(state: AgentState) -> None:
             logger.debug("Progress callback error: %s", e)
 
 
+_MODEL_PRICING = {
+    # USD per 1M tokens: (input, output)
+    "claude-opus-4-6": (15.0, 75.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5-20251001": (0.80, 4.0),
+}
+
+
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Estimate USD cost from token counts and model pricing."""
+    pricing = _MODEL_PRICING.get(model, (3.0, 15.0))  # default to Sonnet
+    return round((input_tokens * pricing[0] + output_tokens * pricing[1]) / 1_000_000, 6)
+
+
+# Thread-local storage for capturing token usage from LangChain callbacks
+_token_usage_store = threading.local()
+
+
+class _TokenUsageCallback:
+    """Minimal callback to capture token usage from Anthropic responses."""
+
+    def __init__(self):
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def __enter__(self):
+        _token_usage_store.callback = self
+        return self
+
+    def __exit__(self, *args):
+        _token_usage_store.callback = None
+
+
 def _structured_call(model: str, max_tokens: int, schema: type, prompt: str, retries: int = 1):
     """Call LLM with structured output (tool use). Returns a Pydantic model instance."""
     # Finding #11: Log approximate token usage to monitor context window utilization
@@ -142,10 +175,18 @@ def _structured_call(model: str, max_tokens: int, schema: type, prompt: str, ret
     try:
         result = structured.invoke(prompt)
         duration_ms = round((time.monotonic() - t0) * 1000)
+
+        # Approximate output tokens from the result size
+        output_approx = len(str(result.model_dump() if hasattr(result, "model_dump") else result)) // 4
+
         _emit_trace("llm_response", {
             "model": model,
             "schema": schema.__name__,
             "duration_ms": duration_ms,
+            "input_tokens": approx_tokens,
+            "output_tokens": output_approx,
+            "total_tokens": approx_tokens + output_approx,
+            "cost_usd": _estimate_cost(model, approx_tokens, output_approx),
             "output": result.model_dump() if hasattr(result, "model_dump") else str(result),
         })
         return result
@@ -674,6 +715,20 @@ Find the bug and write your findings summary."""
         except Exception as e:
             logger.error("Exploration LLM call failed: %s", e)
             break
+
+        # Track actual token usage from Anthropic API response
+        usage = getattr(response, "response_metadata", {}).get("usage", {})
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        _emit_trace("llm_response", {
+            "model": "claude-sonnet-4-6",
+            "stage": "exploration",
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "cost_usd": _estimate_cost("claude-sonnet-4-6", input_tokens, output_tokens),
+            "tool_calls_in_response": len(response.tool_calls) if response.tool_calls else 0,
+        })
 
         messages.append(response)
 

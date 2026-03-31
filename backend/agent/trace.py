@@ -205,10 +205,36 @@ class RunTrace:
 
         total_llm = sum(1 for e in events if e["event_type"] == "llm_request")
         total_tool = sum(1 for e in events if e["event_type"] == "tool_call")
-        total_tokens = sum(
+        total_tokens_approx = sum(
             e["data"].get("prompt_tokens_approx", 0)
             for e in events if e["event_type"] == "llm_request"
         )
+
+        # Actual token usage from llm_response events
+        total_input_tokens = sum(
+            e["data"].get("input_tokens", 0)
+            for e in events if e["event_type"] == "llm_response"
+        )
+        total_output_tokens = sum(
+            e["data"].get("output_tokens", 0)
+            for e in events if e["event_type"] == "llm_response"
+        )
+        total_cost_usd = sum(
+            e["data"].get("cost_usd", 0.0)
+            for e in events if e["event_type"] == "llm_response"
+        )
+
+        # Per-stage token breakdown
+        stage_tokens: dict[str, dict] = {}
+        for e in events:
+            if e["event_type"] == "llm_response":
+                stage = e.get("stage", e["data"].get("stage", "unknown"))
+                if stage not in stage_tokens:
+                    stage_tokens[stage] = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "calls": 0}
+                stage_tokens[stage]["input_tokens"] += e["data"].get("input_tokens", 0)
+                stage_tokens[stage]["output_tokens"] += e["data"].get("output_tokens", 0)
+                stage_tokens[stage]["cost_usd"] += e["data"].get("cost_usd", 0.0)
+                stage_tokens[stage]["calls"] += 1
 
         last_ts = events[-1]["timestamp"] if events else 0
 
@@ -220,9 +246,14 @@ class RunTrace:
             "summary": {
                 "total_llm_calls": total_llm,
                 "total_tool_calls": total_tool,
-                "total_tokens_approx": total_tokens,
+                "total_tokens_approx": total_tokens_approx,
+                "total_input_tokens": total_input_tokens,
+                "total_output_tokens": total_output_tokens,
+                "total_tokens": total_input_tokens + total_output_tokens,
+                "total_cost_usd": round(total_cost_usd, 6),
                 "total_events": len(events),
             },
+            "token_usage_by_stage": stage_tokens,
             "events": events,
         }
 
