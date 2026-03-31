@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.1.2.0] - 2026-03-31
+
+### Fixed
+
+- Agent pipeline now reuses a single branch per ticket across retry iterations instead of creating a new branch on each attempt. Previously, 3 review iterations produced 3 orphan branches (`fix/ticket-abc`, `fix/ticket-def`, `fix/ticket-ghi`). Now the same branch is reset and repatched on each retry, keeping the repo clean and the final PR on one branch.
+
+### Tests
+
+- Added `TestBranchReuseOnRetry` test class with 2 tests verifying branch reuse behavior and confirming no extra branches are created during retry iterations.
+
 ## [0.1.1.0] - 2026-03-29
 
 ### Security
