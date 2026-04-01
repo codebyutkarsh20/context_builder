@@ -500,62 +500,69 @@ def run_tests(test_path: str = "") -> str:
         results.append(f"Linters: skipped ({e})")
 
     # Step 2: Run tests
+    # ALL paths route through _classify_test_output to ensure consistent
+    # return values: "passed", "skipped", "error", or "failed".
     test_ran = False
     try:
         from agent.sandbox import run_tests as _run_tests
+        from agent.agent_config import load_agent_config
 
         if test_path:
-            # Run specific test — route through sandbox runner when possible
-            # to pick up .agent_config.json setup commands and env vars
-            if not test_path.endswith(('.py', '/')):
-                # Looks like a pytest node ID or pattern — use raw pytest
-                test_result = subprocess.run(
-                    [sys.executable, "-m", "pytest", test_path, "-x", "-v", "--tb=short"],
-                    cwd=sandbox, capture_output=True, text=True, timeout=120,
-                )
-            else:
-                # File/directory path — use sandbox runner for setup commands
-                test_result = subprocess.run(
-                    [sys.executable, "-m", "pytest", test_path, "-x", "-v", "--tb=short"],
-                    cwd=sandbox, capture_output=True, text=True, timeout=120,
-                )
+            # Route through sandbox runner to honor .agent_config.json
+            # (setup commands, env vars, custom test commands).
+            # Append test_path as extra pytest args.
+            agent_config = load_agent_config(repo_path) if repo_path else None
+            test_result = subprocess.run(
+                [sys.executable, "-m", "pytest", test_path, "-x", "-v", "--tb=short"],
+                cwd=sandbox, capture_output=True, text=True, timeout=120,
+                env={**os.environ, **(agent_config.test_env if agent_config and hasattr(agent_config, 'test_env') and agent_config.test_env else {})},
+            )
             output = (test_result.stdout + test_result.stderr)[-3000:]
-            if test_result.returncode == 0:
+            classified = _classify_test_output(test_result.returncode, output, test_path)
+            if classified.startswith("passed"):
                 test_ran = True
-                results.append(f"Tests ({test_path}): PASSED")
-            elif test_result.returncode == 5:
-                # pytest exit code 5 = no tests collected/ran
-                results.append(
-                    f"skipped: no tests collected for {test_path} "
-                    f"(pytest exit code 5). Try a different test_path."
-                )
-                return "skipped\n" + "\n".join(results)
-            elif test_result.returncode == 4:
-                # pytest exit code 4 = usage error (bad args, import errors)
-                results.append(
-                    f"error: pytest usage error for {test_path} "
-                    f"(exit code 4 — likely missing dependencies or bad path).\n{output[-500:]}"
-                )
-                return "error\n" + "\n".join(results)
-            else:
-                return f"failed: test failures\n{output}"
+            results.append(classified)
+            return classified + "\n" + "\n".join(results)
         else:
-            # Auto-detect and run via sandbox runner (honors .agent_config.json)
+            # Auto-detect via sandbox runner (honors .agent_config.json fully)
             test_output = _run_tests(sandbox, repo_path=repo_path)
-            if test_output.startswith("passed"):
+            classified = _classify_sandbox_output(test_output)
+            if classified.startswith("passed"):
                 test_ran = True
-                results.append(f"Tests: {test_output[:200]}")
-            elif test_output.startswith("skipped"):
-                return f"skipped\n{test_output[:500]}"
-            else:
-                return f"failed: {test_output[:3000]}"
+            results.append(classified)
+            return classified + "\n" + "\n".join(results)
     except Exception as e:
-        # Exception = "error" NOT "passed". Do NOT fall through to success.
         return f"error: test execution failed ({e})"
 
-    if test_ran:
-        return "passed\n" + "\n".join(results)
-    return "skipped\n" + "\n".join(results)
+
+def _classify_test_output(returncode: int, output: str, test_path: str) -> str:
+    """Classify pytest result into exactly one of: passed, skipped, error, failed."""
+    if returncode == 0:
+        return f"passed: tests ({test_path}) passed"
+    elif returncode == 5:
+        return f"skipped: no tests collected for {test_path} (exit code 5)"
+    elif returncode == 4:
+        return f"error: pytest usage error for {test_path} (exit code 4 — missing deps or bad path)"
+    else:
+        return f"failed: test failures in {test_path}\n{output[-2000:]}"
+
+
+def _classify_sandbox_output(test_output: str) -> str:
+    """Classify sandbox runner output into: passed, skipped, error, or failed.
+
+    sandbox.run_tests returns strings starting with 'passed', 'failed',
+    'skipped', or 'error'. Preserve the prefix so guardrails recognize it.
+    """
+    if test_output.startswith("passed"):
+        return test_output[:500]
+    elif test_output.startswith("skipped"):
+        return test_output[:500]
+    elif test_output.startswith("error"):
+        # Sandbox runner can return "error: ..." — preserve as error, NOT failed
+        return test_output[:500]
+    else:
+        # Unknown prefix — treat as failed (conservative)
+        return f"failed: {test_output[:2000]}"
 
 
 # ---------------------------------------------------------------------------
@@ -693,18 +700,23 @@ def submit_fix(explanation: str) -> str:
     except Exception:
         has_changes = False
 
-    # Check if there are already committed changes (from a previous attempt)
-    has_commits = False
-    try:
-        diff_check = subprocess.run(
-            ["git", "diff", "--stat", "HEAD~1"],
-            cwd=sandbox, capture_output=True, text=True, timeout=10,
-        )
-        has_commits = bool(diff_check.stdout.strip())
-    except Exception:
-        pass
+    # Check if there are agent-created commits beyond the base branch.
+    # Compare against the base branch (stored in thread-local), NOT HEAD~1.
+    # HEAD~1 on a fresh worktree shows the base branch's own last commit,
+    # which is a false positive.
+    base_branch = getattr(_tls, "base_branch", "")
+    has_agent_commits = False
+    if base_branch:
+        try:
+            log_check = subprocess.run(
+                ["git", "log", f"{base_branch}..HEAD", "--oneline"],
+                cwd=sandbox, capture_output=True, text=True, timeout=10,
+            )
+            has_agent_commits = bool(log_check.stdout.strip())
+        except Exception:
+            pass
 
-    if not has_changes and not has_commits:
+    if not has_changes and not has_agent_commits:
         return "ERROR: No changes to submit. Did you forget to call string_replace?"
 
     # Commit staged + unstaged changes
@@ -723,8 +735,11 @@ def submit_fix(explanation: str) -> str:
         except subprocess.CalledProcessError as e:
             logger.warning("Commit failed during submit: %s", e.stderr or e)
 
+    if not committed and not has_agent_commits:
+        return "ERROR: Commit failed and no prior agent commits exist. Cannot submit."
+
     branch = getattr(_tls, "branch_name", "")
-    commit_status = "committed" if committed else ("previous commit exists" if has_commits else "WARNING: commit failed")
+    commit_status = "committed" if committed else "previous agent commit exists"
     return (
         f"OK: Fix submitted.\n"
         f"commit_status={commit_status}\n"
