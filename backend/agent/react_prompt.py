@@ -157,6 +157,40 @@ If run_tests reports lint errors, check whether the erroring lines are in YOUR d
 - If YES: fix them.
 - If NO: they are pre-existing. Proceed to submit_fix — the pre-existing errors are not your problem.
 
+## EXPLORATION STRATEGY
+
+Be surgical. Don't read entire files when you can target specific functions.
+
+1. Start from the bug description. What module/function is mentioned?
+2. Use grep_repo to find where the relevant code lives.
+3. Use read_function (NOT read_file) to read ONLY the suspected buggy function.
+4. Read the callers of that function to understand how it's used.
+5. Form a hypothesis. If unsure, read ONE more function. Then decide.
+
+**Good pattern:** grep → read_function → hypothesis → record_localization (5-8 tool calls)
+**Bad pattern:** list_files → read_file (entire file) → list_files → read_file (another file) (15+ tool calls)
+
+## REPAIR VERIFICATION
+
+After editing, ALWAYS re-read the function you edited to verify the fix looks correct:
+1. string_replace to apply fix
+2. check_syntax to verify no syntax errors
+3. read_function on the edited function to visually confirm the change is right
+4. ONLY THEN proceed to testing
+
+This catches wrong indentation, incomplete edits, and logic errors before wasting test runs.
+
+## WHEN TO ESCALATE
+
+Call escalate immediately if:
+- You've re-read the same file 3+ times without making progress
+- The bug requires changes to 5+ files
+- The bug involves concurrency, race conditions, or distributed systems
+- You can't reproduce the described behavior from the code you see
+- Tests keep failing for reasons unrelated to your fix
+
+Escalating early saves money. A wrong fix is worse than no fix.
+
 ## IMPORTANT
 
 Find the bug, fix it, test it, get it reviewed, and submit. Be methodical but efficient.
@@ -165,13 +199,23 @@ Stop exploring as soon as you have enough evidence. Make minimal, targeted fixes
 
 def build_task_message(work_order: dict, intent: dict) -> str:
     """Build the initial user message that kicks off the ReAct loop."""
+    hint_modules = intent.get("likely_affected_modules", [])
+    hint_functions = intent.get("likely_affected_functions", [])
+
+    # Build a focused starting instruction
+    start_hint = ""
+    if hint_functions:
+        start_hint = f"Start by reading function(s) {hint_functions} with read_function."
+    elif hint_modules:
+        start_hint = f"Start by examining {hint_modules} with grep_repo or read_function."
+    else:
+        start_hint = "Start by grepping for keywords from the bug description."
+
     return (
         f"Fix this bug: {work_order.get('title', '')}\n\n"
-        f"Start by exploring the codebase to find the root cause. "
-        f"The likely location is: {intent.get('likely_affected_modules', [])} / "
-        f"{intent.get('likely_affected_functions', [])}\n\n"
-        f"When you've found and fixed the bug, tested it, and gotten it reviewed, "
-        f"call submit_fix with your explanation."
+        f"{start_hint}\n\n"
+        f"Goal: find root cause → record_localization → create_sandbox → fix → test → review → submit_fix.\n"
+        f"Be efficient. Target 15-25 tool calls total."
     )
 
 

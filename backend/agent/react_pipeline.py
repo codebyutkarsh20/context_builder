@@ -210,6 +210,23 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     from agent.pipeline import _build_kickstart_context, _load_business_rules
     kickstart = _build_kickstart_context(repo_name, str(repo_path), intent, DATA_DIR)
 
+    # Add repo structure snapshot (saves 2-3 list_files calls)
+    try:
+        top_level = subprocess.run(
+            ["find", str(repo_path), "-maxdepth", "2", "-name", "*.py", "-not", "-path", "*/.*"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if top_level.stdout:
+            py_files = sorted(set(
+                str(Path(f.strip()).relative_to(repo_path))
+                for f in top_level.stdout.strip().split("\n")
+                if f.strip() and "__pycache__" not in f
+            ))[:30]
+            if py_files:
+                kickstart += "\n\nREPO STRUCTURE (top-level .py files):\n" + "\n".join(f"  {f}" for f in py_files)
+    except Exception:
+        pass
+
     # Load conventions and business rules
     from agent.react_prompt import (
         build_system_prompt,
