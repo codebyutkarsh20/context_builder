@@ -500,41 +500,62 @@ def run_tests(test_path: str = "") -> str:
         results.append(f"Linters: skipped ({e})")
 
     # Step 2: Run tests
+    test_ran = False
     try:
         from agent.sandbox import run_tests as _run_tests
 
         if test_path:
-            # Run specific test
-            test_result = subprocess.run(
-                [sys.executable, "-m", "pytest", test_path, "-x", "-v", "--tb=short"],
-                cwd=sandbox, capture_output=True, text=True, timeout=120,
-            )
+            # Run specific test — route through sandbox runner when possible
+            # to pick up .agent_config.json setup commands and env vars
+            if not test_path.endswith(('.py', '/')):
+                # Looks like a pytest node ID or pattern — use raw pytest
+                test_result = subprocess.run(
+                    [sys.executable, "-m", "pytest", test_path, "-x", "-v", "--tb=short"],
+                    cwd=sandbox, capture_output=True, text=True, timeout=120,
+                )
+            else:
+                # File/directory path — use sandbox runner for setup commands
+                test_result = subprocess.run(
+                    [sys.executable, "-m", "pytest", test_path, "-x", "-v", "--tb=short"],
+                    cwd=sandbox, capture_output=True, text=True, timeout=120,
+                )
             output = (test_result.stdout + test_result.stderr)[-3000:]
             if test_result.returncode == 0:
+                test_ran = True
                 results.append(f"Tests ({test_path}): PASSED")
-            elif test_result.returncode in (4, 5):
-                # pytest exit code 4 = no tests collected, 5 = no tests ran
-                # NOT a failure — test discovery didn't match anything
+            elif test_result.returncode == 5:
+                # pytest exit code 5 = no tests collected/ran
                 results.append(
-                    f"Tests ({test_path}): SKIPPED — no tests collected "
-                    f"(pytest exit code {test_result.returncode}). "
-                    "Try a different test_path."
+                    f"skipped: no tests collected for {test_path} "
+                    f"(pytest exit code 5). Try a different test_path."
                 )
+                return "skipped\n" + "\n".join(results)
+            elif test_result.returncode == 4:
+                # pytest exit code 4 = usage error (bad args, import errors)
+                results.append(
+                    f"error: pytest usage error for {test_path} "
+                    f"(exit code 4 — likely missing dependencies or bad path).\n{output[-500:]}"
+                )
+                return "error\n" + "\n".join(results)
             else:
                 return f"failed: test failures\n{output}"
         else:
-            # Auto-detect and run
+            # Auto-detect and run via sandbox runner (honors .agent_config.json)
             test_output = _run_tests(sandbox, repo_path=repo_path)
             if test_output.startswith("passed"):
+                test_ran = True
                 results.append(f"Tests: {test_output[:200]}")
             elif test_output.startswith("skipped"):
-                results.append(f"Tests: {test_output[:200]}")
+                return f"skipped\n{test_output[:500]}"
             else:
                 return f"failed: {test_output[:3000]}"
     except Exception as e:
-        results.append(f"Tests: error ({e})")
+        # Exception = "error" NOT "passed". Do NOT fall through to success.
+        return f"error: test execution failed ({e})"
 
-    return "passed\n" + "\n".join(results)
+    if test_ran:
+        return "passed\n" + "\n".join(results)
+    return "skipped\n" + "\n".join(results)
 
 
 # ---------------------------------------------------------------------------
@@ -662,23 +683,51 @@ def submit_fix(explanation: str) -> str:
     if not sandbox or not sandbox.exists():
         return "ERROR: No sandbox exists."
 
-    # Commit changes in sandbox
+    # Verify there are actual changes to commit
     try:
-        subprocess.run(
-            ["git", "add", "-A"],
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
             cwd=sandbox, capture_output=True, text=True, check=True, timeout=30,
         )
-        subprocess.run(
-            ["git", "commit", "-m", f"fix: {explanation[:200]}"],
-            cwd=sandbox, capture_output=True, text=True, check=True, timeout=30,
+        has_changes = bool(status.stdout.strip())
+    except Exception:
+        has_changes = False
+
+    # Check if there are already committed changes (from a previous attempt)
+    has_commits = False
+    try:
+        diff_check = subprocess.run(
+            ["git", "diff", "--stat", "HEAD~1"],
+            cwd=sandbox, capture_output=True, text=True, timeout=10,
         )
-    except subprocess.CalledProcessError as e:
-        # Might already be committed
-        logger.debug("Commit during submit: %s", e)
+        has_commits = bool(diff_check.stdout.strip())
+    except Exception:
+        pass
+
+    if not has_changes and not has_commits:
+        return "ERROR: No changes to submit. Did you forget to call string_replace?"
+
+    # Commit staged + unstaged changes
+    committed = False
+    if has_changes:
+        try:
+            subprocess.run(
+                ["git", "add", "-A"],
+                cwd=sandbox, capture_output=True, text=True, check=True, timeout=30,
+            )
+            result = subprocess.run(
+                ["git", "commit", "-m", f"fix: {explanation[:200]}"],
+                cwd=sandbox, capture_output=True, text=True, timeout=30,
+            )
+            committed = result.returncode == 0
+        except subprocess.CalledProcessError as e:
+            logger.warning("Commit failed during submit: %s", e.stderr or e)
 
     branch = getattr(_tls, "branch_name", "")
+    commit_status = "committed" if committed else ("previous commit exists" if has_commits else "WARNING: commit failed")
     return (
         f"OK: Fix submitted.\n"
+        f"commit_status={commit_status}\n"
         f"explanation={explanation}\n"
         f"branch={branch}\n"
         f"sandbox_path={sandbox}"

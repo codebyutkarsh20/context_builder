@@ -120,9 +120,13 @@ You have a budget of ~30 tool calls. Successful fixes average 15-25 calls. Plan 
 
 - You MUST call create_sandbox before string_replace or create_file
 - You MUST attempt run_tests at least once before submit_fix
-- If tests return "skipped" or "error" (repo can't run tests), that counts — proceed to review
-- If tests return "failed" with actual assertion failures, fix the issue and re-test
-- Do NOT retry run_tests more than 3 times with different paths. If it can't run, move on.
+- Test results and what they mean:
+  - "passed" → tests ran and passed. Proceed to review.
+  - "skipped" → no tests could be collected (missing deps). Proceed to review.
+  - "error" → test execution failed (import error, bad path). Proceed to review.
+  - "failed" → actual assertion failures. Fix the issue and re-test.
+- Only "failed" blocks submission. "skipped" and "error" are acceptable.
+- Do NOT retry run_tests more than 3 times. If it can't run, move on.
 - You MUST call request_review before submit_fix
 - After 3 failed test/review cycles, call escalate with a clear reason
 - Do NOT modify files unrelated to the bug

@@ -190,9 +190,13 @@ def update_from_tool_result(
         if result.startswith("passed"):
             gs.tests_passed = True
             gs.test_failure_count = 0
-        elif result.startswith("skipped") or "no tests collected" in result.lower():
+        elif result.startswith("skipped") or result.startswith("error"):
+            # "skipped" = no tests collected/ran (exit code 5, missing deps)
+            # "error" = test execution failed (import error, bad path, exit code 4)
+            # Both count as "attempted but couldn't run" — agent may proceed
             gs.tests_skipped = True
         elif result.startswith("failed"):
+            # Actual assertion failures — agent must fix before submitting
             gs.tests_passed = False
             gs.test_failure_count += 1
 
