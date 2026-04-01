@@ -1,12 +1,7 @@
 """
-runner.py — A/B eval runner that orchestrates both pipelines on a bug dataset.
+eval/runner.py — Eval suite runner with timeout isolation and trace persistence.
 
-Supports:
-  - A/B mode: run each bug on fixed + ReAct pipelines
-  - Single pipeline mode: run on one only
-  - Sentinel mode: run 5 fast bugs for quick regression checks
-  - Per-case timeout with crash isolation
-  - Graph-less execution (exploration tools work on raw repos)
+Runs bugs through the ReAct pipeline, scores results, persists traces per-run.
 """
 
 from __future__ import annotations
@@ -15,16 +10,16 @@ import concurrent.futures
 import json
 import logging
 import os
+import subprocess
 import time
 import traceback
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .dataset import load_eval_dataset, EvalBug
-from .repo_manager import RepoManager
-from .scoring import score_case, build_summary
+from agent.eval.dataset import load_eval_dataset
+from agent.eval.scoring import score_case, build_summary
 
 logger = logging.getLogger(__name__)
 
@@ -49,12 +44,15 @@ class EvalCaseResult:
     error: str = ""
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Drop full trace from serialized report (too large for aggregate JSON)
+        d.pop("trace_report", None)
+        return d
 
 
 @dataclass
 class EvalRunReport:
-    """Complete report for one eval run."""
+    """Complete eval run report."""
     run_id: str
     timestamp: float
     dataset_path: str
@@ -62,13 +60,23 @@ class EvalRunReport:
     pipelines: list[str]
     results: list[EvalCaseResult] = field(default_factory=list)
     summary: dict = field(default_factory=dict)
-    comparison: dict = field(default_factory=dict)
-    graph_less: bool = True
+    comparison: dict | None = None
+    graph_less: bool = False
+    commit_sha: str = ""
 
     def to_dict(self) -> dict:
-        d = asdict(self)
-        d["results"] = [r.to_dict() for r in self.results]
-        return d
+        return {
+            "run_id": self.run_id,
+            "timestamp": self.timestamp,
+            "dataset_path": self.dataset_path,
+            "total_bugs": self.total_bugs,
+            "pipelines": self.pipelines,
+            "results": [r.to_dict() for r in self.results],
+            "summary": self.summary,
+            "comparison": self.comparison,
+            "graph_less": self.graph_less,
+            "commit_sha": self.commit_sha,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -76,18 +84,11 @@ class EvalRunReport:
 # ---------------------------------------------------------------------------
 
 class EvalRunner:
-    """A/B eval runner for the AI Deploy Agent.
-
-    Runs each bug through one or both pipelines, scores results,
-    builds aggregate summaries, and persists reports.
-
-    Graph-less by default: eval runs do NOT require Neo4j. Both pipelines
-    fall back to exploration tools (grep, read_file, etc.) on raw repos.
-    """
+    """Run eval bugs through the ReAct pipeline."""
 
     def __init__(
         self,
-        dataset_path: Path | str = Path("eval/bugs.json"),
+        dataset_path: str | Path = "eval/bugs.json",
         pipelines: list[str] | None = None,
         timeout_per_case: int = EVAL_CASE_TIMEOUT,
         create_prs: bool = False,
@@ -100,6 +101,7 @@ class EvalRunner:
         self.dry_run = not create_prs
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        from agent.eval.repo_manager import RepoManager
         self.repo_manager = RepoManager(cache_dir=repo_cache_dir)
 
     def run(
@@ -136,6 +138,17 @@ class EvalRunner:
             logger.info("Sentinel mode: running first %d bugs", len(bugs))
 
         run_id = str(uuid.uuid4())[:8]
+
+        # Capture commit SHA for cross-run comparison
+        commit_sha = ""
+        try:
+            commit_sha = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except Exception:
+            pass
+
         report = EvalRunReport(
             run_id=run_id,
             timestamp=time.time(),
@@ -143,11 +156,12 @@ class EvalRunner:
             total_bugs=len(bugs),
             pipelines=list(self.pipelines),
             graph_less=True,
+            commit_sha=commit_sha,
         )
 
         logger.info(
-            "Starting eval run %s: %d bugs × %d pipeline(s) = %d cases",
-            run_id, len(bugs), len(self.pipelines), len(bugs) * len(self.pipelines),
+            "Starting eval run %s (commit %s): %d bugs × %d pipeline(s) = %d cases",
+            run_id, commit_sha or "?", len(bugs), len(self.pipelines), len(bugs) * len(self.pipelines),
         )
 
         for i, bug in enumerate(bugs):
@@ -170,7 +184,7 @@ class EvalRunner:
 
             # Run each pipeline
             for pipeline in self.pipelines:
-                case_result = self._run_single_case(bug, repo_path, pipeline)
+                case_result = self._run_single_case(bug, repo_path, pipeline, run_id)
                 report.results.append(case_result)
 
             if progress_cb:
@@ -194,9 +208,14 @@ class EvalRunner:
         return report
 
     def _run_single_case(
-        self, bug: dict, repo_path: Path, pipeline: str
+        self, bug: dict, repo_path: Path, pipeline: str, run_id: str = ""
     ) -> EvalCaseResult:
-        """Run one bug through one pipeline with timeout isolation."""
+        """Run one bug through one pipeline with timeout isolation.
+
+        Uses ThreadPoolExecutor WITHOUT context manager to avoid shutdown(wait=True)
+        blocking on timeout. On timeout, shutdown(wait=False, cancel_futures=True)
+        abandons the worker immediately.
+        """
         from agent.trace import RunTrace
 
         trace = RunTrace(job_id=f"{bug['ticket_id']}_{pipeline}", enabled=True)
@@ -205,20 +224,25 @@ class EvalRunner:
         case_start = time.time()
         result: dict
 
+        # Do NOT use `with executor:` — its __exit__ calls shutdown(wait=True)
+        # which blocks until the worker finishes, defeating the timeout.
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    self._invoke_pipeline, pipeline, work_order, trace
-                )
-                result = future.result(timeout=self.timeout_per_case)
+            future = executor.submit(
+                self._invoke_pipeline, pipeline, work_order, trace
+            )
+            result = future.result(timeout=self.timeout_per_case)
         except concurrent.futures.TimeoutError:
             logger.error(
                 "%s/%s timed out after %ds", bug["ticket_id"], pipeline, self.timeout_per_case
             )
             result = {"status": "failed", "error": f"Timeout after {self.timeout_per_case}s"}
+            executor.shutdown(wait=False, cancel_futures=True)
         except Exception as e:
             logger.exception("%s/%s crashed", bug["ticket_id"], pipeline)
             result = {"status": "failed", "error": str(e), "_traceback": traceback.format_exc()}
+        else:
+            executor.shutdown(wait=False)
 
         duration = round(time.time() - case_start, 2)
 
@@ -243,9 +267,9 @@ class EvalRunner:
 
         trace_report = trace.to_report()
 
-        # Save individual trace JSON for detailed analysis
-        trace_dir = self.results_dir / "traces"
-        trace_dir.mkdir(exist_ok=True)
+        # Save individual trace JSON — scoped by run_id to prevent clobbering
+        trace_dir = self.results_dir / "traces" / (run_id or "unknown")
+        trace_dir.mkdir(parents=True, exist_ok=True)
         trace_path = trace_dir / f"{bug['ticket_id']}_{pipeline}.json"
         try:
             trace_path.write_text(json.dumps(trace_report, indent=2, default=str))
@@ -290,42 +314,27 @@ class EvalRunner:
 
         comparison_metrics = [
             "pass_rate", "localization_accuracy", "fix_rate",
-            "approval_rate", "patch_correctness_avg", "avg_cost_usd",
-            "avg_duration_seconds",
+            "avg_tool_calls", "avg_cost_usd",
         ]
-
         deltas = {}
         for metric in comparison_metrics:
-            v1 = s1.get(metric, 0.0)
-            v2 = s2.get(metric, 0.0)
-            deltas[metric] = {
-                p1: v1,
-                p2: v2,
-                "delta": round(v2 - v1, 4),
-            }
+            v1 = s1.get(metric, 0)
+            v2 = s2.get(metric, 0)
+            if isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+                deltas[metric] = {p1: v1, p2: v2, "delta": round(v2 - v1, 4)}
 
         # Per-bug comparison
-        per_bug = []
-        bug_ids = list(dict.fromkeys(r.ticket_id for r in report.results))
-        for tid in bug_ids:
-            r1 = next((r for r in report.results if r.ticket_id == tid and r.pipeline == p1), None)
-            r2 = next((r for r in report.results if r.ticket_id == tid and r.pipeline == p2), None)
-            per_bug.append({
-                "ticket_id": tid,
-                p1: {
-                    "pass": r1.score.get("full_pass", False) if r1 else False,
-                    "cost": r1.cost_usd if r1 else 0,
-                    "duration": r1.duration_seconds if r1 else 0,
-                },
-                p2: {
-                    "pass": r2.score.get("full_pass", False) if r2 else False,
-                    "cost": r2.cost_usd if r2 else 0,
-                    "duration": r2.duration_seconds if r2 else 0,
-                },
-                "winner": _pick_winner(r1, r2, p1, p2),
-            })
+        per_bug: dict[str, dict] = {}
+        for r in report.results:
+            if r.ticket_id not in per_bug:
+                per_bug[r.ticket_id] = {}
+            per_bug[r.ticket_id][r.pipeline] = {
+                "pass": r.score.get("full_pass", False),
+                "cost": r.cost_usd,
+                "tool_calls": r.score.get("tool_call_count", 0),
+            }
 
-        # Overall winner
+        # Overall winner by pass rate
         pass1 = s1.get("pass_rate", 0)
         pass2 = s2.get("pass_rate", 0)
         if pass1 > pass2:
@@ -333,7 +342,6 @@ class EvalRunner:
         elif pass2 > pass1:
             overall_winner = p2
         else:
-            # Tiebreak on cost
             cost1 = s1.get("avg_cost_usd", 0)
             cost2 = s2.get("avg_cost_usd", 0)
             overall_winner = p1 if cost1 <= cost2 else p2
@@ -376,6 +384,7 @@ class EvalRunner:
         entry = {
             "run_id": report.run_id,
             "timestamp": report.timestamp,
+            "commit_sha": report.commit_sha,
             "total_bugs": report.total_bugs,
             "pipelines": report.pipelines,
         }
@@ -395,53 +404,25 @@ class EvalRunner:
 # ---------------------------------------------------------------------------
 
 def _bug_to_work_order(bug: dict, repo_path: Path) -> dict:
-    """Convert EvalBug to pipeline work_order format."""
+    """Convert eval bug dict to pipeline work_order."""
+    repo_name = (
+        bug.get("repo_name")
+        or bug.get("repo")
+        or bug["ticket_id"].lower()
+    )
     return {
         "ticket_id": bug["ticket_id"],
-        "title": bug.get("title", ""),
+        "title": bug.get("title", bug["ticket_id"]),
         "description": bug.get("description", ""),
-        "repo_name": bug.get("repo_name", bug["ticket_id"].lower()),
+        "repo_name": repo_name,
         "repo_path": str(repo_path),
         "priority": bug.get("priority", "medium"),
         "comments": bug.get("comments", []),
     }
 
 
-def _error_score(bug: dict, pipeline: str, error: str) -> dict:
-    """Generate a failure score for a bug that couldn't be run."""
-    return {
-        "ticket_id": bug["ticket_id"],
-        "title": bug.get("title", ""),
-        "pipeline": pipeline,
-        "localization_hit": False,
-        "root_cause_match": False,
-        "fix_generated": False,
-        "review_approved": False,
-        "confidence": 0.0,
-        "patch_correctness": 0.0,
-        "multi_file_complete": False,
-        "test_pass": False,
-        "patch_hits_target": False,
-        "cost_usd": 0.0,
-        "duration_seconds": 0.0,
-        "tool_call_count": 0,
-        "status": "failed",
-        "error": error,
-        "full_pass": False,
-    }
-
-
-def _pick_winner(
-    r1: EvalCaseResult | None, r2: EvalCaseResult | None, p1: str, p2: str
-) -> str:
-    """Pick winner for a single bug comparison."""
-    if r1 is None and r2 is None:
-        return "tie"
-    if r1 is None:
-        return p2
-    if r2 is None:
-        return p1
-
+def _pick_winner(r1: EvalCaseResult, r2: EvalCaseResult, p1: str, p2: str) -> str:
+    """Pick a winner between two pipeline results for the same bug."""
     pass1 = r1.score.get("full_pass", False)
     pass2 = r2.score.get("full_pass", False)
 
@@ -449,12 +430,22 @@ def _pick_winner(
         return p1
     if pass2 and not pass1:
         return p2
-    if not pass1 and not pass2:
-        return "neither"
+    if pass1 and pass2:
+        # Both pass — cheaper wins
+        return f"{p2} (cheaper)" if r2.cost_usd < r1.cost_usd else f"{p1} (cheaper)"
+    return "neither"
 
-    # Both passed — tiebreak on cost
-    if r1.cost_usd < r2.cost_usd:
-        return f"{p1} (cheaper)"
-    elif r2.cost_usd < r1.cost_usd:
-        return f"{p2} (cheaper)"
-    return "tie"
+
+def _error_score(bug: dict, pipeline: str, error_msg: str) -> dict:
+    """Build an error score dict for cases that fail before the pipeline runs."""
+    return {
+        "ticket_id": bug["ticket_id"],
+        "pipeline": pipeline,
+        "localization_hit": False,
+        "root_cause_match": False,
+        "fix_generated": False,
+        "review_approved": False,
+        "full_pass": False,
+        "patch_hits_target": False,
+        "error": error_msg,
+    }
