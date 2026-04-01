@@ -16,7 +16,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent.pipeline import _structured_call
+# Use the extracted llm module (pipeline._structured_call delegates to it)
+from agent.llm import structured_call as _structured_call
 
 
 class TestStructuredCallConfig:
@@ -38,7 +39,7 @@ class TestStructuredCallConfig:
 class TestStructuredCallRetry:
     """_structured_call retries on failure with truncated error."""
 
-    @patch("agent.pipeline.ChatAnthropic")
+    @patch("agent.llm.ChatAnthropic")
     def test_retries_on_first_failure(self, mock_cls):
         """First call fails, retry succeeds."""
         mock_llm = MagicMock()
@@ -55,7 +56,7 @@ class TestStructuredCallRetry:
         assert result == expected
         assert mock_structured.invoke.call_count == 2
 
-    @patch("agent.pipeline.ChatAnthropic")
+    @patch("agent.llm.ChatAnthropic")
     def test_raises_if_no_retries(self, mock_cls):
         """With retries=0, first failure raises immediately."""
         mock_llm = MagicMock()
@@ -68,7 +69,7 @@ class TestStructuredCallRetry:
         with pytest.raises(ValueError, match="bad"):
             _structured_call("model", 100, dict, "prompt", retries=0)
 
-    @patch("agent.pipeline.ChatAnthropic")
+    @patch("agent.llm.ChatAnthropic")
     def test_retry_prompt_contains_truncated_error(self, mock_cls):
         """The retry prompt includes the (truncated) error message."""
         mock_llm = MagicMock()
@@ -90,7 +91,7 @@ class TestStructuredCallRetry:
         assert "x" * 1000 in retry_prompt
         assert "x" * 1001 not in retry_prompt
 
-    @patch("agent.pipeline.ChatAnthropic")
+    @patch("agent.llm.ChatAnthropic")
     def test_both_calls_fail_raises(self, mock_cls):
         """If both original and retry fail, the retry error is raised."""
         mock_llm = MagicMock()
@@ -103,7 +104,7 @@ class TestStructuredCallRetry:
         with pytest.raises(ValueError, match="second"):
             _structured_call("model", 100, dict, "prompt", retries=1)
 
-    @patch("agent.pipeline.ChatAnthropic")
+    @patch("agent.llm.ChatAnthropic")
     def test_constructor_params(self, mock_cls):
         """ChatAnthropic is called with correct timeout and max_retries."""
         mock_llm = MagicMock()

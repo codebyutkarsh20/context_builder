@@ -51,9 +51,20 @@ def redact_secrets(text: str) -> str:
     return text
 
 
+def _get_chat_anthropic():
+    """Lazy import so the module can be loaded without langchain installed."""
+    from langchain_anthropic import ChatAnthropic
+    return ChatAnthropic
+
+# Module-level attribute for test patching: @patch("agent.llm.ChatAnthropic")
+ChatAnthropic = None
+
+
 def structured_call(model: str, max_tokens: int, schema: type, prompt: str, retries: int = 1):
     """Call LLM with structured output (tool use). Returns a Pydantic model instance."""
-    from langchain_anthropic import ChatAnthropic
+    global ChatAnthropic
+    if ChatAnthropic is None:
+        ChatAnthropic = _get_chat_anthropic()
 
     approx_tokens = len(prompt) // 4
     logger.info("LLM call: model=%s schema=%s ~%d input tokens", model, schema.__name__, approx_tokens)

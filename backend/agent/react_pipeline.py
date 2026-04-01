@@ -1,13 +1,13 @@
 """
-react_pipeline.py — ReAct agent pipeline (3-node LangGraph).
+react_pipeline.py — ReAct agent pipeline (plain function chain).
 
 Architecture:
-    intake_node → react_agent_node → finalize_node → END
+    intake_node → react_agent_node → finalize_node
 
 The react_agent_node runs a single while-loop where the LLM decides:
 explore → localize → edit → test → review → submit.
 
-This is the ReAct alternative to the fixed 8-node pipeline in pipeline.py.
+No LangGraph dependency. Three functions called sequentially.
 """
 
 from __future__ import annotations
