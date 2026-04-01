@@ -31,17 +31,22 @@ logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
 
 from fastapi.middleware.cors import CORSMiddleware
 
+# Core routers (used by the 3-page frontend: Overview, Agent, Knowledge)
 from api.repos import router as repos_router
-from api.graph import router as graph_router
-from api.context import router as context_router
-from api.search import router as search_router
-from api.chat import router as chat_router
+from api.graph import router as graph_router      # graph/stats + graph/hotspots for Overview
 from api.agent import router as agent_router
 from api.knowledge import router as knowledge_router
-from api.metrics import router as metrics_router
-from api.flags import router as flags_router
 from api.eval import router as eval_router
-from api.tools import router as tools_router
+
+# Unmounted routers — modules still exist for internal use, just not exposed over HTTP.
+# Re-enable by uncommenting the include_router lines below.
+# from api.context import router as context_router   # Context layer visualization
+# from api.search import router as search_router     # Full-text code search
+# from api.chat import router as chat_router         # Q&A chat interface
+# from api.metrics import router as metrics_router   # Metrics dashboard (record_run still works internally)
+# from api.flags import router as flags_router       # Feature flag management
+# from api.tools import router as tools_router       # MCP tool endpoints
+
 from graph.neo4j_client import neo4j_client
 
 
@@ -77,17 +82,20 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
+# Core routers — used by frontend + CLI
 app.include_router(repos_router, prefix="/api")
 app.include_router(graph_router, prefix="/api")
-app.include_router(context_router, prefix="/api")
-app.include_router(search_router, prefix="/api")
-app.include_router(chat_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
 app.include_router(knowledge_router, prefix="/api")
-app.include_router(metrics_router, prefix="/api")
-app.include_router(flags_router, prefix="/api")
 app.include_router(eval_router, prefix="/api")
-app.include_router(tools_router, prefix="/api")
+
+# Unmounted — uncomment to re-enable
+# app.include_router(context_router, prefix="/api")
+# app.include_router(search_router, prefix="/api")
+# app.include_router(chat_router, prefix="/api")
+# app.include_router(metrics_router, prefix="/api")
+# app.include_router(flags_router, prefix="/api")
+# app.include_router(tools_router, prefix="/api")
 
 
 @app.get("/health")

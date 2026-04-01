@@ -1,7 +1,7 @@
 import { ReactNode, useState } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
-  LayoutDashboard, GitGraph, Layers, Search, MessageCircle, BookOpen,
+  LayoutDashboard, BookOpen,
   ChevronDown, Check, Plus, Loader2, Cpu, Trash2,
 } from 'lucide-react'
 import { cn } from '../lib/utils'
@@ -14,10 +14,6 @@ interface LayoutProps {
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'Overview', color: 'text-blue-400' },
-  { to: '/graph', icon: GitGraph, label: 'Knowledge Graph', color: 'text-purple-400' },
-  { to: '/context', icon: Layers, label: 'Context Layers', color: 'text-emerald-400' },
-  { to: '/search', icon: Search, label: 'Search', color: 'text-amber-400' },
-  { to: '/chat', icon: MessageCircle, label: 'Ask', color: 'text-cyan-400' },
   { to: '/agent', icon: Cpu, label: 'Agent', color: 'text-rose-400' },
   { to: '/knowledge', icon: BookOpen, label: 'Knowledge', color: 'text-purple-400' },
 ]
