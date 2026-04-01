@@ -89,6 +89,8 @@ Follow these steps in order. You decide when to move to each step.
 - run_tests(test_path) — Run tests + linters on your changes. **Always pass a specific
   test_path** targeting the test file(s) relevant to your fix (e.g. 'tests/test_helpers.py::TestJSON').
   Running without test_path triggers auto-detect which may fail on repos that need special setup.
+  **If tests return "skipped" or "error" (not "failed"), the repo may lack test dependencies.
+  This is OK — proceed to request_review and submit_fix. Do NOT keep retrying test commands.**
 
 ### Multi-file coordination (call after editing):
 - get_callers(file_path, function_name) — Find files that call/import the code you changed. Use this to check if callers need updating after you modify a function signature.
@@ -105,7 +107,10 @@ Follow these steps in order. You decide when to move to each step.
 ## RULES
 
 - You MUST call create_sandbox before string_replace or create_file
-- You MUST call run_tests before submit_fix
+- You MUST attempt run_tests at least once before submit_fix
+- If tests return "skipped" or "error" (repo can't run tests), that counts — proceed to review
+- If tests return "failed" with actual assertion failures, fix the issue and re-test
+- Do NOT retry run_tests more than 3 times with different paths. If it can't run, move on.
 - You MUST call request_review before submit_fix
 - After 3 failed test/review cycles, call escalate with a clear reason
 - Do NOT modify files unrelated to the bug

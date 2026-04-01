@@ -98,7 +98,10 @@ def _score_patch_correctness(result: dict, bug: dict) -> float:
     for p in patches:
         fp = (p.get("file_path") or "").lower()
         if fp:
-            patched.add(fp)
+            # Normalize: strip test files from the patched set for correctness scoring
+            # (agent may add tests, which is good but not a "fix" file)
+            if not fp.startswith("test") and "/test" not in fp:
+                patched.add(fp)
 
     if not patched:
         return 0.0
@@ -116,6 +119,53 @@ def _score_patch_correctness(result: dict, bug: dict) -> float:
         return 0.0
 
     return round(intersection / max(len(expected), len(patched)), 4)
+
+
+def _score_ground_truth_file_match(result: dict, bug: dict) -> dict:
+    """Detailed ground truth comparison at file level.
+
+    Returns a dict with:
+      - matched_files: files correctly identified and patched
+      - missing_files: expected files not patched
+      - extra_files: files patched but not in ground truth
+      - file_precision: matched / (matched + extra)
+      - file_recall: matched / (matched + missing)
+      - file_f1: harmonic mean of precision and recall
+    """
+    expected = set(f.lower() for f in bug.get("expected_patch_files", bug.get("expected_files", [])))
+
+    repair = result.get("repair") or {}
+    patches = repair.get("patches") or []
+    patched = set()
+    for p in patches:
+        fp = (p.get("file_path") or "").lower()
+        if fp and not fp.startswith("test") and "/test" not in fp:
+            patched.add(fp)
+
+    matched = set()
+    for exp in expected:
+        for pat in patched:
+            if exp in pat or pat.endswith(exp) or pat in exp:
+                matched.add(exp)
+                break
+
+    missing = expected - matched
+    extra = patched - {p for p in patched if any(
+        e in p or p.endswith(e) or p in e for e in expected
+    )}
+
+    precision = len(matched) / (len(matched) + len(extra)) if (len(matched) + len(extra)) > 0 else 0.0
+    recall = len(matched) / (len(matched) + len(missing)) if (len(matched) + len(missing)) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "matched_files": sorted(matched),
+        "missing_files": sorted(missing),
+        "extra_files": sorted(extra),
+        "file_precision": round(precision, 4),
+        "file_recall": round(recall, 4),
+        "file_f1": round(f1, 4),
+    }
 
 
 def _score_multi_file_complete(result: dict, bug: dict) -> bool:
@@ -199,6 +249,13 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
     loc_hit = _score_localization_hit(result, expected_files)
     fix_gen = _score_fix_generated(result)
     approved = _score_review_approved(result)
+    patch_correctness = _score_patch_correctness(result, bug)
+    hits_target = _score_patch_hits_target(result, expected_files)
+    gt_match = _score_ground_truth_file_match(result, bug)
+
+    # full_pass requires: localization + fix + patches target the right files
+    # (review_approved is informational, not a gate — Claude reviewing Claude has bias)
+    full_pass = loc_hit and fix_gen and hits_target
 
     return {
         "ticket_id": bug["ticket_id"],
@@ -213,10 +270,18 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
         "confidence": _get_review_confidence(result),
 
         # New metrics
-        "patch_correctness": _score_patch_correctness(result, bug),
+        "patch_correctness": patch_correctness,
         "multi_file_complete": _score_multi_file_complete(result, bug),
         "test_pass": _score_test_pass(result),
-        "patch_hits_target": _score_patch_hits_target(result, expected_files),
+        "patch_hits_target": hits_target,
+
+        # Ground truth comparison
+        "gt_file_precision": gt_match["file_precision"],
+        "gt_file_recall": gt_match["file_recall"],
+        "gt_file_f1": gt_match["file_f1"],
+        "gt_matched_files": gt_match["matched_files"],
+        "gt_missing_files": gt_match["missing_files"],
+        "gt_extra_files": gt_match["extra_files"],
 
         # Resource tracking
         "cost_usd": result.get("cost_usd", 0.0) or 0.0,
@@ -226,8 +291,9 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
         "status": str(result.get("status", "unknown")),
         "error": result.get("error", ""),
 
-        # Derived
-        "full_pass": loc_hit and fix_gen and approved,
+        # Derived — requires localization + fix + correct target files
+        # (NOT gated on review_approved — that's self-review bias)
+        "full_pass": full_pass,
     }
 
 

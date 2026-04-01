@@ -35,6 +35,8 @@ class GuardrailState:
         self.sandbox_created: bool = False
         self.sandbox_path: str = ""
         self.tests_passed: bool = False
+        self.tests_attempted: bool = False  # True after any run_tests call
+        self.tests_skipped: bool = False    # True if tests can't run (exit 4/5)
         self.test_failure_count: int = 0
         self.review_approved: bool = False
         self.review_verdict: str = ""
@@ -97,8 +99,11 @@ def check_tool_call(
         missing = []
         if not gs.sandbox_created:
             missing.append("create_sandbox (no sandbox exists)")
-        if not gs.tests_passed:
-            missing.append("run_tests (tests must pass)")
+        if not gs.tests_attempted:
+            missing.append("run_tests (must attempt tests at least once)")
+        elif not gs.tests_passed and not gs.tests_skipped:
+            # Tests ran and FAILED (actual assertion failures) — block
+            missing.append("run_tests (tests failed — fix the failures first)")
         if not gs.review_approved:
             missing.append("request_review (review must approve)")
         if missing:
@@ -135,9 +140,12 @@ def update_from_tool_result(
                 gs.sandbox_path = line.split("sandbox_path=")[-1].strip()
 
     elif tool_name == "run_tests":
+        gs.tests_attempted = True
         if result.startswith("passed"):
             gs.tests_passed = True
-            gs.test_failure_count = 0  # Reset on success
+            gs.test_failure_count = 0
+        elif result.startswith("skipped") or "no tests collected" in result.lower():
+            gs.tests_skipped = True
         elif result.startswith("failed"):
             gs.tests_passed = False
             gs.test_failure_count += 1
