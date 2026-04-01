@@ -3253,8 +3253,15 @@ def build_agent_graph():
     return graph.compile()
 
 
-# Module-level compiled graph
-agent_app = build_agent_graph()
+# Lazy graph compilation — only built when run_ticket() is called,
+# not at import time. Fixes test collection crashes.
+agent_app = None
+
+def _get_agent_app():
+    global agent_app
+    if agent_app is None:
+        agent_app = build_agent_graph()
+    return agent_app
 
 
 def run_ticket(
@@ -3300,7 +3307,7 @@ def run_ticket(
     }
 
     try:
-        result = agent_app.invoke(initial_state)
+        result = _get_agent_app().invoke(initial_state)
         result_dict = dict(result)
         # Record metrics (Step 20)
         try:

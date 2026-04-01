@@ -21,8 +21,6 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from langgraph.graph import END, StateGraph
-
 from agent.types import PipelineStatus, ReactAgentState
 
 if TYPE_CHECKING:
@@ -481,28 +479,10 @@ def _cleanup_sandbox(sandbox_path: str, repo_path: Path | None, branch_name: str
 
 
 # ---------------------------------------------------------------------------
-# Graph construction
+# Pipeline execution — plain function chain, no LangGraph needed.
+# The old StateGraph added complexity for 3 linear nodes with no
+# conditional routing. A simple function sequence does the same thing.
 # ---------------------------------------------------------------------------
-
-def build_react_graph():
-    """Build the 3-node ReAct LangGraph state machine."""
-    graph = StateGraph(ReactAgentState)
-
-    graph.add_node("intake", intake_node)
-    graph.add_node("react_agent", react_agent_node)
-    graph.add_node("finalize", finalize_node)
-
-    graph.set_entry_point("intake")
-    graph.add_edge("intake", "react_agent")
-    graph.add_edge("react_agent", "finalize")
-    graph.add_edge("finalize", END)
-
-    return graph.compile()
-
-
-# Module-level compiled graph
-react_app = build_react_graph()
-
 
 def run_ticket_react(
     work_order: dict,
@@ -512,13 +492,16 @@ def run_ticket_react(
 ) -> dict:
     """Run a bug ticket through the ReAct pipeline.
 
-    Drop-in replacement for pipeline.run_ticket() but uses the ReAct architecture.
+    Three stages executed sequentially:
+      1. intake_node — translate ticket to intent
+      2. react_agent_node — ReAct loop with tools
+      3. finalize_node — create PR or escalate
     """
     _thread_local.progress_callback = progress_cb
     _thread_local.trace = trace
     _thread_local.current_stage = "pending"
 
-    initial_state: ReactAgentState = {
+    state: ReactAgentState = {
         "work_order": work_order,
         "intent": {},
         "sandbox_path": "",
@@ -542,9 +525,11 @@ def run_ticket_react(
     }
 
     try:
-        result = react_app.invoke(initial_state)
-        result_dict = dict(result)
-        # Record metrics (same as fixed pipeline — keeps dashboard current)
+        state = intake_node(state)
+        state = react_agent_node(state)
+        state = finalize_node(state)
+
+        result_dict = dict(state)
         try:
             from api.metrics import record_run
             record_run(result_dict)
