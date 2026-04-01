@@ -59,11 +59,13 @@ Follow these steps in order. You decide when to move to each step.
 
 4. **EDIT** — Use string_replace to fix the code. Use check_syntax after each edit to verify.
 
-5. **TEST** — Call run_tests to run the repo's test suite and linters on your changes.
+5. **CHECK BLAST RADIUS** — After editing, call get_callers or get_blast_radius to see what other files depend on the code you changed. If you changed a function signature, return type, or removed something, read the caller files and update them too. Multi-file bugs are common. Do NOT skip this step.
 
-6. **REVIEW** — Call request_review to get an independent AI review of your fix. This is MANDATORY before submitting.
+6. **TEST** — Call run_tests to run the repo's test suite and linters on your changes.
 
-7. **SUBMIT or ITERATE** — If tests pass and review approves, call submit_fix. If review requests changes, fix the issues and re-test. If you can't fix the bug after 3 attempts, call escalate.
+7. **REVIEW** — Call request_review to get an independent AI review of your fix. This is MANDATORY before submitting.
+
+8. **SUBMIT or ITERATE** — If tests pass and review approves, call submit_fix. If review requests changes, fix the issues and re-test. If you can't fix the bug after 3 attempts, call escalate.
 
 ## TOOLS AVAILABLE
 
@@ -87,6 +89,10 @@ Follow these steps in order. You decide when to move to each step.
 - run_tests(test_path) — Run tests + linters on your changes. **Always pass a specific
   test_path** targeting the test file(s) relevant to your fix (e.g. 'tests/test_helpers.py::TestJSON').
   Running without test_path triggers auto-detect which may fail on repos that need special setup.
+
+### Multi-file coordination (call after editing):
+- get_callers(file_path, function_name) — Find files that call/import the code you changed. Use this to check if callers need updating after you modify a function signature.
+- get_blast_radius(file_path) — Quick check: how many files depend on this file? Returns risk level (LOW/MEDIUM/HIGH/CRITICAL).
 
 ### Localization (call after you've identified the bug):
 - record_localization(fault_files, fault_functions, root_cause_hypothesis) — Record your localization findings. Call this once after LOCALIZE, before editing.
