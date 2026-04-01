@@ -12,9 +12,9 @@ This is solved by building a dual-layer knowledge graph:
 - CODE LAYER: Files → Classes → Functions → Calls/Imports (via Tree-sitter + Neo4j)
 - BUSINESS LAYER: BusinessRules, DomainConcepts, FailureRecords, ExternalDependencies
   linked to code entities via ENFORCED_BY, REPRESENTED_BY, RESULTED_IN_CHANGE edges
-### Problem Statement 2: Developer + Reviewer Agent Pipeline
-Build a LangGraph pipeline: Intake → Developer → Reviewer → PR Agent.
-Agentless-first (hierarchical localization), evolve to agentic (graph-guided navigation).
+### Problem Statement 2: Autonomous Bug-Fixing Agent
+ReAct pipeline: single agent loop with 19 tools decides explore → localize → edit → test → review → submit.
+Evolved from fixed 8-node LangGraph to ReAct architecture (v0.2.0.0, April 2026).
 ## Tech Stack
 - Python 3.11 / FastAPI (agent API)
 - LangGraph (agent orchestration)
@@ -28,26 +28,35 @@ Agentless-first (hierarchical localization), evolve to agentic (graph-guided nav
 - Prometheus + Grafana (monitoring)
 ## Architecture
 agent/
-├── intake/         # Jira → WorkOrder parsing
-├── context/        # Knowledge graph queries + context assembly
-├── localization/   # Hierarchical + graph-guided fault localization
-├── repair/         # Multi-patch generation + test validation
-├── review/         # AI code review with business rule checking
-├── pr/             # GitHub PR creation + test evidence
+├── react_pipeline.py  # 3-node LangGraph: intake → react_agent → finalize (DEFAULT)
+├── react_loop.py      # Core ReAct while-loop with 19 tools
+├── react_tools.py     # Sandbox-aware edit/test/review/submit tools
+├── react_prompt.py    # System prompt builder with context assembly
+├── react_guardrails.py # Safety: sandbox gate, submit gate, anti-pattern detection
+├── context_manager.py # Context window management (observation masking + Haiku summarization)
+├── pipeline.py        # Legacy fixed 8-node pipeline (fallback via --no-react)
+├── explore_tools.py   # Read-only codebase exploration tools (8 tools)
+├── types.py           # AgentState, ReactAgentState, Pydantic models
+├── trace.py           # RunTrace observability with SSE streaming
+├── sandbox.py         # Git worktree sandbox + test execution
+├── patch_utils.py     # Fuzzy patch matching + syntax checking
+├── eval/              # Unified eval package (A/B comparison, 25-bug dataset)
 ├── graph/
-│   ├── builder/    # Tree-sitter → Neo4j pipeline
-│   ├── business/   # Business knowledge extraction + ingestion
-│   └── queries/    # Cypher query templates
-├── embeddings/     # ChromaDB pipeline
-└── eval/           # Evaluation suite
+│   ├── builder.py     # Tree-sitter → Neo4j pipeline
+│   ├── business/      # Business knowledge extraction + ingestion
+│   └── queries.py     # Cypher query templates
+└── embeddings/        # ChromaDB pipeline
 ## Build & Test
 ```bash
 pip install -r backend/requirements.txt
-pytest tests/ -v                                    # All tests
-pytest tests/test_localization.py -v                # Single module
-python -m agent.run --ticket=PROJ-1234 --dry-run    # Test on one ticket
-cd backend && python cli.py build /path/to/repo       # Build knowledge graph
-python -m agent.eval.run --dataset=eval/bugs.json   # Run eval suite
+pytest tests/ -v                                           # All tests
+cd backend && python cli.py build /path/to/repo            # Build knowledge graph
+cd backend && python cli.py fix TICKET --repo /path        # Fix a bug (ReAct, default)
+cd backend && python cli.py fix TICKET --no-react --repo . # Fix with fixed pipeline
+cd backend && python cli.py eval run                       # Run 25-bug eval suite
+cd backend && python cli.py eval run --bug FLASK-2651      # Single bug eval
+cd backend && python cli.py eval report                    # Show latest results
+cd backend && python cli.py eval gate results/latest.json  # CI regression gate
 ```
 ## Key Design Rules
 - MUST use LangGraph for all agent orchestration
@@ -59,16 +68,26 @@ python -m agent.eval.run --dataset=eval/bugs.json   # Run eval suite
 - NEVER hardcode repo-specific knowledge in agent code — it belongs in the knowledge graph
 - NEVER remove validation checks from target code without explicit business rule confirmation
 
-## Current State & Next Steps
-[UPDATE THIS WEEKLY]
-- [ ] Knowledge graph construction pipeline (Tree-sitter → Neo4j)
-- [ ] Business knowledge extraction from git history + Jira
-- [ ] Context assembly with dual-layer graph queries
-- [ ] Localization agent with graph-guided traversal
-- [ ] Repair agent with multi-patch sampling
-- [ ] Review agent with business rule verification
-- [ ] PR creation pipeline
-- [ ] Eval suite against real bug dataset
+## Current State (April 2026)
+- [x] Knowledge graph construction pipeline (Tree-sitter → Neo4j)
+- [x] Business knowledge extraction from git history
+- [x] Context assembly with graph + embeddings + failure signals
+- [x] ReAct agent with 19 tools (explore, edit, test, review, submit)
+- [x] Multi-file coordination tools (get_callers, get_blast_radius)
+- [x] Prompt caching (Anthropic server-side, ~87% savings on prefix)
+- [x] Context window management (observation masking + Haiku summarization)
+- [x] Eval suite: 25 bugs from SWE-bench + open source, A/B comparison
+- [x] PR creation pipeline (dry_run + real PR via gh CLI)
+- [ ] Real Jira integration (currently mock intake)
+- [ ] Multi-candidate patch sampling (generate 3-5, pick best)
+- [ ] Production feedback loop (Sentry/PagerDuty → graph)
+- [ ] Container sandbox isolation (Docker --network none)
+
+### Eval Results (25-bug dataset, ReAct pipeline)
+- Localization: 96% (24/25 find the right file)
+- Submit rate: 40% (10/25 produce a fix)
+- Pass rate: 40% (10/25 fix + correct file)
+- Avg cost: $1.92/bug, avg 32 tool calls for successes
 
 ## Dashboard
 A React + FastAPI dashboard visualizes the knowledge graph and context output.

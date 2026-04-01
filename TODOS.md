@@ -2,6 +2,30 @@
 
 ## Active
 
+### P0 — Integration tests for react tool/guardrail/prompt contract
+**What:** Write regression tests covering: run_tests exit code classification (0/1/2/3/4/5), submit_fix terminal vs non-terminal behavior, guardrail acceptance of passed/skipped/error/failed, prompt-guardrail contract alignment.
+**Why:** Contract bugs were found 4 times by external agent review. Each time the prompt, tool, and guardrail had drifted without tests catching it. This is the highest-risk technical debt.
+**Context:** Identified across multiple review rounds (April 2026). Files: react_tools.py, react_guardrails.py, react_prompt.py, sandbox.py.
+
+### P1 — Multi-candidate patch sampling
+**What:** Generate 3-5 candidate patches per bug, test all, pick the one that passes. Based on SWE-bench research showing 3-8% gain from ensembling.
+**Why:** Current pipeline generates 1 patch. If it's wrong, the agent spirals trying to fix it. Multiple candidates + test filtering is the cheapest quality improvement.
+**Context:** SWE-bench research (April 2026). Agentless uses 42 candidates.
+
+### P1 — Expand eval dataset with multi-file bugs
+**What:** Add 8-10 multi-file bugs from SWE-bench. Current 25 bugs are all single-file.
+**Why:** Real production bugs are ~50% multi-file. We have get_callers/get_blast_radius tools but no eval data to test them.
+
+### P1 — Real Jira integration
+**What:** Connect to real Jira board, pull tickets, run agent, track PR review outcomes.
+**Why:** The 80% approval target is unmeasurable without real human reviewers on real bugs.
+
+### P2 — Extract shared utilities from pipeline.py
+**What:** Move _structured_call, _run_repo_linters, _build_reviewer_context, _load_graph_data, _find_callers_from_graph into standalone modules. React tools import these from pipeline.py which forces loading the entire fixed pipeline.
+**Why:** pipeline.py is 3300 lines. Importing it pulls in langchain_anthropic at module load, breaking test collection.
+
+## Active (inherited)
+
 ### P2 — Validate ENFORCED_BY edge precision before production use
 **What:** Run `BusinessLogicExtractor` on 20 manually annotated functions, measure precision/recall of ENFORCED_BY edges. Gate business context injection on >80% precision.
 **Why:** The extractor links rules to functions by docstring keyword matching. If precision is low (<80%), repair prompts get noisy rule context that degrades fix quality (-3% per research findings).

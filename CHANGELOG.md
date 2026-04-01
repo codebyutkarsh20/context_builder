@@ -9,21 +9,40 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - Unified eval package (`backend/agent/eval/`) with A/B pipeline comparison, 11 scoring metrics, regression gates, and GitHub PR review tracking.
-- Context window management (`context_manager.py`) with 3-layer strategy: per-tool output caps, observation masking, and Haiku summarization safety net.
+- Context window management (`context_manager.py`) with 3-layer strategy: per-tool output caps, observation masking (15-turn window), and Haiku summarization safety net (120K trigger).
 - `record_localization` tool for explicit fault location tracking in ReAct pipeline.
+- Multi-file coordination tools: `get_callers` and `get_blast_radius` query knowledge graph for dependent files.
 - CLI eval subgroup: `python cli.py eval run/curate/report/gate/track-prs`.
+- 25-bug eval dataset expanded from SWE-bench Lite (9 repos: Django, Sympy, Requests, Pytest, Scikit-learn, Sphinx, Matplotlib, Astropy, xarray).
 - 32 tests for the new eval package.
+- Anthropic prompt caching on system prompt (~87% savings on static prefix across 30+ LLM calls).
+- Tool call budget system with per-phase allocation (explore: 6-10, edit: 3-5, verify: 3-5).
+- Anti-pattern detection: advisory warnings at 8+ greps, 10+ reads, 3+ tests, 4+ edits, 2+ reviews.
+- Ground truth file matching in scoring (precision/recall/F1 against expected_patch_files).
+- Context window usage logging every 10 tool calls.
 
 ### Fixed
 
 - ReAct agent no longer wastes tool calls on absolute sandbox paths (auto-strips prefixes).
 - Diff-scoped linting: only flags errors on lines the agent changed, not pre-existing repo issues.
-- Pytest exit codes 4/5 (no tests collected) correctly return "skipped" instead of "failed".
-- `submit_fix` guardrail bypass: blocked calls no longer set `state["submitted"] = True`.
+- Pytest exit code 4 correctly classified as USAGE_ERROR (not "no tests collected").
+- Pytest exit codes 2 (interrupted) and 3 (internal error) return "error:", not "failed:".
+- `run_tests` exception no longer falls through to "passed" (was P0 bug).
+- `run_tests(test_path)` now routes through `sandbox.run_tests` with full config support.
+- `submit_fix` only marks terminal success when tool returns "OK:" (not on errors).
+- `submit_fix` checks for agent-created commits vs base branch (not HEAD~1 false positive).
+- `submit_fix` returns ERROR if no changes exist to commit.
+- Guardrails accept "error" as valid test attempt (prompt/guardrail contract aligned).
+- `full_pass` scoring requires `patch_hits_target` (not just `review_approved` — removes self-review bias).
+- Metrics recording added to ReAct pipeline (was missing, dashboard would go stale).
 
 ### Changed
 
-- ReAct eval cost reduced from $2-4 to ~$1.40 per bug (64% reduction) via prompt tuning + context management.
+- ReAct is now the default pipeline everywhere (CLI, API, eval). Use `--no-react` for fixed pipeline.
+- MAX_TOOL_CALLS reduced from 60 to 40 (no success ever hit 60).
+- `grep_repo` default max_results reduced from 25 to 10.
+- `read_file` default window: 80 lines. Prompt strongly prefers `read_function` over `read_file`.
+- ReAct eval cost reduced from $2-4 to ~$0.11 per simple bug (prompt caching + tool efficiency).
 
 ## [0.2.0.0] - 2026-04-01
 
