@@ -6,11 +6,12 @@ Runs bugs through the ReAct pipeline, scores results, persists traces per-run.
 
 from __future__ import annotations
 
-import concurrent.futures
 import json
 import logging
+import multiprocessing
 import os
 import subprocess
+import tempfile
 import time
 import traceback
 import uuid
@@ -210,39 +211,53 @@ class EvalRunner:
     def _run_single_case(
         self, bug: dict, repo_path: Path, pipeline: str, run_id: str = ""
     ) -> EvalCaseResult:
-        """Run one bug through one pipeline with timeout isolation.
+        """Run one bug through one pipeline with process-level timeout isolation.
 
-        Uses ThreadPoolExecutor WITHOUT context manager to avoid shutdown(wait=True)
-        blocking on timeout. On timeout, shutdown(wait=False, cancel_futures=True)
-        abandons the worker immediately.
+        Each case runs in a child process that can be killed on timeout.
+        The child writes its result + trace to a temp file. If the process
+        exceeds the timeout, it is killed (SIGKILL) and the case is marked failed.
         """
-        from agent.trace import RunTrace
-
-        trace = RunTrace(job_id=f"{bug['ticket_id']}_{pipeline}", enabled=True)
         work_order = _bug_to_work_order(bug, repo_path)
-
         case_start = time.time()
-        result: dict
 
-        # Do NOT use `with executor:` — its __exit__ calls shutdown(wait=True)
-        # which blocks until the worker finishes, defeating the timeout.
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        try:
-            future = executor.submit(
-                self._invoke_pipeline, pipeline, work_order, trace
-            )
-            result = future.result(timeout=self.timeout_per_case)
-        except concurrent.futures.TimeoutError:
+        # Temp files for IPC — child writes result + trace, parent reads
+        result_fd, result_path = tempfile.mkstemp(suffix=".json", prefix="eval_result_")
+        os.close(result_fd)
+
+        proc = multiprocessing.Process(
+            target=_run_case_in_child,
+            args=(pipeline, work_order, result_path),
+            daemon=True,
+        )
+        proc.start()
+        proc.join(timeout=self.timeout_per_case)
+
+        if proc.is_alive():
             logger.error(
-                "%s/%s timed out after %ds", bug["ticket_id"], pipeline, self.timeout_per_case
+                "%s/%s timed out after %ds — killing process",
+                bug["ticket_id"], pipeline, self.timeout_per_case,
             )
-            result = {"status": "failed", "error": f"Timeout after {self.timeout_per_case}s"}
-            executor.shutdown(wait=False, cancel_futures=True)
-        except Exception as e:
-            logger.exception("%s/%s crashed", bug["ticket_id"], pipeline)
-            result = {"status": "failed", "error": str(e), "_traceback": traceback.format_exc()}
+            proc.kill()
+            proc.join(timeout=5)
+            result = {"status": "failed", "error": f"Timeout after {self.timeout_per_case}s (killed)"}
+            trace_report = {}
         else:
-            executor.shutdown(wait=False)
+            # Read result from temp file
+            try:
+                with open(result_path) as f:
+                    child_output = json.load(f)
+                result = child_output.get("result", {"status": "failed", "error": "No result from child"})
+                trace_report = child_output.get("trace_report", {})
+            except Exception as e:
+                logger.error("Failed to read child result: %s", e)
+                result = {"status": "failed", "error": f"Child process error: {e}"}
+                trace_report = {}
+
+        # Clean up temp file
+        try:
+            os.unlink(result_path)
+        except OSError:
+            pass
 
         duration = round(time.time() - case_start, 2)
 
@@ -250,12 +265,10 @@ class EvalRunner:
         score = score_case(result, bug, pipeline)
         score["duration_seconds"] = duration
 
-        # Extract cost from result or trace
+        # Extract cost
         cost = result.get("cost_usd", 0.0) or 0.0
-        if not cost:
-            trace_report = trace.to_report()
+        if not cost and trace_report:
             cost = trace_report.get("summary", {}).get("total_cost_usd", 0.0)
-
         score["cost_usd"] = cost
 
         logger.info(
@@ -265,18 +278,17 @@ class EvalRunner:
             score["review_approved"], score["full_pass"],
         )
 
-        trace_report = trace.to_report()
-
-        # Save individual trace JSON — scoped by run_id to prevent clobbering
+        # Save individual trace JSON — scoped by run_id
         trace_dir = self.results_dir / "traces" / (run_id or "unknown")
         trace_dir.mkdir(parents=True, exist_ok=True)
         trace_path = trace_dir / f"{bug['ticket_id']}_{pipeline}.json"
-        try:
-            trace_path.write_text(json.dumps(trace_report, indent=2, default=str))
-        except Exception as e:
-            logger.warning("Failed to save trace: %s", e)
+        if trace_report:
+            try:
+                trace_path.write_text(json.dumps(trace_report, indent=2, default=str))
+            except Exception as e:
+                logger.warning("Failed to save trace: %s", e)
 
-        # Build compact trace summary for the eval report
+        # Build compact trace summary
         trace_summary = {
             "tool_calls": trace_report.get("summary", {}).get("total_tool_calls", 0),
             "llm_calls": trace_report.get("summary", {}).get("total_llm_calls", 0),
@@ -294,17 +306,18 @@ class EvalRunner:
             ticket_id=bug["ticket_id"],
             pipeline=pipeline,
             score=score,
-            trace_report=trace_report,
+            trace_report=trace_report or None,
             duration_seconds=duration,
             cost_usd=cost,
             error=result.get("error", ""),
             trace_summary=trace_summary,
         )
 
-    def _invoke_pipeline(self, pipeline: str, work_order: dict, trace: Any) -> dict:
+    @staticmethod
+    def _invoke_pipeline(pipeline: str, work_order: dict, trace: Any) -> dict:
         """Call the ReAct pipeline entry point."""
         from agent.react_pipeline import run_ticket_react
-        return run_ticket_react(work_order, trace=trace, dry_run=self.dry_run)
+        return run_ticket_react(work_order, trace=trace, dry_run=True)
 
     def _build_comparison(self, report: EvalRunReport) -> dict:
         """Build A/B comparison between two pipelines."""
@@ -402,6 +415,38 @@ class EvalRunner:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _run_case_in_child(pipeline: str, work_order: dict, result_path: str) -> None:
+    """Entry point for child process. Runs pipeline, writes result + trace to file.
+
+    This runs in a separate process so it can be killed on timeout.
+    All output goes to a JSON file that the parent reads.
+    """
+    from agent.trace import RunTrace
+
+    trace = RunTrace(
+        job_id=f"{work_order.get('ticket_id', 'unknown')}_{pipeline}",
+        enabled=True,
+    )
+
+    try:
+        result = EvalRunner._invoke_pipeline(pipeline, work_order, trace)
+    except Exception as e:
+        result = {
+            "status": "failed",
+            "error": str(e),
+            "_traceback": traceback.format_exc(),
+        }
+
+    trace_report = trace.to_report()
+
+    # Write result + trace to the temp file for the parent to read
+    try:
+        with open(result_path, "w") as f:
+            json.dump({"result": result, "trace_report": trace_report}, f, default=str)
+    except Exception:
+        pass  # Parent will detect missing/corrupt file
+
 
 def _bug_to_work_order(bug: dict, repo_path: Path) -> dict:
     """Convert eval bug dict to pipeline work_order."""
