@@ -25,6 +25,7 @@ def run_tests(
     worktree_path: Path,
     repo_path: "str | Path | None" = None,
     agent_config: "AgentConfig | None" = None,
+    test_path: str = "",
 ) -> str:
     """Auto-detect test runner and execute tests.
 
@@ -41,6 +42,8 @@ def run_tests(
             agent_config is not provided explicitly.
         agent_config: Pre-loaded AgentConfig; if None and repo_path is given,
             the config is loaded automatically.
+        test_path: Optional specific test file/dir/node to run. When provided,
+            this overrides test_pattern from config and auto-detection.
 
     Returns:
         A human-readable string starting with "passed", "failed", "skipped",
@@ -82,7 +85,10 @@ def run_tests(
         else:
             cmd_parts = test_cmd_base.split()
 
-        if test_pattern:
+        # test_path (from agent) overrides test_pattern (from config)
+        if test_path:
+            cmd_parts.append(test_path)
+        elif test_pattern:
             cmd_parts.append(test_pattern)
 
         logger.info("Running tests (config-driven) in %s: %s", worktree_path, " ".join(cmd_parts))
@@ -128,6 +134,10 @@ def run_tests(
     if cmd is None:
         logger.info("No test runner detected — skipping tests")
         return "skipped: no test runner found"
+
+    # Append targeted test path if provided
+    if test_path:
+        cmd.append(test_path)
 
     logger.info("Running tests in %s: %s", test_cwd, " ".join(cmd))
     try:

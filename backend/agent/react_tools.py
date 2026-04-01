@@ -499,53 +499,18 @@ def run_tests(test_path: str = "") -> str:
     except Exception as e:
         results.append(f"Linters: skipped ({e})")
 
-    # Step 2: Run tests
-    # Both paths go through sandbox.run_tests or raw pytest with consistent
-    # classification into exactly one of: passed/skipped/error/failed.
+    # Step 2: Run tests through sandbox.run_tests which handles:
+    # - .agent_config.json (setup_commands, test_command, test_args, test_env, test_timeout)
+    # - Auto-detection (pytest, npm test, make test)
+    # - test_path targeting (appended to the discovered/configured command)
     try:
         from agent.sandbox import run_tests as _run_tests
-
-        if test_path:
-            # Try sandbox runner first — it handles .agent_config.json
-            # (setup commands, custom test command, env vars, timeouts).
-            # Pass test_path as the worktree_path's test target.
-            test_output = _run_tests(sandbox, repo_path=repo_path)
-
-            # If sandbox runner found tests, use its result
-            if test_output.startswith("passed") or test_output.startswith("failed"):
-                classified = _classify_sandbox_output(test_output)
-                results.append(classified)
-                return classified + "\n" + "\n".join(results)
-
-            # Sandbox runner skipped/errored — fall back to targeted pytest
-            test_result = subprocess.run(
-                [sys.executable, "-m", "pytest", test_path, "-x", "-v", "--tb=short"],
-                cwd=sandbox, capture_output=True, text=True, timeout=120,
-            )
-            output = (test_result.stdout + test_result.stderr)[-3000:]
-            classified = _classify_test_output(test_result.returncode, output, test_path)
-            results.append(classified)
-            return classified + "\n" + "\n".join(results)
-        else:
-            # Auto-detect via sandbox runner (honors .agent_config.json fully)
-            test_output = _run_tests(sandbox, repo_path=repo_path)
-            classified = _classify_sandbox_output(test_output)
-            results.append(classified)
-            return classified + "\n" + "\n".join(results)
+        test_output = _run_tests(sandbox, repo_path=repo_path, test_path=test_path)
+        classified = _classify_sandbox_output(test_output)
+        results.append(classified)
+        return classified + "\n" + "\n".join(results)
     except Exception as e:
         return f"error: test execution failed ({e})"
-
-
-def _classify_test_output(returncode: int, output: str, test_path: str) -> str:
-    """Classify pytest result into exactly one of: passed, skipped, error, failed."""
-    if returncode == 0:
-        return f"passed: tests ({test_path}) passed"
-    elif returncode == 5:
-        return f"skipped: no tests collected for {test_path} (exit code 5)"
-    elif returncode == 4:
-        return f"error: pytest usage error for {test_path} (exit code 4 — missing deps or bad path)"
-    else:
-        return f"failed: test failures in {test_path}\n{output[-2000:]}"
 
 
 def _classify_sandbox_output(test_output: str) -> str:
