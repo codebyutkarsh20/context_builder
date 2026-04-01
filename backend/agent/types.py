@@ -125,3 +125,36 @@ class AgentState(TypedDict, total=False):
     exploration_log: list     # Tool calls + results from exploration phase
     caller_files: list        # Caller file paths discovered for blast radius (Phase 2B)
     dry_run: bool             # Skip PR creation + feature flags, return patch + PR body only
+
+
+class ReactAgentState(TypedDict, total=False):
+    """State for the ReAct agent pipeline (3-node: intake → react_agent → finalize)."""
+    # Input (from intake)
+    work_order: dict          # WorkOrder fields
+    intent: dict              # IntentAnalysis.model_dump()
+
+    # Infrastructure (set by tools during react loop)
+    sandbox_path: str         # Git worktree path
+    branch_name: str          # Fix branch name
+    base_branch: str          # Original branch for PR base
+
+    # Agent decisions (set by terminal tools)
+    submitted: bool           # Agent called submit_fix
+    escalated: bool           # Agent called escalate
+    escalate_reason: str      # Reason for escalation
+    explanation: str          # Fix explanation from submit_fix
+
+    # Observability
+    tool_call_count: int      # Total tool calls in the react loop
+    cost_usd: float           # Cumulative LLM cost
+    messages: list            # Full conversation history for debugging
+
+    # Compatibility (for eval scorer + API)
+    localization: dict        # Extracted from conversation for scoring
+    repair: dict              # Patches applied, for scoring
+    review: dict              # Review result, for scoring
+    status: str               # PipelineStatus value
+    error: str                # Error message if failed
+    pr_url: str               # GitHub PR URL if created
+    test_result: str          # Last test execution output
+    dry_run: bool             # Skip PR creation
