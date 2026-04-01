@@ -79,13 +79,28 @@ def _resolve_sandbox_path(file_path: str) -> Path | None:
     sandbox = getattr(_tls, "sandbox_path", None)
     if not sandbox:
         return None
-    # If the agent passed an absolute path that's already inside the sandbox, use it directly
+
     p = Path(file_path)
+
+    # Auto-strip absolute sandbox or repo prefix if agent mistakenly used one
     if p.is_absolute():
-        resolved = p.resolve()
-        if str(resolved).startswith(str(sandbox.resolve())):
-            return resolved
-        return None  # Absolute path outside sandbox
+        sandbox_str = str(sandbox.resolve())
+        if str(p).startswith(sandbox_str):
+            file_path = str(p)[len(sandbox_str):].lstrip("/")
+            p = Path(file_path)
+        else:
+            repo_path = getattr(_tls, "repo_path", None)
+            if repo_path:
+                repo_str = str(repo_path.resolve())
+                if str(p).startswith(repo_str):
+                    file_path = str(p)[len(repo_str):].lstrip("/")
+                    p = Path(file_path)
+                    logger.debug("Stripped repo prefix from absolute path: %s -> %s", p, file_path)
+                else:
+                    return None  # Absolute path outside both sandbox and repo
+            else:
+                return None
+
     resolved = (sandbox / file_path).resolve()
     # Path traversal check
     if not str(resolved).startswith(str(sandbox.resolve())):
@@ -130,7 +145,8 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
     a unique, exact substring of the file (including whitespace/indentation).
 
     Args:
-        file_path: Relative path from repo root e.g. 'app/services/payment.py'
+        file_path: RELATIVE path from repo root e.g. 'app/services/payment.py'.
+                   Do NOT use absolute paths like '/tmp/agent_sandbox_.../file.py'.
         old_string: The exact text to replace (must be unique in the file)
         new_string: The replacement text
     """
@@ -257,6 +273,74 @@ def create_file(file_path: str, content: str) -> str:
         return f"ERROR: {e}"
 
 
+def _diff_scoped_lint(sandbox: Path, modified_files: list[str]) -> str:
+    """Run ruff on modified files but only report errors on lines the agent changed.
+
+    Returns empty string if no new lint errors, otherwise the filtered error text.
+    """
+    import shutil as _shutil
+
+    if not _shutil.which("ruff"):
+        return ""  # No ruff available, skip
+
+    # Get the set of changed line numbers per file from git diff
+    changed_lines: dict[str, set[int]] = {}
+    try:
+        diff_output = subprocess.run(
+            ["git", "diff", "-U0", "HEAD"],
+            cwd=sandbox, capture_output=True, text=True, timeout=30,
+        ).stdout
+        current_file = None
+        for line in diff_output.splitlines():
+            if line.startswith("+++ b/"):
+                current_file = line[6:]
+            elif line.startswith("@@ ") and current_file:
+                # Parse hunk header: @@ -old,count +new,count @@
+                import re as _re_inner
+                m = _re_inner.search(r'\+(\d+)(?:,(\d+))?', line)
+                if m:
+                    start = int(m.group(1))
+                    count = int(m.group(2)) if m.group(2) else 1
+                    if current_file not in changed_lines:
+                        changed_lines[current_file] = set()
+                    changed_lines[current_file].update(range(start, start + count))
+    except Exception:
+        return ""  # Can't determine changed lines, skip lint
+
+    if not changed_lines:
+        return ""
+
+    # Run ruff on modified files
+    try:
+        ruff_result = subprocess.run(
+            ["ruff", "check", "--no-fix"] + modified_files,
+            cwd=sandbox, capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return ""
+
+    if ruff_result.returncode == 0:
+        return ""
+
+    # Filter: only keep errors on lines the agent changed
+    new_errors = []
+    for err_line in ruff_result.stdout.splitlines():
+        # ruff output format: file.py:line:col: EXXXX message
+        parts = err_line.split(":", 3)
+        if len(parts) >= 3:
+            err_file = parts[0].strip()
+            try:
+                err_lineno = int(parts[1].strip())
+            except ValueError:
+                continue
+            if err_file in changed_lines and err_lineno in changed_lines[err_file]:
+                new_errors.append(err_line)
+
+    if new_errors:
+        return "Lint errors on YOUR changed lines:\n" + "\n".join(new_errors)
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Sandbox tools
 # ---------------------------------------------------------------------------
@@ -344,10 +428,17 @@ def create_sandbox() -> str:
 def run_tests(test_path: str = "") -> str:
     """
     Run the repo's test suite and linters on your changes in the sandbox.
-    Runs linters first, then targeted tests, then full suite.
+    Runs linters first on changed files, then the specified tests.
+
+    IMPORTANT: Always pass a specific test_path targeting tests relevant to your fix.
+    Example: test_path='tests/test_helpers.py::TestJSON' or test_path='tests/test_app.py'
+    Running with empty test_path triggers auto-detect which often fails on repos needing
+    special setup (virtualenvs, fixtures, etc).
 
     Args:
-        test_path: Optional specific test file/dir to run. Empty = auto-detect.
+        test_path: Specific test file, directory, or test ID to run.
+                   Examples: 'tests/test_app.py', 'tests/test_helpers.py::TestJSON'
+                   Empty = auto-detect (not recommended — prefer targeted tests).
     """
     sandbox = getattr(_tls, "sandbox_path", None)
     if not sandbox or not sandbox.exists():
@@ -361,8 +452,9 @@ def run_tests(test_path: str = "") -> str:
     try:
         from agent.pipeline import _run_repo_linters
 
-        # Get only files the agent created (untracked) — these are fully the agent's responsibility
+        # Collect agent-touched files (new + modified)
         new_files = []
+        modified_files = []
         status_result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=sandbox, capture_output=True, text=True, timeout=30,
@@ -372,15 +464,38 @@ def run_tests(test_path: str = "") -> str:
                 f = line[3:].strip()
                 if f.endswith(".py"):
                     new_files.append(f)
+            elif line and line[0] in ("M", " ") and line[1] in ("M",):
+                f = line[3:].strip()
+                if f.endswith(".py"):
+                    modified_files.append(f)
 
+        # Also check staged modifications
+        diff_result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=sandbox, capture_output=True, text=True, timeout=30,
+        )
+        for f in diff_result.stdout.splitlines():
+            f = f.strip()
+            if f.endswith(".py") and f not in modified_files and f not in new_files:
+                modified_files.append(f)
+
+        # Lint new files fully (agent owns 100% of their content)
         if new_files:
             patches = [{"file_path": f} for f in new_files]
             lint_errors = _run_repo_linters(sandbox, patches)
             if lint_errors:
                 return f"failed: linter errors in new files\n{lint_errors}"
             results.append(f"Linters (new files): PASSED ({len(new_files)} files)")
-        else:
-            results.append("Linters: skipped (no new files)")
+
+        # For modified files, only report errors on CHANGED lines (diff-scoped linting)
+        if modified_files:
+            diff_lint_errors = _diff_scoped_lint(sandbox, modified_files)
+            if diff_lint_errors:
+                return f"failed: linter errors in your changes\n{diff_lint_errors}"
+            results.append(f"Linters (modified files): PASSED ({len(modified_files)} files)")
+
+        if not new_files and not modified_files:
+            results.append("Linters: skipped (no changed files)")
     except Exception as e:
         results.append(f"Linters: skipped ({e})")
 
@@ -397,6 +512,14 @@ def run_tests(test_path: str = "") -> str:
             output = (test_result.stdout + test_result.stderr)[-3000:]
             if test_result.returncode == 0:
                 results.append(f"Tests ({test_path}): PASSED")
+            elif test_result.returncode in (4, 5):
+                # pytest exit code 4 = no tests collected, 5 = no tests ran
+                # NOT a failure — test discovery didn't match anything
+                results.append(
+                    f"Tests ({test_path}): SKIPPED — no tests collected "
+                    f"(pytest exit code {test_result.returncode}). "
+                    "Try a different test_path."
+                )
             else:
                 return f"failed: test failures\n{output}"
         else:
@@ -563,6 +686,49 @@ def submit_fix(explanation: str) -> str:
 
 
 @tool
+def record_localization(
+    fault_files: list[str],
+    fault_functions: list[str],
+    root_cause_hypothesis: str,
+) -> str:
+    """
+    Record your localization findings — which files and functions contain the bug
+    and your hypothesis for why the bug occurs. Call this ONCE after you finish
+    exploring and before you start editing.
+
+    This is used for tracking and eval scoring. It does not affect the fix.
+
+    Args:
+        fault_files: List of file paths that contain the bug, e.g. ['flask/wrappers.py']
+        fault_functions: List of function names that are buggy, e.g. ['Response.make_sequence']
+        root_cause_hypothesis: 1-2 sentence explanation of WHY the bug happens
+    """
+    if not fault_files:
+        return "ERROR: fault_files must not be empty — provide at least one file path"
+    if not root_cause_hypothesis:
+        return "ERROR: root_cause_hypothesis must not be empty"
+
+    # Store in thread-local for later extraction by the pipeline
+    _tls.localization = {
+        "fault_files": fault_files,
+        "fault_functions": fault_functions or [],
+        "root_cause_hypothesis": root_cause_hypothesis,
+        "confidence": 0.9,
+    }
+    return (
+        f"OK: Localization recorded.\n"
+        f"  fault_files: {fault_files}\n"
+        f"  fault_functions: {fault_functions}\n"
+        f"  hypothesis: {root_cause_hypothesis[:200]}"
+    )
+
+
+def get_localization() -> dict:
+    """Retrieve the recorded localization (called by react_loop/pipeline)."""
+    return getattr(_tls, "localization", {})
+
+
+@tool
 def escalate(reason: str) -> str:
     """
     Escalate to human. Call this when you cannot fix the bug after multiple attempts,
@@ -580,7 +746,7 @@ def escalate(reason: str) -> str:
 
 EDIT_TOOLS = [string_replace, check_syntax, create_file]
 SANDBOX_TOOLS = [create_sandbox, run_tests]
-COMPLETION_TOOLS = [request_review, submit_fix, escalate]
+COMPLETION_TOOLS = [record_localization, request_review, submit_fix, escalate]
 
 # All react-specific tools (exploration tools are added from explore_tools.py)
 REACT_TOOLS = EDIT_TOOLS + SANDBOX_TOOLS + COMPLETION_TOOLS

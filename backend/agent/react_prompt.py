@@ -53,7 +53,7 @@ Follow these steps in order. You decide when to move to each step.
 
 1. **EXPLORE** — Use grep_repo, read_file, read_function, list_files, get_file_structure to understand the codebase and find the bug. Stop exploring as soon as you have enough evidence.
 
-2. **LOCALIZE** — Identify the exact file(s) and function(s) where the bug lives. Form a root cause hypothesis.
+2. **LOCALIZE** — Identify the exact file(s) and function(s) where the bug lives. Form a root cause hypothesis. You MUST call record_localization with your hypothesis before moving to editing. This records which files/functions are faulty and why — it is used for tracking and scoring.
 
 3. **CREATE SANDBOX** — Call create_sandbox to create an isolated git worktree. You MUST do this before making any edits.
 
@@ -84,7 +84,12 @@ Follow these steps in order. You decide when to move to each step.
 
 ### Sandbox & Testing:
 - create_sandbox() — Create git worktree sandbox (call once before editing)
-- run_tests(test_path) — Run tests + linters on your changes
+- run_tests(test_path) — Run tests + linters on your changes. **Always pass a specific
+  test_path** targeting the test file(s) relevant to your fix (e.g. 'tests/test_helpers.py::TestJSON').
+  Running without test_path triggers auto-detect which may fail on repos that need special setup.
+
+### Localization (call after you've identified the bug):
+- record_localization(fault_files, fault_functions, root_cause_hypothesis) — Record your localization findings. Call this once after LOCALIZE, before editing.
 
 ### Completion:
 - request_review(explanation) — Get independent AI review of your fix
@@ -100,6 +105,17 @@ Follow these steps in order. You decide when to move to each step.
 - Do NOT modify files unrelated to the bug
 - Do NOT remove validation logic without explicit business rule confirmation
 - Keep fixes minimal — fix the bug, nothing more
+- **ALWAYS use relative paths** (e.g. 'flask/wrappers.py', NOT '/tmp/agent_sandbox_.../flask/wrappers.py'). All tools resolve paths relative to the repo root automatically. Absolute paths will be rejected.
+
+## PATH CONVENTION
+
+Every file_path argument to every tool must be a **relative path from the repo root**.
+Examples:
+  - CORRECT: 'src/app/models.py'
+  - CORRECT: 'tests/test_helpers.py'
+  - WRONG:   '/tmp/agent_sandbox_flask_1e8074/src/app/models.py'
+  - WRONG:   '/home/user/repos/flask/src/app/models.py'
+The sandbox and repo root are handled internally. Never include them in your paths.
 
 ## BUG TICKET
 
@@ -123,6 +139,17 @@ Severity: {intent.get('severity', 'medium')}
 {kickstart_context}
 {conventions_section}
 {business_rules_section}
+
+## PRE-EXISTING LINT/TEST ERRORS
+
+Many open-source repos have pre-existing lint warnings (e.g. ruff E741, E721, pyflakes).
+**Do NOT fix pre-existing lint errors.** Only fix lint errors that YOUR edits introduced.
+How to tell: if a lint error is in code you did NOT touch (lines outside your diff), it is
+pre-existing. Ignore it and move on. Do NOT spend tool calls trying to clean up the codebase.
+
+If run_tests reports lint errors, check whether the erroring lines are in YOUR diff:
+- If YES: fix them.
+- If NO: they are pre-existing. Proceed to submit_fix — the pre-existing errors are not your problem.
 
 ## IMPORTANT
 

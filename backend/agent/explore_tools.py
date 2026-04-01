@@ -128,11 +128,38 @@ def _safe_relpath(p: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def _safe_resolve(file_path: str) -> "Path | None":
-    """Resolve file_path relative to repo root, rejecting path traversal."""
+    """Resolve file_path relative to repo root, rejecting path traversal.
+
+    If the agent passes an absolute path that starts with the repo root or
+    a known sandbox prefix, auto-strip the prefix so the call succeeds
+    instead of triggering a confusing 'Path traversal blocked' error.
+    """
     repo_path = getattr(_tls, 'repo_path', None)
     if not repo_path:
         return None
     try:
+        p = Path(file_path)
+        if p.is_absolute():
+            # Auto-strip repo or sandbox prefix
+            repo_str = str(repo_path.resolve())
+            if str(p).startswith(repo_str):
+                file_path = str(p)[len(repo_str):].lstrip("/")
+            elif "/agent_sandbox_" in str(p):
+                # Heuristic: strip everything up to and including the sandbox root
+                # e.g. /tmp/agent_sandbox_flask_abc123/flask/app.py -> flask/app.py
+                parts = str(p).split("/")
+                sandbox_idx = next(
+                    (i for i, part in enumerate(parts) if "agent_sandbox_" in part), None
+                )
+                if sandbox_idx is not None:
+                    file_path = "/".join(parts[sandbox_idx + 1:])
+                else:
+                    logger.warning("Path traversal attempt blocked: %s", file_path)
+                    return None
+            else:
+                logger.warning("Path traversal attempt blocked: %s", file_path)
+                return None
+
         resolved = (repo_path / file_path).resolve()
         if not str(resolved).startswith(str(repo_path.resolve())):
             logger.warning("Path traversal attempt blocked: %s", file_path)
