@@ -575,7 +575,7 @@ def _make_progress_callback(job_id: str):
 
 
 def _run_pipeline(job_id: str, work_order: dict, debug: bool = False, dry_run: bool = False) -> None:
-    """Run the LangGraph pipeline in a background thread."""
+    """Run the agent pipeline in a background thread."""
     trace = None
     try:
         with _agent_jobs_lock:

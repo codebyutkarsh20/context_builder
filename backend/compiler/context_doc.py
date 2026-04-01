@@ -121,7 +121,8 @@ class ContextCompiler:
     def __init__(self, repo_name: str, repo_path: str | Path | None = None) -> None:
         self.repo_name = repo_name
         self.repo_path = Path(repo_path) if repo_path else None
-        self._out_dir = Path(f"/tmp/context_builder/{repo_name}")
+        DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
+        self._out_dir = DATA_DIR / repo_name
 
     # ------------------------------------------------------------------
     # Public API

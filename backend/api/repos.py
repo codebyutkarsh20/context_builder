@@ -81,7 +81,7 @@ def run_analysis(job_id: str, req: AnalyzeRequest):
         if not repo_path.exists():
             raise ValueError(f"Path does not exist: {repo_path}")
         # Path traversal guard
-        if _REPOS_BASE_DIR and not str(repo_path).startswith(str(_REPOS_BASE_DIR)):
+        if _REPOS_BASE_DIR and not repo_path.is_relative_to(_REPOS_BASE_DIR):
             raise ValueError(f"Path is outside allowed base directory: {repo_path}")
 
         repo_name = _sanitize_repo_name(req.repo_name or repo_path.name)
@@ -275,7 +275,7 @@ def run_analysis(job_id: str, req: AnalyzeRequest):
 async def analyze_repo(req: AnalyzeRequest, background_tasks: BackgroundTasks):
     # Pre-validate repo path synchronously
     repo_path = Path(req.repo_path).resolve()
-    if _REPOS_BASE_DIR and not str(repo_path).startswith(str(_REPOS_BASE_DIR)):
+    if _REPOS_BASE_DIR and not repo_path.is_relative_to(_REPOS_BASE_DIR):
         raise HTTPException(status_code=400, detail="Path is outside the allowed base directory")
     if not repo_path.exists():
         raise HTTPException(status_code=400, detail=f"Path does not exist: {repo_path}")
