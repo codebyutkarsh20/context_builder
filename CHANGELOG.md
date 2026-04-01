@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.0.0] - 2026-04-01
+
+### Added
+
+- ReAct agent pipeline as alternative to fixed 8-node LangGraph pipeline. Single agent loop where the LLM decides: explore, localize, edit, test, review, submit.
+- 8 new sandbox-aware tools: string_replace, check_syntax, create_file, create_sandbox, run_tests, request_review, submit_fix, escalate.
+- Safety guardrails: sandbox gate, submit gate, $5 cost cap, 60 tool call cap, 15-minute timeout.
+- `python cli.py fix --react` command to run bugs through the ReAct pipeline.
+- `--react` flag on eval runner for A/B comparison between pipelines.
+- ReactAgentState TypedDict for the new pipeline's state management.
+
+### Changed
+
+- Eval runner now supports both fixed and ReAct pipelines via `--react` flag.
+
 ## [0.1.2.2] - 2026-03-31
 
 ### Changed
