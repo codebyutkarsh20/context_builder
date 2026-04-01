@@ -43,6 +43,7 @@ class EvalCaseResult:
     pipeline: str
     score: dict
     trace_report: dict | None = None
+    trace_summary: dict | None = None
     duration_seconds: float = 0.0
     cost_usd: float = 0.0
     error: str = ""
@@ -240,14 +241,40 @@ class EvalRunner:
             score["review_approved"], score["full_pass"],
         )
 
+        trace_report = trace.to_report()
+
+        # Save individual trace JSON for detailed analysis
+        trace_dir = self.results_dir / "traces"
+        trace_dir.mkdir(exist_ok=True)
+        trace_path = trace_dir / f"{bug['ticket_id']}_{pipeline}.json"
+        try:
+            trace_path.write_text(json.dumps(trace_report, indent=2, default=str))
+        except Exception as e:
+            logger.warning("Failed to save trace: %s", e)
+
+        # Build compact trace summary for the eval report
+        trace_summary = {
+            "tool_calls": trace_report.get("summary", {}).get("total_tool_calls", 0),
+            "llm_calls": trace_report.get("summary", {}).get("total_llm_calls", 0),
+            "total_tokens": trace_report.get("summary", {}).get("total_tokens", 0),
+            "cost_usd": trace_report.get("summary", {}).get("total_cost_usd", 0.0),
+            "phase_breakdown": trace_report.get("phase_breakdown", {}),
+            "wasted_calls": trace_report.get("wasted_calls", {}),
+            "run_outcome": trace_report.get("run_outcome", {}),
+            "context_timeline": trace_report.get("context_timeline", []),
+            "guardrail_events": len(trace_report.get("guardrail_events", [])),
+            "trace_path": str(trace_path),
+        }
+
         return EvalCaseResult(
             ticket_id=bug["ticket_id"],
             pipeline=pipeline,
             score=score,
-            trace_report=trace.to_report(),
+            trace_report=trace_report,
             duration_seconds=duration,
             cost_usd=cost,
             error=result.get("error", ""),
+            trace_summary=trace_summary,
         )
 
     def _invoke_pipeline(self, pipeline: str, work_order: dict, trace: Any) -> dict:

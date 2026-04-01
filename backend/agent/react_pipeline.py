@@ -240,6 +240,19 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     )
     task_message = build_task_message(work_order, intent)
 
+    # Emit prompt_build for observability
+    if trace:
+        trace.emit("prompt_build", "react_agent", {
+            "system_prompt_chars": len(system_prompt),
+            "system_prompt_tokens_approx": len(system_prompt) // 4,
+            "task_message_chars": len(task_message),
+            "kickstart_chars": len(kickstart),
+            "conventions_chars": len(conventions),
+            "business_rules_chars": len(business_rules),
+            "hint_files": hint_files,
+            "repo_name": repo_name,
+        })
+
     # Run the ReAct loop
     from agent.react_loop import react_loop
     state = react_loop(

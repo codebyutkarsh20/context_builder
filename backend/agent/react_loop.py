@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from agent.context_manager import cap_tool_output, mask_old_observations, maybe_summarize
+from agent.context_manager import cap_tool_output, count_tokens_approx, mask_old_observations, maybe_summarize
+from agent.trace import _PHASE_MAP
 from agent.react_guardrails import (
     GuardrailState,
     check_limits,
@@ -115,6 +116,7 @@ def react_loop(
     ]
 
     gs = GuardrailState()
+    current_phase = "explore"  # Track phase transitions
 
     if trace:
         trace.stage_start("react_loop")
@@ -134,14 +136,18 @@ def react_loop(
             logger.warning("ReAct loop hit limit: %s", limit_error[:100])
             break
 
-        # Log context window usage periodically
-        if gs.tool_call_count > 0 and gs.tool_call_count % 10 == 0:
-            from agent.context_manager import count_tokens_approx
-            approx_tokens = count_tokens_approx(messages)
-            logger.info(
-                "Context window: ~%dK / 160K tokens (%d%% used) at call %d",
-                approx_tokens // 1000, approx_tokens * 100 // 160_000, gs.tool_call_count,
-            )
+        # Emit llm_request BEFORE calling LLM — captures what the model sees
+        context_tokens = count_tokens_approx(messages)
+        if trace:
+            trace.emit("llm_request", "react_loop", {
+                "model": REACT_MODEL,
+                "message_count": len(messages),
+                "context_tokens": context_tokens,
+                "context_pct": round(context_tokens * 100 / 160_000, 1),
+                "tool_call_count": gs.tool_call_count,
+                "cost_usd_so_far": round(gs.cost_usd, 6),
+                "phase": current_phase,
+            })
 
         # Call the LLM
         try:
@@ -171,6 +177,7 @@ def react_loop(
                 "cumulative_cost_usd": gs.cost_usd,
                 "tool_calls": len(response.tool_calls) if response.tool_calls else 0,
                 "tool_call_count": gs.tool_call_count,
+                "context_tokens": context_tokens,
             })
 
         # Log cache hit on first cached call
@@ -183,10 +190,17 @@ def react_loop(
         # No tool calls — agent is done (shouldn't happen without submit/escalate)
         if not response.tool_calls:
             logger.info("ReAct agent stopped without terminal tool after %d calls", gs.tool_call_count)
-            # Extract any final text as explanation
             if isinstance(response.content, str) and response.content:
                 state["explanation"] = response.content[:500]
             break
+
+        # Capture agent reasoning (text content before tool calls)
+        agent_reasoning = ""
+        if isinstance(response.content, str):
+            agent_reasoning = response.content[:1000]
+        elif isinstance(response.content, list):
+            text_blocks = [b.get("text", "") for b in response.content if isinstance(b, dict) and b.get("type") == "text"]
+            agent_reasoning = " ".join(text_blocks)[:1000]
 
         # Execute each tool call
         terminal = False
@@ -194,6 +208,19 @@ def react_loop(
             tool_name = tc["name"]
             tool_args = tc["args"]
             tool_id = tc["id"]
+
+            # Detect phase transition
+            new_phase = _PHASE_MAP.get(tool_name, current_phase)
+            if new_phase != current_phase:
+                if trace:
+                    trace.emit("state_transition", "react_loop", {
+                        "from_phase": current_phase,
+                        "to_phase": new_phase,
+                        "trigger_tool": tool_name,
+                        "at_call": gs.tool_call_count + 1,
+                        "cost_usd_at_transition": round(gs.cost_usd, 6),
+                    })
+                current_phase = new_phase
 
             logger.info("ReAct tool call %d: %s(%s)",
                         gs.tool_call_count + 1, tool_name, str(tool_args)[:100])
@@ -203,6 +230,8 @@ def react_loop(
                     "tool_name": tool_name,
                     "args": tool_args,
                     "call_number": gs.tool_call_count + 1,
+                    "phase": current_phase,
+                    "reasoning": agent_reasoning,
                 })
 
             # Guardrail check BEFORE execution
@@ -211,12 +240,25 @@ def react_loop(
             if guardrail_error and guardrail_error.startswith("WARNING:"):
                 # Warnings are advisory — let the tool proceed but inform the agent
                 logger.info("Guardrail warning for %s: %s", tool_name, guardrail_error[:100])
-                # Still execute the tool
+                if trace:
+                    trace.emit("guardrail_event", "react_loop", {
+                        "tool_name": tool_name,
+                        "action": "warn",
+                        "message": guardrail_error[:200],
+                        "call_number": gs.tool_call_count + 1,
+                    })
                 guardrail_error = None
 
             if guardrail_error:
                 result_str = guardrail_error
                 logger.info("Guardrail blocked %s: %s", tool_name, guardrail_error[:100])
+                if trace:
+                    trace.emit("guardrail_event", "react_loop", {
+                        "tool_name": tool_name,
+                        "action": "block",
+                        "message": guardrail_error[:200],
+                        "call_number": gs.tool_call_count + 1,
+                    })
             else:
                 # Execute the tool
                 t = tool_map.get(tool_name)
@@ -237,6 +279,7 @@ def react_loop(
                             "tool_name": tool_name,
                             "duration_ms": tool_duration,
                             "result_preview": str(result_str)[:500],
+                            "phase": current_phase,
                         })
 
             # Update guardrail state
@@ -251,8 +294,6 @@ def react_loop(
                     state["explanation"] = tool_args.get("explanation", "")
                     terminal = True
                 else:
-                    # submit_fix returned an error (e.g. no changes, commit failed)
-                    # NOT terminal — let the agent try to fix the issue
                     logger.warning("submit_fix returned error: %s", result_text[:200])
                 messages.append(ToolMessage(content=result_text, tool_call_id=tool_id))
                 if terminal:
@@ -271,8 +312,6 @@ def react_loop(
                 state["sandbox_path"] = str(sandbox_path or "")
                 state["branch_name"] = get_branch_name()
                 state["base_branch"] = get_base_branch()
-                # Redirect explore tools to read from sandbox instead of original repo
-                # This ensures read_file, grep_repo etc. see the agent's edits
                 if sandbox_path:
                     from agent.explore_tools import set_context
                     repo_name = state.get("work_order", {}).get("repo_name", "")
@@ -287,7 +326,6 @@ def react_loop(
                 state["test_result"] = str(result_str)[:3000]
 
             if tool_name == "request_review":
-                # Parse review result for state
                 result_text = str(result_str)
                 review_dict = {"verdict": "UNKNOWN", "confidence": 0.0}
                 if "APPROVE" in result_text:
@@ -304,30 +342,83 @@ def react_loop(
             break
 
         # Context window management (Layers 2 + 3)
+        pre_mask_tokens = count_tokens_approx(messages)
         messages = mask_old_observations(messages)
+        post_mask_tokens = count_tokens_approx(messages)
+        if pre_mask_tokens != post_mask_tokens and trace:
+            trace.emit("context_compaction", "react_loop", {
+                "action": "observation_masking",
+                "tokens_before": pre_mask_tokens,
+                "tokens_after": post_mask_tokens,
+                "tokens_saved": pre_mask_tokens - post_mask_tokens,
+                "at_call": gs.tool_call_count,
+            })
+
         if gs.tool_call_count > 0 and gs.tool_call_count % 20 == 0:
+            pre_summarize = count_tokens_approx(messages)
             messages = maybe_summarize(messages)
+            post_summarize = count_tokens_approx(messages)
+            if pre_summarize != post_summarize and trace:
+                trace.emit("context_compaction", "react_loop", {
+                    "action": "summarization",
+                    "tokens_before": pre_summarize,
+                    "tokens_after": post_summarize,
+                    "tokens_saved": pre_summarize - post_summarize,
+                    "at_call": gs.tool_call_count,
+                })
 
     # Finalize state
     state["tool_call_count"] = gs.tool_call_count
     state["cost_usd"] = round(gs.cost_usd, 6)
     state["messages"] = [
         {"role": type(m).__name__, "content": str(m.content)[:500]}
-        for m in messages[-20:]  # Keep last 20 messages for debugging
+        for m in messages[-20:]
     ]
 
-    # If neither submitted nor escalated, force escalation
     if not state.get("submitted") and not state.get("escalated"):
         state["escalated"] = True
         state["escalate_reason"] = state.get("error", "Agent stopped without submitting or escalating")
 
+    # Determine outcome
+    if state.get("submitted"):
+        outcome = "submitted"
+    elif state.get("escalated"):
+        outcome = "escalated"
+    else:
+        outcome = "timeout"
+
     logger.info(
-        "ReAct loop done: %d tool calls, $%.4f cost, %.0fs elapsed, submitted=%s, escalated=%s",
-        gs.tool_call_count, gs.cost_usd, gs.elapsed,
-        state.get("submitted"), state.get("escalated"),
+        "ReAct loop done: %d tool calls, $%.4f cost, %.0fs elapsed, outcome=%s",
+        gs.tool_call_count, gs.cost_usd, gs.elapsed, outcome,
     )
 
+    # Emit run_outcome with full summary
     if trace:
+        trace.emit("run_outcome", "react_loop", {
+            "outcome": outcome,
+            "tool_call_count": gs.tool_call_count,
+            "cost_usd": round(gs.cost_usd, 6),
+            "elapsed_seconds": round(gs.elapsed, 1),
+            "final_phase": current_phase,
+            "submitted": state.get("submitted", False),
+            "escalated": state.get("escalated", False),
+            "escalate_reason": state.get("escalate_reason", ""),
+            "localization_found": bool(state.get("localization")),
+            "sandbox_created": gs.sandbox_created,
+            "tests_attempted": gs.tests_attempted,
+            "tests_passed": gs.tests_passed,
+            "tests_skipped": gs.tests_skipped,
+            "review_approved": gs.review_approved,
+            "review_verdict": gs.review_verdict,
+            "test_failure_count": gs.test_failure_count,
+            "guardrail_stats": {
+                "grep_count": gs.grep_count,
+                "read_file_count": gs.read_file_count,
+                "run_tests_count": gs.run_tests_count,
+                "string_replace_count": gs.string_replace_count,
+                "review_count": gs.review_count,
+            },
+        })
         trace.stage_end("react_loop")
 
     return state

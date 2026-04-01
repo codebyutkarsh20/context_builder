@@ -59,6 +59,11 @@ TraceEventType = Literal[
     "llm_response",
     "tool_call",
     "tool_result",
+    "guardrail_event",
+    "state_transition",
+    "context_compaction",
+    "prompt_build",
+    "run_outcome",
     "patch_candidate",
     "test_output",
     "error",
@@ -238,6 +243,28 @@ class RunTrace:
 
         last_ts = events[-1]["timestamp"] if events else 0
 
+        # Phase breakdown: classify tool calls into explore/edit/test/review/submit
+        phase_stats = _compute_phase_stats(events)
+
+        # Context window timeline: token count at each LLM call
+        context_timeline = [
+            {"call": e["data"].get("tool_call_count", i), "tokens": e["data"].get("context_tokens", 0)}
+            for i, e in enumerate(events)
+            if e["event_type"] == "llm_request" and e["data"].get("context_tokens")
+        ]
+
+        # Wasted call detection
+        wasted = _detect_wasted_calls(events)
+
+        # Guardrail events
+        guardrail_blocks = [
+            e for e in events if e["event_type"] == "guardrail_event"
+        ]
+
+        # Run outcome (if emitted)
+        outcome_events = [e for e in events if e["event_type"] == "run_outcome"]
+        run_outcome = outcome_events[-1]["data"] if outcome_events else {}
+
         return {
             "job_id": self.job_id,
             "started_at": self._start_wall,
@@ -254,6 +281,11 @@ class RunTrace:
                 "total_events": len(events),
             },
             "token_usage_by_stage": stage_tokens,
+            "phase_breakdown": phase_stats,
+            "context_timeline": context_timeline,
+            "wasted_calls": wasted,
+            "guardrail_events": guardrail_blocks,
+            "run_outcome": run_outcome,
             "events": events,
         }
 
@@ -262,3 +294,89 @@ class RunTrace:
         path.parent.mkdir(parents=True, exist_ok=True)
         report = self.to_report()
         path.write_text(json.dumps(report, indent=2, default=str))
+
+
+# ── Report helpers ─────────────────────────────────────────────────────────
+
+# Tool → phase mapping
+_PHASE_MAP = {
+    # Explore
+    "grep_repo": "explore", "read_file": "explore", "read_function": "explore",
+    "list_files": "explore", "search_code": "explore", "get_function_info": "explore",
+    "get_file_structure": "explore", "get_file_summary": "explore",
+    "record_localization": "explore",
+    # Edit
+    "create_sandbox": "edit", "string_replace": "edit", "check_syntax": "edit",
+    "create_file": "edit", "get_callers": "edit", "get_blast_radius": "edit",
+    # Test
+    "run_tests": "test",
+    # Review
+    "request_review": "review",
+    # Submit
+    "submit_fix": "submit", "escalate": "submit",
+}
+
+
+def _compute_phase_stats(events: list[dict]) -> dict:
+    """Compute per-phase tool call counts and cost."""
+    phases: dict[str, dict] = {}
+    for e in events:
+        if e["event_type"] != "tool_call":
+            continue
+        tool_name = e["data"].get("tool_name", "")
+        phase = _PHASE_MAP.get(tool_name, "other")
+        if phase not in phases:
+            phases[phase] = {"tool_calls": 0, "tools_used": []}
+        phases[phase]["tool_calls"] += 1
+        if tool_name not in phases[phase]["tools_used"]:
+            phases[phase]["tools_used"].append(tool_name)
+
+    # Add first-call-in-phase timestamps
+    seen_phases: set[str] = set()
+    for e in events:
+        if e["event_type"] != "tool_call":
+            continue
+        tool_name = e["data"].get("tool_name", "")
+        phase = _PHASE_MAP.get(tool_name, "other")
+        if phase not in seen_phases:
+            seen_phases.add(phase)
+            if phase in phases:
+                phases[phase]["first_call_at"] = e["timestamp"]
+                phases[phase]["first_call_number"] = e["data"].get("call_number", 0)
+
+    return phases
+
+
+def _detect_wasted_calls(events: list[dict]) -> dict:
+    """Detect patterns that suggest wasted tool calls."""
+    tool_calls = [e for e in events if e["event_type"] == "tool_call"]
+
+    # Repeated reads of the same file
+    read_targets: dict[str, int] = {}
+    for tc in tool_calls:
+        name = tc["data"].get("tool_name", "")
+        if name in ("read_file", "read_function"):
+            target = tc["data"].get("args", {}).get("file_path", "")
+            if target:
+                read_targets[target] = read_targets.get(target, 0) + 1
+    repeated_reads = {f: c for f, c in read_targets.items() if c > 2}
+
+    # Grep spam (5+ consecutive greps)
+    grep_streaks = 0
+    max_grep_streak = 0
+    for tc in tool_calls:
+        if tc["data"].get("tool_name") == "grep_repo":
+            grep_streaks += 1
+            max_grep_streak = max(max_grep_streak, grep_streaks)
+        else:
+            grep_streaks = 0
+
+    # Test retry loops
+    test_count = sum(1 for tc in tool_calls if tc["data"].get("tool_name") == "run_tests")
+
+    return {
+        "repeated_reads": repeated_reads,
+        "max_grep_streak": max_grep_streak,
+        "test_attempts": test_count,
+        "total_tool_calls": len(tool_calls),
+    }
