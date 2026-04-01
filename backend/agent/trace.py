@@ -210,8 +210,10 @@ class RunTrace:
 
         total_llm = sum(1 for e in events if e["event_type"] == "llm_request")
         total_tool = sum(1 for e in events if e["event_type"] == "tool_call")
+        # Context tokens from llm_request events (ReAct emits context_tokens,
+        # legacy emits prompt_tokens_approx — check both)
         total_tokens_approx = sum(
-            e["data"].get("prompt_tokens_approx", 0)
+            e["data"].get("context_tokens", 0) or e["data"].get("prompt_tokens_approx", 0)
             for e in events if e["event_type"] == "llm_request"
         )
 
