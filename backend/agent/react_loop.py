@@ -94,7 +94,7 @@ def react_loop(
     if trace:
         trace.stage_start("react_loop")
 
-    logger.info("=== REACT LOOP: Starting agent with %d tools ===", len(all_tools))
+    logger.info("=== REACT LOOP: Starting agent with %d tools (160K context) ===", len(all_tools))
 
     while gs.tool_call_count < MAX_TOOL_CALLS:
         # Check time limit
@@ -108,6 +108,15 @@ def react_loop(
         if limit_error:
             logger.warning("ReAct loop hit limit: %s", limit_error[:100])
             break
+
+        # Log context window usage periodically
+        if gs.tool_call_count > 0 and gs.tool_call_count % 10 == 0:
+            from agent.context_manager import count_tokens_approx
+            approx_tokens = count_tokens_approx(messages)
+            logger.info(
+                "Context window: ~%dK / 160K tokens (%d%% used) at call %d",
+                approx_tokens // 1000, approx_tokens * 100 // 160_000, gs.tool_call_count,
+            )
 
         # Call the LLM
         try:

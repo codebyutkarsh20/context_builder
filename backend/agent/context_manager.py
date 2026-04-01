@@ -21,37 +21,43 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 logger = logging.getLogger(__name__)
 
 # Layer 2: Observation masking config
-OBSERVATION_WINDOW = 10  # Keep last N tool results in full
-MASK_TEMPLATE = "[Tool result from {tool_name}: {char_count} chars — masked to save context]"
+# With 160K context, we can keep more turns in full than the default 10.
+# Recent turns give the agent memory of what it already tried.
+OBSERVATION_WINDOW = 15  # Keep last 15 tool results in full (not 10)
+MASK_TEMPLATE = "[Tool result from {tool_name}: {char_count} chars — masked. Call again if needed.]"
 
 # Layer 3: Summarization config
-SUMMARIZATION_TRIGGER = 80_000  # Approximate tokens before triggering summarization
+# 160K context window → trigger summarization at ~120K tokens (~480K chars)
+# This gives 40K headroom for the LLM response + safety margin.
+SUMMARIZATION_TRIGGER = 120_000  # tokens (not 80K — we have 160K available)
 SUMMARIZATION_MODEL = "claude-haiku-4-5-20251001"
 TOKEN_ESTIMATE_RATIO = 0.25  # Rough chars-to-tokens for code
 
 # Layer 1: Per-tool output caps (chars)
+# These are SAFETY caps, not aggressive limits. The agent should see enough
+# context to make correct decisions. Don't starve it.
 TOOL_OUTPUT_CAPS = {
-    "read_file": 4000,        # ~50 lines at ~80 chars/line
-    "grep_repo": 2000,        # 10 matches at ~200 chars each
-    "read_function": 3000,    # Single function, ~30-60 lines
-    "list_files": 1500,       # Directory listing
-    "search_code": 2000,      # Semantic search results
-    "get_function_info": 1500,
-    "get_file_summary": 2000,
-    "get_file_structure": 2000,
-    "run_tests": 2000,        # Test output
-    "request_review": 1500,   # Review verdict + feedback
-    "string_replace": 500,
-    "check_syntax": 500,
-    "create_file": 500,
-    "create_sandbox": 500,
+    "read_file": 8000,        # ~100 lines — full function with context
+    "grep_repo": 4000,        # 10-15 matches with surrounding lines
+    "read_function": 6000,    # Single function, could be 100+ lines for complex ones
+    "list_files": 3000,       # Full directory listing
+    "search_code": 4000,      # Semantic search results with snippets
+    "get_function_info": 3000,
+    "get_file_summary": 3000,
+    "get_file_structure": 4000, # Full file outline — classes, methods, imports
+    "run_tests": 4000,        # Full test output — agent needs to see failures
+    "request_review": 3000,   # Full review with all checks + feedback
+    "string_replace": 1000,   # Confirmation + context
+    "check_syntax": 1000,
+    "create_file": 1000,
+    "create_sandbox": 1000,
     "record_localization": 500,
-    "get_callers": 1500,
-    "get_blast_radius": 1500,
+    "get_callers": 3000,      # Full caller list with file paths
+    "get_blast_radius": 3000,
     "submit_fix": 500,
     "escalate": 500,
 }
-DEFAULT_CAP = 2000
+DEFAULT_CAP = 4000
 
 
 def cap_tool_output(tool_name: str, output: str) -> str:

@@ -409,20 +409,20 @@ def grep_repo(pattern: str, file_glob: str = "", max_results: int = 10) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def read_file(file_path: str, start_line: int = 1, end_line: int = 50) -> str:
+def read_file(file_path: str, start_line: int = 1, end_line: int = 80) -> str:
     """
-    Read a 50-line window of a file. PREFER read_function when you know the function name
-    — it's more precise and wastes less context.
+    Read a window of a file. PREFER read_function when you know the function name
+    — it extracts exactly one function with line numbers.
 
-    Only use read_file when you need:
+    Use read_file when you need:
     - File header/imports (start_line=1, end_line=30)
     - A specific line range from grep results
-    - Code that isn't inside a function
+    - Code that isn't inside a function (class-level, module-level)
 
     Args:
         file_path: Relative path from repo root e.g. 'app/services/payment.py'
         start_line: First line to read (1-indexed, default 1)
-        end_line: Last line to read (default 50 — keep windows small)
+        end_line: Last line to read (default 80)
     """
     repo_path = getattr(_tls, 'repo_path', None)
     if not repo_path:
