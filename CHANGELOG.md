@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.0.0] - 2026-04-01
+
+### Added
+
+- Unified eval package (`backend/agent/eval/`) with A/B pipeline comparison, 11 scoring metrics, regression gates, and GitHub PR review tracking.
+- Context window management (`context_manager.py`) with 3-layer strategy: per-tool output caps, observation masking, and Haiku summarization safety net.
+- `record_localization` tool for explicit fault location tracking in ReAct pipeline.
+- CLI eval subgroup: `python cli.py eval run/curate/report/gate/track-prs`.
+- 32 tests for the new eval package.
+
+### Fixed
+
+- ReAct agent no longer wastes tool calls on absolute sandbox paths (auto-strips prefixes).
+- Diff-scoped linting: only flags errors on lines the agent changed, not pre-existing repo issues.
+- Pytest exit codes 4/5 (no tests collected) correctly return "skipped" instead of "failed".
+- `submit_fix` guardrail bypass: blocked calls no longer set `state["submitted"] = True`.
+
+### Changed
+
+- ReAct eval cost reduced from $2-4 to ~$1.40 per bug (64% reduction) via prompt tuning + context management.
+
 ## [0.2.0.0] - 2026-04-01
 
 ### Added
