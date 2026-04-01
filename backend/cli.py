@@ -19,6 +19,198 @@ from rich import print as rprint
 app = typer.Typer(help="Build and query knowledge graphs for any code repository.")
 console = Console()
 
+# ---------------------------------------------------------------------------
+# Eval subcommand group
+# ---------------------------------------------------------------------------
+
+eval_app = typer.Typer(help="Evaluation suite for the AI Deploy Agent.")
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("run")
+def eval_run(
+    bug: str = typer.Option(None, "--bug", "-b", help="Run only this ticket_id"),
+    pipeline: str = typer.Option("both", "--pipeline", "-p",
+                                 help="Pipeline to run: 'fixed', 'react', or 'both'"),
+    dataset: str = typer.Option("eval/bugs.json", "--dataset", "-d", help="Path to bugs JSON"),
+    timeout: int = typer.Option(600, "--timeout", help="Per-case timeout in seconds"),
+    sentinel: bool = typer.Option(False, "--sentinel", help="Run only first 5 bugs (fast regression check)"),
+    create_prs: bool = typer.Option(False, "--create-prs", help="Create real PRs (default: dry-run)"),
+    output: str = typer.Option("eval/results", "--output", "-o", help="Results output directory"),
+):
+    """
+    Run the evaluation suite. Supports A/B comparison of fixed vs ReAct pipelines.
+
+    Examples:
+        python cli.py eval run                               # All bugs, both pipelines
+        python cli.py eval run --bug FLASK-2651 -p react     # Single bug, ReAct only
+        python cli.py eval run --sentinel                    # Fast 5-bug regression check
+        python cli.py eval run -p fixed --timeout 300        # Fixed only, 5min timeout
+    """
+    from agent.eval.runner import EvalRunner
+
+    pipelines = ["fixed", "react"] if pipeline == "both" else [pipeline]
+
+    console.print(Panel(
+        f"[bold cyan]Dataset:[/bold cyan]   {dataset}\n"
+        f"[bold cyan]Pipelines:[/bold cyan] {', '.join(pipelines)}\n"
+        f"[bold cyan]Sentinel:[/bold cyan]  {sentinel}\n"
+        f"[bold cyan]Dry run:[/bold cyan]   {not create_prs}\n"
+        f"[bold cyan]Timeout:[/bold cyan]   {timeout}s per case",
+        title="[bold]Eval Suite[/bold]",
+        border_style="cyan",
+    ))
+
+    runner = EvalRunner(
+        dataset_path=Path(dataset),
+        pipelines=pipelines,
+        timeout_per_case=timeout,
+        create_prs=create_prs,
+        results_dir=Path(output),
+    )
+
+    def _progress(tid: str, current: int, total: int) -> None:
+        console.print(f"  [dim]Completed {current}/{total}: {tid}[/dim]")
+
+    report = runner.run(bug_filter=bug, sentinel=sentinel, progress_cb=_progress)
+
+    # Print summary
+    from agent.eval.report import generate_markdown_report
+    console.print()
+    console.print(generate_markdown_report(report))
+
+
+@eval_app.command("curate")
+def eval_curate(
+    swe_bench_path: str = typer.Argument(..., help="Path to SWE-bench-lite dataset JSON"),
+    output: str = typer.Option("eval/bugs.json", "--output", "-o", help="Output bugs.json path"),
+    max_bugs: int = typer.Option(25, "--max", help="Maximum number of bugs to include"),
+):
+    """
+    Curate eval bugs from a SWE-bench-lite dataset.
+
+    Download the SWE-bench-lite dataset from HuggingFace first, then run:
+        python cli.py eval curate /path/to/swe-bench-lite.json
+    """
+    from agent.eval.dataset import curate_from_swe_bench
+
+    bugs = curate_from_swe_bench(swe_bench_path, output, max_bugs=max_bugs)
+    console.print(f"[green]Curated {len(bugs)} bugs → {output}[/green]")
+
+    # Show distribution
+    single = sum(1 for b in bugs if b.get("difficulty") == "single-file")
+    multi = len(bugs) - single
+    console.print(f"  Single-file: {single} | Multi-file: {multi}")
+
+    categories = {}
+    for b in bugs:
+        cat = b.get("category", "unknown")
+        categories[cat] = categories.get(cat, 0) + 1
+    for cat, count in sorted(categories.items()):
+        console.print(f"  {cat}: {count}")
+
+
+@eval_app.command("report")
+def eval_report(
+    results_dir: str = typer.Option("eval/results", "--dir", "-d", help="Results directory"),
+    format: str = typer.Option("markdown", "--format", "-f", help="Output format: markdown or json"),
+):
+    """
+    View the latest evaluation report.
+    """
+    from agent.eval.regression import load_previous_report
+    from agent.eval.report import generate_markdown_report, generate_json_report
+
+    report = load_previous_report(results_dir)
+    if not report:
+        console.print("[yellow]No eval results found.[/yellow]")
+        raise typer.Exit(1)
+
+    if format == "json":
+        import json
+        console.print(json.dumps(report._data, indent=2, default=str))
+    else:
+        # Build a lightweight report proxy for markdown generation
+        console.print(generate_markdown_report(report))
+
+
+@eval_app.command("gate")
+def eval_gate(
+    results_file: str = typer.Argument("eval/results/latest.json", help="Path to eval results JSON"),
+    min_pass_rate: float = typer.Option(0.75, "--min-pass-rate", help="Minimum pass rate (0-1)"),
+    max_regression: float = typer.Option(0.05, "--max-regression", help="Max allowed regression (0-1)"),
+):
+    """
+    CI regression gate. Exit 0 if passing, exit 1 if regressed.
+
+    Usage in CI:
+        python cli.py eval gate eval/results/latest.json --min-pass-rate 0.75
+    """
+    from agent.eval.regression import check_regression_gate, load_previous_report
+
+    current = load_previous_report(Path(results_file).parent)
+    if not current:
+        console.print("[red]No eval results found at {results_file}[/red]")
+        raise typer.Exit(1)
+
+    passed, reason = check_regression_gate(
+        current, None, min_pass_rate=min_pass_rate, max_regression=max_regression,
+    )
+
+    if passed:
+        console.print(f"[bold green]GATE PASSED[/bold green]: {reason}")
+        raise typer.Exit(0)
+    else:
+        console.print(f"[bold red]GATE FAILED[/bold red]: {reason}")
+        raise typer.Exit(1)
+
+
+@eval_app.command("track-prs")
+def eval_track_prs(
+    poll: bool = typer.Option(True, "--poll/--no-poll", help="Poll GitHub for updates"),
+):
+    """
+    Track PR review outcomes for the 80% approval target.
+    """
+    from agent.eval.pr_tracker import PRTracker
+
+    tracker = PRTracker()
+
+    if poll:
+        console.print("[dim]Polling GitHub for PR review updates...[/dim]")
+        tracker.poll_all()
+
+    metrics = tracker.compute_approval_rate()
+    tracked = tracker.list_tracked()
+
+    if not tracked:
+        console.print("[yellow]No PRs tracked yet. Run eval with --create-prs first.[/yellow]")
+        return
+
+    table = Table(title="Tracked PRs", show_header=True)
+    table.add_column("Ticket", style="cyan")
+    table.add_column("Pipeline", style="green")
+    table.add_column("State")
+    table.add_column("Review")
+    table.add_column("PR URL", style="dim")
+
+    for pr in tracked:
+        review = pr.get("review_decision") or "pending"
+        state = pr.get("state", "?")
+        table.add_row(
+            pr["ticket_id"], pr["pipeline"], state, review, pr["pr_url"]
+        )
+
+    console.print(table)
+    console.print()
+    console.print(Panel(
+        f"[bold]Approval rate:[/bold] {metrics['approval_rate']:.0%} "
+        f"({metrics['approved']}/{metrics['reviewed']} reviewed)\n"
+        f"[bold]Target met:[/bold] {'YES' if metrics['target_met'] else 'NO'} (80%)",
+        title="80% Target",
+        border_style="green" if metrics["target_met"] else "red",
+    ))
+
 
 @app.command()
 def build(

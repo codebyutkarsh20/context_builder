@@ -145,7 +145,16 @@ def run_tests(
 
 
 def _format_test_output(returncode: int, raw_output: str, timeout: int) -> str:
-    """Format raw subprocess output into a concise test result string."""
+    """Format raw subprocess output into a concise test result string.
+
+    Pytest exit codes:
+      0 = all tests passed
+      1 = some tests failed
+      2 = interrupted
+      3 = internal error
+      4 = no tests collected (not a failure — means test discovery found nothing)
+      5 = no tests ran (not a failure — no matching tests)
+    """
     if returncode == 0:
         logger.info("Tests passed")
         summary_lines = [
@@ -153,6 +162,17 @@ def _format_test_output(returncode: int, raw_output: str, timeout: int) -> str:
             if "passed" in line.lower() or "ok" in line.lower()
         ]
         return "passed\n" + ("\n".join(summary_lines[-5:]) if summary_lines else raw_output[:500])
+
+    # Pytest exit code 4 = no tests collected, 5 = no tests ran
+    # These are NOT failures — they mean test discovery didn't find anything
+    if returncode in (4, 5):
+        logger.info("No tests collected/ran (exit code %d) — treating as skipped", returncode)
+        return (
+            f"skipped: no tests collected (pytest exit code {returncode}). "
+            "This usually means the test path didn't match any tests, or the repo "
+            "needs special setup. Try a more specific test_path.\n"
+            + raw_output[-500:]
+        )
 
     logger.warning("Tests failed (exit code %d)", returncode)
     error_lines = []

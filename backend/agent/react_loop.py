@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from agent.context_manager import cap_tool_output, mask_old_observations, maybe_summarize
 from agent.react_guardrails import (
     GuardrailState,
     check_limits,
@@ -27,6 +28,7 @@ from agent.react_tools import (
     get_sandbox_path,
     get_branch_name,
     get_base_branch,
+    get_localization,
 )
 
 if TYPE_CHECKING:
@@ -183,6 +185,8 @@ def react_loop(
                     except Exception as te:
                         result_str = f"ERROR: Tool execution failed: {te}"
                     tool_duration = round((time.monotonic() - tool_t0) * 1000)
+                    # Layer 1: Cap tool output size
+                    result_str = cap_tool_output(tool_name, str(result_str))
 
                     if trace:
                         trace.emit("tool_result", "react_loop", {
@@ -194,15 +198,15 @@ def react_loop(
             # Update guardrail state
             update_from_tool_result(tool_name, tool_args, str(result_str), gs)
 
-            # Check for terminal tools
-            if tool_name == "submit_fix":
+            # Check for terminal tools — only mark as terminal if NOT blocked by guardrail
+            if tool_name == "submit_fix" and guardrail_error is None:
                 state["submitted"] = True
                 state["explanation"] = tool_args.get("explanation", "")
                 terminal = True
                 messages.append(ToolMessage(content=str(result_str), tool_call_id=tool_id))
                 break
 
-            if tool_name == "escalate":
+            if tool_name == "escalate" and guardrail_error is None:
                 state["escalated"] = True
                 state["escalate_reason"] = tool_args.get("reason", "")
                 terminal = True
@@ -221,6 +225,11 @@ def react_loop(
                     from agent.explore_tools import set_context
                     repo_name = state.get("work_order", {}).get("repo_name", "")
                     set_context(repo_name, str(sandbox_path), None)
+
+            if tool_name == "record_localization" and "OK:" in str(result_str):
+                loc = get_localization()
+                if loc:
+                    state["localization"] = loc
 
             if tool_name == "run_tests":
                 state["test_result"] = str(result_str)[:3000]
@@ -241,6 +250,11 @@ def react_loop(
 
         if terminal:
             break
+
+        # Context window management (Layers 2 + 3)
+        messages = mask_old_observations(messages)
+        if gs.tool_call_count > 0 and gs.tool_call_count % 20 == 0:
+            messages = maybe_summarize(messages)
 
     # Finalize state
     state["tool_call_count"] = gs.tool_call_count
