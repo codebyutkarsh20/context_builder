@@ -649,6 +649,72 @@ def _compile_without_neo4j(
     (out / "summary.md").write_text(summary)
 
 
+@app.command()
+def fix(
+    ticket_id: str = typer.Argument(..., help="Bug ticket ID (e.g., PROJ-1234)"),
+    title: str = typer.Option("", "--title", "-t", help="Bug title"),
+    description: str = typer.Option("", "--desc", "-d", help="Bug description"),
+    repo_path: str = typer.Option("", "--repo", "-r", help="Path to local repo"),
+    repo_name: str = typer.Option("", "--name", "-n", help="Repo name (for graph lookup)"),
+    dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="Skip PR creation"),
+    react: bool = typer.Option(False, "--react", help="Use ReAct pipeline instead of fixed pipeline"),
+):
+    """
+    Run the AI agent to fix a bug.
+
+    Examples:
+        python cli.py fix PROJ-1234 --title "Bug title" --desc "description" --repo /path/to/repo
+        python cli.py fix PROJ-1234 --react --repo /path/to/repo  # Use ReAct pipeline
+    """
+    from agent.trace import RunTrace
+
+    work_order = {
+        "ticket_id": ticket_id,
+        "title": title or ticket_id,
+        "description": description or f"Fix bug {ticket_id}",
+        "repo_name": repo_name or (Path(repo_path).name if repo_path else ticket_id.lower()),
+        "repo_path": repo_path,
+        "priority": "medium",
+        "comments": [],
+    }
+
+    trace = RunTrace(job_id=ticket_id, enabled=True)
+
+    console.print(Panel(
+        f"[bold cyan]Ticket:[/bold cyan]    {ticket_id}\n"
+        f"[bold cyan]Pipeline:[/bold cyan]  {'ReAct' if react else 'Fixed (LangGraph)'}\n"
+        f"[bold cyan]Dry run:[/bold cyan]   {dry_run}\n"
+        f"[bold cyan]Repo:[/bold cyan]      {repo_path or '(auto-detect)'}",
+        title="[bold]AI Deploy Agent[/bold]",
+        border_style="cyan",
+    ))
+
+    if react:
+        from agent.react_pipeline import run_ticket_react
+        result = run_ticket_react(work_order, trace=trace, dry_run=dry_run)
+    else:
+        from agent.pipeline import run_ticket
+        result = run_ticket(work_order, trace=trace, dry_run=dry_run)
+
+    status = result.get("status", "unknown")
+    pr_url = result.get("pr_url", "")
+    error = result.get("error", "")
+
+    if status == "done":
+        console.print(f"\n[bold green]SUCCESS[/bold green] — {pr_url or 'Fix generated'}")
+    elif status == "escalated":
+        reason = result.get("escalate_reason", result.get("error", "unknown"))
+        console.print(f"\n[bold yellow]ESCALATED[/bold yellow] — {reason}")
+    else:
+        console.print(f"\n[bold red]FAILED[/bold red] — {error or status}")
+
+    # Print trace summary
+    report = trace.to_report()
+    console.print(f"\n[dim]Duration: {report.get('total_duration_seconds', 0):.0f}s | "
+                  f"Tool calls: {result.get('tool_call_count', 'N/A')} | "
+                  f"Cost: ${result.get('cost_usd', 0):.4f}[/dim]")
+
+
 def _print_structure_summary(structure: dict):
     techs = ", ".join(structure.get("tech_stack", [])) or "unknown"
     stats = structure.get("file_stats", {})

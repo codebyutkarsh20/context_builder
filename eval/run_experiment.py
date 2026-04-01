@@ -89,8 +89,7 @@ def build_graph(bug: dict, repo_dir: Path) -> None:
         logger.info("Graph built for %s", repo_name)
 
 
-def run_pipeline(bug: dict, repo_dir: Path) -> dict:
-    from agent.pipeline import run_ticket
+def run_pipeline(bug: dict, repo_dir: Path, use_react: bool = False) -> dict:
     from agent.trace import RunTrace
 
     work_order = {
@@ -104,11 +103,17 @@ def run_pipeline(bug: dict, repo_dir: Path) -> dict:
     }
 
     trace = RunTrace(job_id=bug["ticket_id"], enabled=True)
-    logger.info("Running pipeline for %s: %s", bug["ticket_id"], bug["title"][:60])
+    pipeline_name = "ReAct" if use_react else "Fixed"
+    logger.info("Running %s pipeline for %s: %s", pipeline_name, bug["ticket_id"], bug["title"][:60])
 
     start = time.time()
     try:
-        result = run_ticket(work_order, trace=trace, dry_run=True)
+        if use_react:
+            from agent.react_pipeline import run_ticket_react
+            result = run_ticket_react(work_order, trace=trace, dry_run=True)
+        else:
+            from agent.pipeline import run_ticket
+            result = run_ticket(work_order, trace=trace, dry_run=True)
     except Exception as e:
         logger.exception("Pipeline crashed for %s", bug["ticket_id"])
         result = {"status": "failed", "error": str(e)}
@@ -222,6 +227,7 @@ def main():
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-clone", action="store_true")
     parser.add_argument("--no-graph", action="store_true")
+    parser.add_argument("--react", action="store_true", help="Use ReAct pipeline instead of fixed pipeline")
     args = parser.parse_args()
 
     bugs = load_bugs(args.bug)
@@ -253,7 +259,7 @@ def main():
         if not args.skip_build and not args.no_graph:
             build_graph(bug, repo_dir)
 
-        result = run_pipeline(bug, repo_dir)
+        result = run_pipeline(bug, repo_dir, use_react=args.react)
         score = score_result(result, bug)
         scores.append(score)
 
