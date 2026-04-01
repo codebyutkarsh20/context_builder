@@ -23,8 +23,16 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 if TYPE_CHECKING:
     from agent.trace import RunTrace
+    from langchain_anthropic import ChatAnthropic
 
-from langchain_anthropic import ChatAnthropic
+# Lazy imports — ChatAnthropic and StateGraph are only needed at runtime,
+# not during test collection. Moving them to function-level or guarding
+# behind TYPE_CHECKING unblocks pytest collection for files that import
+# helpers from pipeline.py.
+def _get_chat_anthropic():
+    from langchain_anthropic import ChatAnthropic
+    return ChatAnthropic
+
 from langgraph.graph import END, StateGraph
 
 from agent.feature_flags import create_flag as _create_feature_flag, set_pr_url as _set_flag_pr_url
@@ -168,6 +176,7 @@ def _structured_call(model: str, max_tokens: int, schema: type, prompt: str, ret
         "prompt_full": prompt,
     })
 
+    ChatAnthropic = _get_chat_anthropic()
     llm = ChatAnthropic(model=model, max_tokens=max_tokens, timeout=120.0, max_retries=2)
     structured = llm.with_structured_output(schema)
 

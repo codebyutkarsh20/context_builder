@@ -439,7 +439,7 @@ export default function Overview() {
                         <span className="font-semibold text-zinc-200 font-mono text-sm">{repo.name}</span>
                       </td>
                       <td className="px-4 py-3 hidden md:table-cell">
-                        <span className="text-zinc-500 font-mono text-xs">{repo.path ?? '/tmp/context_builder/' + repo.name}</span>
+                        <span className="text-zinc-500 font-mono text-xs">{repo.repo_path || '/tmp/context_builder/' + repo.name}</span>
                       </td>
                       <td className="px-4 py-3">
                         <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-950/50 border border-emerald-800/40 text-emerald-400 text-xs font-medium">
