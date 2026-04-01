@@ -450,7 +450,7 @@ def run_tests(test_path: str = "") -> str:
 
     # Step 1: Run linters only on NEWLY INTRODUCED errors (not pre-existing ones)
     try:
-        from agent.pipeline import _run_repo_linters
+        from agent.linters import run_repo_linters as _run_repo_linters
 
         # Collect agent-touched files (new + modified)
         new_files = []
@@ -575,7 +575,7 @@ def request_review(explanation: str) -> str:
     # Build independent reviewer context
     reviewer_context = ""
     try:
-        from agent.pipeline import _build_reviewer_context
+        from agent.graph_utils import build_reviewer_context as _build_reviewer_context
         if repo_name:
             reviewer_context = _build_reviewer_context(repo_name, modified_files)
     except Exception:
@@ -607,7 +607,7 @@ Produce 6 checks (ROOT_CAUSE, BUSINESS_RULES, PATTERNS, COMPLETENESS, BLAST_RADI
 verdict: APPROVE if all checks pass. CHANGES_REQUESTED if any fail. ESCALATE if too complex."""
 
     try:
-        from agent.pipeline import _structured_call
+        from agent.llm import structured_call as _structured_call
         result = _structured_call("claude-opus-4-6", 3000, ReviewResult, prompt)
         review_dict = result.model_dump()
 
@@ -628,7 +628,7 @@ verdict: APPROVE if all checks pass. CHANGES_REQUESTED if any fail. ESCALATE if 
     except Exception as e:
         # Fallback to Sonnet
         try:
-            from agent.pipeline import _structured_call
+            from agent.llm import structured_call as _structured_call
             result = _structured_call("claude-sonnet-4-6", 2000, ReviewResult, prompt)
             review_dict = result.model_dump()
             verdict = review_dict.get("verdict", "UNKNOWN")
@@ -793,7 +793,7 @@ def get_callers(file_path: str, function_name: str = "") -> str:
 
     # Strategy 1: Query knowledge graph
     try:
-        from agent.pipeline import _load_graph_data, _find_callers_from_graph
+        from agent.graph_utils import load_graph_data as _load_graph_data, find_callers_from_graph as _find_callers_from_graph
         graph_data, _ = _load_graph_data(repo_name)
         if graph_data:
             fault_files = [file_path]
@@ -805,7 +805,7 @@ def get_callers(file_path: str, function_name: str = "") -> str:
     # Strategy 2: Fallback to grep
     if not callers and repo_path:
         try:
-            from agent.pipeline import _find_callers_via_grep
+            from agent.graph_utils import find_callers_via_grep as _find_callers_via_grep
             callers = _find_callers_via_grep(repo_path, [file_path])
         except Exception:
             pass

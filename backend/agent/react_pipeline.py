@@ -99,14 +99,8 @@ def intake_node(state: ReactAgentState) -> ReactAgentState:
 
     work_order = state.get("work_order", {})
 
-    # Import and reuse the structured call + models from pipeline.py
-    from agent.pipeline import (
-        _structured_call,
-        _extract_stack_trace_hints,
-        _extract_repro_steps,
-        _classify_bug_category,
-        INTAKE_MODEL,
-    )
+    from agent.llm import structured_call as _structured_call, INTAKE_MODEL
+    from agent.intake_helpers import extract_stack_trace_hints, extract_repro_steps, classify_bug_category
     from agent.types import IntentAnalysis
 
     prompt = f"""Translate this bug ticket into a technical specification.
@@ -137,7 +131,7 @@ not from guessing the implementation."""
 
     # Stack trace hints
     description = work_order.get("description", "")
-    stack_hints = _extract_stack_trace_hints(description)
+    stack_hints = extract_stack_trace_hints(description)
     if stack_hints:
         work_order["stack_trace_hints"] = stack_hints
         state["work_order"] = work_order
@@ -151,13 +145,13 @@ not from guessing the implementation."""
         state["intent"] = intent
 
     # Repro steps
-    repro_steps = _extract_repro_steps(description)
+    repro_steps = extract_repro_steps(description)
     if repro_steps:
         work_order["repro_steps"] = repro_steps
         state["work_order"] = work_order
 
     # Bug category
-    bug_category = _classify_bug_category(work_order.get("title", ""), description)
+    bug_category = classify_bug_category(work_order.get("title", ""), description)
     work_order["bug_category"] = bug_category
     state["work_order"] = work_order
 
@@ -207,8 +201,8 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     set_react_context(repo_name, repo_path, DATA_DIR)
 
     # Build orientation context
-    from agent.pipeline import _build_kickstart_context, _load_business_rules
-    kickstart = _build_kickstart_context(repo_name, str(repo_path), intent, DATA_DIR)
+    from agent.graph_utils import build_kickstart_context, load_business_rules
+    kickstart = build_kickstart_context(repo_name, str(repo_path), intent, DATA_DIR)
 
     # Add repo structure snapshot (saves 2-3 list_files calls)
     try:
@@ -237,7 +231,7 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
 
     # Business rules (use hint files from intent for scoping)
     hint_files = intent.get("likely_affected_modules", [])[:5]
-    business_rules = _load_business_rules(repo_name, hint_files) if hint_files else ""
+    business_rules = load_business_rules(repo_name, hint_files) if hint_files else ""
 
     system_prompt = build_system_prompt(
         work_order=work_order,
