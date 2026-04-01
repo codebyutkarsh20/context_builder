@@ -227,7 +227,8 @@ def main():
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-clone", action="store_true")
     parser.add_argument("--no-graph", action="store_true")
-    parser.add_argument("--react", action="store_true", help="Use ReAct pipeline instead of fixed pipeline")
+    parser.add_argument("--react", action="store_true", default=True, help="Use ReAct pipeline (default)")
+    parser.add_argument("--no-react", dest="react", action="store_false", help="Use fixed pipeline instead")
     args = parser.parse_args()
 
     bugs = load_bugs(args.bug)

@@ -588,10 +588,10 @@ def _run_pipeline(job_id: str, work_order: dict, debug: bool = False, dry_run: b
         with _agent_jobs_lock:
             _agent_jobs[job_id]["_trace"] = trace
 
-        from agent.pipeline import run_ticket
+        from agent.react_pipeline import run_ticket_react
 
         progress_cb = _make_progress_callback(job_id)
-        result = run_ticket(work_order, progress_cb=progress_cb, trace=trace, dry_run=dry_run)
+        result = run_ticket_react(work_order, progress_cb=progress_cb, trace=trace, dry_run=dry_run)
 
         # Determine final status from pipeline outcome
         pipeline_status = result.get("status", "done")

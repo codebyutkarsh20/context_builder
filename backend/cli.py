@@ -849,14 +849,14 @@ def fix(
     repo_path: str = typer.Option("", "--repo", "-r", help="Path to local repo"),
     repo_name: str = typer.Option("", "--name", "-n", help="Repo name (for graph lookup)"),
     dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="Skip PR creation"),
-    react: bool = typer.Option(False, "--react", help="Use ReAct pipeline instead of fixed pipeline"),
+    react: bool = typer.Option(True, "--react/--no-react", help="ReAct pipeline (default) or fixed pipeline (--no-react)"),
 ):
     """
-    Run the AI agent to fix a bug.
+    Run the AI agent to fix a bug. Uses ReAct pipeline by default.
 
     Examples:
         python cli.py fix PROJ-1234 --title "Bug title" --desc "description" --repo /path/to/repo
-        python cli.py fix PROJ-1234 --react --repo /path/to/repo  # Use ReAct pipeline
+        python cli.py fix PROJ-1234 --no-react --repo /path/to/repo  # Use fixed pipeline
     """
     from agent.trace import RunTrace
 
