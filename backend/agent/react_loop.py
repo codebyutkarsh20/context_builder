@@ -47,9 +47,24 @@ _MODEL_PRICING = {
 REACT_MODEL = "claude-sonnet-4-6"
 
 
-def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+def _estimate_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
+    """Estimate cost accounting for Anthropic prompt caching.
+
+    Cache writes cost 1.25x base input price.
+    Cache reads cost 0.1x base input price (90% discount).
+    """
     pricing = _MODEL_PRICING.get(model, (3.0, 15.0))
-    return round((input_tokens * pricing[0] + output_tokens * pricing[1]) / 1_000_000, 6)
+    input_cost = input_tokens * pricing[0]
+    cache_write_cost = cache_creation_tokens * pricing[0] * 1.25
+    cache_read_cost = cache_read_tokens * pricing[0] * 0.1
+    output_cost = output_tokens * pricing[1]
+    return round((input_cost + cache_write_cost + cache_read_cost + output_cost) / 1_000_000, 6)
 
 
 def react_loop(
@@ -84,8 +99,18 @@ def react_loop(
         timeout=120.0,
     ).bind_tools(all_tools)
 
+    # Enable Anthropic prompt caching on the system prompt.
+    # The system prompt + tool definitions are identical across all 30+ LLM calls
+    # in a single bug fix. Caching saves ~87% on input tokens for the static prefix.
+    # Cache read: 0.1x base price. Write: 1.25x (amortized over 30 calls).
     messages: list = [
-        SystemMessage(content=system_prompt),
+        SystemMessage(
+            content=[{
+                "type": "text",
+                "text": system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            }]
+        ),
         HumanMessage(content=task_message),
     ]
 
@@ -126,22 +151,32 @@ def react_loop(
             state["error"] = f"LLM call failed: {e}"
             break
 
-        # Track token usage
+        # Track token usage (including Anthropic prompt caching)
         usage = getattr(response, "response_metadata", {}).get("usage", {})
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
-        gs.cost_usd += _estimate_cost(REACT_MODEL, input_tokens, output_tokens)
+        cache_creation = usage.get("cache_creation_input_tokens", 0)
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        call_cost = _estimate_cost(REACT_MODEL, input_tokens, output_tokens, cache_creation, cache_read)
+        gs.cost_usd += call_cost
 
         if trace:
             trace.emit("llm_response", "react_loop", {
                 "model": REACT_MODEL,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
-                "cost_usd": _estimate_cost(REACT_MODEL, input_tokens, output_tokens),
+                "cache_creation_tokens": cache_creation,
+                "cache_read_tokens": cache_read,
+                "cost_usd": call_cost,
                 "cumulative_cost_usd": gs.cost_usd,
                 "tool_calls": len(response.tool_calls) if response.tool_calls else 0,
                 "tool_call_count": gs.tool_call_count,
             })
+
+        # Log cache hit on first cached call
+        if cache_read > 0 and gs.tool_call_count <= 2:
+            logger.info("Prompt cache HIT: %d tokens cached (saving ~%.0f%% on prefix)",
+                        cache_read, 90.0)
 
         messages.append(response)
 
