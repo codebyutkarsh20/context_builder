@@ -24,35 +24,6 @@ export interface JobStatus {
   error?: string
 }
 
-export interface GraphNode {
-  id: string
-  name: string
-  type: 'File' | 'Class' | 'Function' | 'BusinessRule' | 'DomainConcept' | 'DecisionPoint'
-  file?: string
-  summary?: string
-  pagerank?: number
-  layer?: string
-  language?: string
-  line_start?: number
-  line_end?: number
-  [key: string]: unknown
-}
-
-export interface GraphEdge {
-  id?: string
-  source: string
-  target: string
-  type: 'CONTAINS' | 'CALLS' | 'IMPORTS' | 'INHERITS' | 'RELATED_TO' | string
-  weight?: number
-}
-
-export interface GraphData {
-  nodes: GraphNode[]
-  edges: GraphEdge[]
-  repo: string
-  layer?: string
-}
-
 export interface GraphStats {
   repo: string
   total_nodes: number
@@ -69,35 +40,10 @@ export interface GraphStats {
 export interface Hotspot {
   id: string
   name: string
-  type: GraphNode['type']
+  type: string
   file?: string
   pagerank: number
   rank: number
-}
-
-export interface ContextLayer {
-  layer: number
-  name: string
-  description: string
-  node_count: number
-  token_estimate: number
-  completeness: number
-}
-
-export interface ContextLayersResponse {
-  repo: string
-  layers: ContextLayer[]
-  total_tokens: number
-  token_budget: number
-}
-
-export interface SearchResult {
-  id: string
-  name: string
-  type: GraphNode['type']
-  file?: string
-  snippet?: string
-  score: number
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -140,7 +86,7 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
   }
 }
 
-// ─── API Functions ────────────────────────────────────────────────────────────
+// ─── Repos (Overview page) ───────────────────────────────────────────────────
 
 export function listRepos(): Promise<Repo[]> {
   return request<Repo[]>('/api/repos')
@@ -159,15 +105,21 @@ export function deleteRepo(repoName: string): Promise<{ deleted: string; cleaned
   })
 }
 
-export function getRepoDetail(repoName: string): Promise<Record<string, unknown>> {
-  return request<Record<string, unknown>>(`/api/repos/${encodeURIComponent(repoName)}`)
-}
-
 export function getJobStatus(jobId: string): Promise<JobStatus> {
   return request<JobStatus>(`/api/status/${jobId}`)
 }
 
-// ─── Knowledge Base (Business Rules) ─────────────────────────────────────────
+export function getGraphStats(repo: string): Promise<GraphStats> {
+  return request<GraphStats>(`/api/graph/stats?repo=${encodeURIComponent(repo)}`)
+}
+
+export function getHotspots(repo: string, topN = 20): Promise<Hotspot[]> {
+  return request<Hotspot[]>(
+    `/api/graph/hotspots?repo=${encodeURIComponent(repo)}&top_n=${topN}`
+  )
+}
+
+// ─── Knowledge Base (Knowledge page) ─────────────────────────────────────────
 
 export interface KnowledgeQuestion {
   id: string
@@ -204,6 +156,13 @@ export interface KnowledgeStats {
   by_severity: { critical: number; high: number; medium: number; low: number }
 }
 
+export interface GraphNodeSummary {
+  id: string
+  name: string
+  type: 'Function' | 'Class' | 'File' | string
+  file: string
+}
+
 export function getKnowledgeQuestions(repo: string, unansweredOnly = false): Promise<KnowledgeQuestion[]> {
   const params = new URLSearchParams({ unanswered_only: String(unansweredOnly) })
   return request<KnowledgeQuestion[]>(`/api/knowledge/${encodeURIComponent(repo)}/questions?${params}`)
@@ -218,13 +177,6 @@ export function submitAnswer(repo: string, questionId: string, answer: string, r
 
 export function getKnowledgeRules(repo: string): Promise<KnowledgeRule[]> {
   return request<KnowledgeRule[]>(`/api/knowledge/${encodeURIComponent(repo)}/rules`)
-}
-
-export interface GraphNodeSummary {
-  id: string
-  name: string
-  type: 'Function' | 'Class' | 'File' | string
-  file: string
 }
 
 export function searchGraphNodes(repo: string, q: string, nodeType?: string): Promise<GraphNodeSummary[]> {
@@ -253,66 +205,7 @@ export function getKnowledgeStats(repo: string): Promise<KnowledgeStats> {
   return request<KnowledgeStats>(`/api/knowledge/${encodeURIComponent(repo)}/stats`)
 }
 
-export function getGraph(repo: string, layer?: string, limit = 5000): Promise<GraphData> {
-  const params = new URLSearchParams({ repo, limit: String(limit) })
-  if (layer) params.set('layer', layer)
-  return request<GraphData>(`/api/graph?${params}`)
-}
-
-export function getGraphStats(repo: string): Promise<GraphStats> {
-  return request<GraphStats>(`/api/graph/stats?repo=${encodeURIComponent(repo)}`)
-}
-
-export function getHotspots(repo: string, topN = 20): Promise<Hotspot[]> {
-  return request<Hotspot[]>(
-    `/api/graph/hotspots?repo=${encodeURIComponent(repo)}&top_n=${topN}`
-  )
-}
-
-export function getContextLayers(repo: string): Promise<ContextLayersResponse> {
-  return request<ContextLayersResponse>(
-    `/api/context/layers?repo=${encodeURIComponent(repo)}`
-  )
-}
-
-export function getContextFull(repo: string): Promise<{ content: string }> {
-  return request<{ content: string }>(
-    `/api/context/full?repo=${encodeURIComponent(repo)}`
-  )
-}
-
-export function search(repo: string, q: string): Promise<SearchResult[]> {
-  return request<SearchResult[]>(
-    `/api/search?repo=${encodeURIComponent(repo)}&q=${encodeURIComponent(q)}`
-  )
-}
-
-// ─── Chat ────────────────────────────────────────────────────────────────────
-
-export interface ChatMessage {
-  role: 'user' | 'assistant'
-  content: string
-}
-
-export interface ChatResponse {
-  answer: string
-  model: string
-  usage: { input_tokens: number; output_tokens: number }
-}
-
-export function chatAsk(
-  repo: string,
-  question: string,
-  history: ChatMessage[] = [],
-): Promise<ChatResponse> {
-  return request<ChatResponse>('/api/chat', {
-    method: 'POST',
-    body: JSON.stringify({ repo, question, history }),
-    timeout: 120_000, // 2 min — LLM call can be slow
-  })
-}
-
-// ─── Agent Pipeline ─────────────────────────────────────────────────────────
+// ─── Agent Pipeline (Agent page) ─────────────────────────────────────────────
 
 export interface AgentTicket {
   ticket_id: string
@@ -358,8 +251,6 @@ export interface AgentJobStatus {
   debug?: boolean
 }
 
-// ─── Trace / Observability ──────────────────────────────────────────────────
-
 export interface TraceEvent {
   index: number
   timestamp: number
@@ -393,13 +284,10 @@ export function runAgentTicket(ticket: {
   return request<{ job_id: string; status: string; debug?: boolean }>('/api/agent/run', {
     method: 'POST',
     body: JSON.stringify(ticket),
-    timeout: 10_000, // POST returns immediately with job_id
+    timeout: 10_000,
   })
 }
 
-/**
- * Subscribe to live trace events via SSE. Returns an unsubscribe function.
- */
 export function subscribeToTrace(
   jobId: string,
   onEvent: (event: TraceEvent) => void,
@@ -428,10 +316,6 @@ export function subscribeToTrace(
   }
 
   return () => eventSource.close()
-}
-
-export function getTraceReport(jobId: string): Promise<Record<string, unknown>> {
-  return request<Record<string, unknown>>(`/api/agent/trace/${jobId}/report`)
 }
 
 export function getAgentJobStatus(jobId: string): Promise<AgentJobStatus> {
