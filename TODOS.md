@@ -2,11 +2,6 @@
 
 ## Active
 
-### P0 — Integration tests for react tool/guardrail/prompt contract
-**What:** Write regression tests covering: run_tests exit code classification (0/1/2/3/4/5), submit_fix terminal vs non-terminal behavior, guardrail acceptance of passed/skipped/error/failed, prompt-guardrail contract alignment.
-**Why:** Contract bugs were found 4 times by external agent review. Each time the prompt, tool, and guardrail had drifted without tests catching it. This is the highest-risk technical debt.
-**Context:** Identified across multiple review rounds (April 2026). Files: react_tools.py, react_guardrails.py, react_prompt.py, sandbox.py.
-
 ### P1 — Multi-candidate patch sampling
 **What:** Generate 3-5 candidate patches per bug, test all, pick the one that passes. Based on SWE-bench research showing 3-8% gain from ensembling.
 **Why:** Current pipeline generates 1 patch. If it's wrong, the agent spirals trying to fix it. Multiple candidates + test filtering is the cheapest quality improvement.
@@ -20,9 +15,9 @@
 **What:** Connect to real Jira board, pull tickets, run agent, track PR review outcomes.
 **Why:** The 80% approval target is unmeasurable without real human reviewers on real bugs.
 
-### P2 — Extract shared utilities from pipeline.py
-**What:** Move _structured_call, _run_repo_linters, _build_reviewer_context, _load_graph_data, _find_callers_from_graph into standalone modules. React tools import these from pipeline.py which forces loading the entire fixed pipeline.
-**Why:** pipeline.py is 3300 lines. Importing it pulls in langchain_anthropic at module load, breaking test collection.
+### P2 — Continue extracting utilities from pipeline.py
+**What:** pipeline.py is still 3300 lines. Utility functions (_redact_secrets, _fuzzy_match_replace, should_iterate, etc.) are still imported by tests. Continue extracting into focused modules (llm.py, graph_utils.py, linters.py pattern).
+**Why:** Fixed pipeline is retired (run_ticket/build_agent_graph deprecated) but the file remains as a utility library. Smaller modules = faster imports, easier testing.
 
 ## Active (inherited)
 
@@ -51,6 +46,14 @@
 **Depends on:** Production validation shipped (current sprint).
 
 ## Completed
+
+### P0 — Integration tests for react tool/guardrail/prompt contract
+**Completed:** v0.3.1.0 (2026-04-02)
+75 regression tests in `test_react_contracts.py`: guardrail gates, exit code chain (pytest 0-5 → sandbox prefix → guardrail state → submit gate), prompt-guardrail alignment, anti-pattern thresholds, terminal detection.
+
+### P0 — Retire fixed LangGraph pipeline
+**Completed:** v0.3.1.0 (2026-04-02)
+Removed `--no-react` from CLI and eval. ReAct is the only supported runtime. `pipeline.py` remains as utility library (should_iterate, _redact_secrets, etc.) with `run_ticket()` and `build_agent_graph()` deprecated.
 
 ### P1 — Jira project prefix must be configurable
 **Completed:** Already implemented (discovered 2026-03-30 during eng review)

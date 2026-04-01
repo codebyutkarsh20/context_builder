@@ -34,7 +34,7 @@ agent/
 ├── react_prompt.py    # System prompt builder with context assembly
 ├── react_guardrails.py # Safety: sandbox gate, submit gate, anti-pattern detection
 ├── context_manager.py # Context window management (observation masking + Haiku summarization)
-├── pipeline.py        # Legacy fixed 8-node pipeline (fallback via --no-react)
+├── pipeline.py        # Legacy utility library (routing functions, helpers — runtime deprecated)
 ├── explore_tools.py   # Read-only codebase exploration tools (8 tools)
 ├── types.py           # AgentState, ReactAgentState, Pydantic models
 ├── trace.py           # RunTrace observability with SSE streaming
@@ -51,15 +51,14 @@ agent/
 pip install -r backend/requirements.txt
 pytest tests/ -v                                           # All tests
 cd backend && python cli.py build /path/to/repo            # Build knowledge graph
-cd backend && python cli.py fix TICKET --repo /path        # Fix a bug (ReAct, default)
-cd backend && python cli.py fix TICKET --no-react --repo . # Fix with fixed pipeline
+cd backend && python cli.py fix TICKET --repo /path        # Fix a bug
 cd backend && python cli.py eval run                       # Run 25-bug eval suite
 cd backend && python cli.py eval run --bug FLASK-2651      # Single bug eval
 cd backend && python cli.py eval report                    # Show latest results
 cd backend && python cli.py eval gate results/latest.json  # CI regression gate
 ```
 ## Key Design Rules
-- MUST use LangGraph for all agent orchestration
+- MUST use the ReAct pipeline (react_pipeline.py) for all agent runs
 - MUST query BOTH code graph AND business knowledge graph before generating fixes
 - MUST include business context (rules, constraints, past incidents) in every repair prompt
 - MUST run target repo's test suite in sandbox before creating PR

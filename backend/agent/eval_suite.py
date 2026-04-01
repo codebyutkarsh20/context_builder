@@ -122,11 +122,11 @@ def score_single_run(result: dict, bug: dict) -> dict:
 
 def _run_single_case(work_order: dict) -> dict:
     """Run a single eval case inside a thread (for timeout support)."""
-    from agent.pipeline import run_ticket
+    from agent.react_pipeline import run_ticket_react
     from agent.trace import RunTrace
 
     trace = RunTrace(job_id=work_order["ticket_id"])
-    result = run_ticket(work_order, trace=trace, dry_run=True)
+    result = run_ticket_react(work_order, trace=trace, dry_run=True)
     result["_trace"] = trace.to_report()
     return result
 

@@ -3215,12 +3215,21 @@ def should_retry_after_test(state: AgentState) -> str:
 # ---------------------------------------------------------------------------
 
 def build_agent_graph():
-    """Build and compile the LangGraph state machine.
+    """DEPRECATED: Build the legacy LangGraph state machine.
 
-    Pipeline: intake → exploration → repair → review → test → PR
-    Exploration is kick-started with graph + vector + failure signals,
-    then the agent explores freely with grep/read/search tools.
+    This fixed pipeline is retired. Use react_pipeline.run_ticket_react() instead.
+    Kept only as a utility library — individual functions (should_iterate, etc.)
+    are still imported by tests, but the graph itself is no longer run in production.
+
+    Known issue: 'repair' state key collides with 'repair' node name on
+    some LangGraph versions, causing ValueError at compile time.
     """
+    import warnings
+    warnings.warn(
+        "build_agent_graph() is deprecated. Use react_pipeline.run_ticket_react() instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     graph = StateGraph(AgentState)
 
     graph.add_node("intake", intake_node)
@@ -3270,7 +3279,10 @@ def run_ticket(
     trace: RunTrace | None = None,
     dry_run: bool = False,
 ) -> dict:
-    """Run a bug ticket through the full agent pipeline.
+    """DEPRECATED: Run a bug ticket through the legacy fixed pipeline.
+
+    Use react_pipeline.run_ticket_react() instead. This function is kept
+    for backwards compatibility but is no longer the supported runtime.
 
     Args:
         work_order: Bug ticket work order dict.

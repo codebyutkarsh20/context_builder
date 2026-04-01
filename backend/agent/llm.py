@@ -2,7 +2,7 @@
 llm.py — LLM calling utilities extracted from pipeline.py.
 
 Provides structured output calls, cost estimation, secret redaction,
-and model configuration. Used by both ReAct and fixed pipelines.
+and model configuration. Used by the ReAct pipeline.
 """
 
 from __future__ import annotations

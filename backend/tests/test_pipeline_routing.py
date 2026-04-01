@@ -1,27 +1,18 @@
 """
 Tests for pipeline routing logic — Phases 1.3, 3.2
 
-Verifies the LangGraph state machine routing:
-  - Confidence gate (localization → read_source / escalate)
-  - Review loop (review → test / retry_fix / escalate)
-  - Max iteration enforcement
-
-NOTE: The fixed LangGraph pipeline is LEGACY (default is ReAct).
-build_agent_graph() may fail on some LangGraph versions due to
-AgentState.repair key colliding with the "repair" node name.
-Graph structure tests are marked xfail for this reason.
+Verifies the legacy pipeline's routing functions (should_iterate, etc.)
+which are still used as utility logic. The fixed LangGraph pipeline itself
+is retired — ReAct (react_pipeline.py) is the only supported runtime.
 """
 
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pytest
-
 from agent.pipeline import (
     should_iterate,
     MAX_ITERATIONS,
-    build_agent_graph,
     multi_file_coordinator_node,
 )
 from agent.types import PipelineStatus
@@ -78,37 +69,8 @@ class TestReviewLoop:
         assert should_iterate(state) == "test"
 
 
-# ── Graph Structure ──────────────────────────────────────────────────
-
-class TestGraphStructure:
-    """The LangGraph state machine has the correct nodes and edges.
-
-    LEGACY: The fixed pipeline may crash on some LangGraph versions due to
-    AgentState.repair key colliding with the "repair" node name. The default
-    pipeline is ReAct (react_pipeline.py) which has no LangGraph dependency.
-    """
-
-    @pytest.mark.xfail(reason="Legacy pipeline: 'repair' state key may collide with node name in some LangGraph versions")
-    def test_graph_compiles(self):
-        graph = build_agent_graph()
-        assert graph is not None
-
-    @pytest.mark.xfail(reason="Legacy pipeline: 'repair' state key may collide with node name in some LangGraph versions")
-    def test_graph_has_all_nodes(self):
-        graph = build_agent_graph()
-        if hasattr(graph, 'nodes'):
-            node_names = set(graph.nodes.keys()) if isinstance(graph.nodes, dict) else set()
-            if not node_names:
-                return  # LangGraph version doesn't expose nodes dict — skip
-            expected = [
-                "intake", "exploration", "repair", "multi_file_coordinator",
-                "review", "test", "create_pr", "escalate",
-            ]
-            for node in expected:
-                assert node in node_names, f"Missing node: {node}"
-            # RAG-mode nodes must not exist
-            for removed in ["context_assembly", "localization", "read_source"]:
-                assert removed not in node_names, f"Removed node still present: {removed}"
+# TestGraphStructure removed — fixed LangGraph pipeline is retired.
+# ReAct pipeline (react_pipeline.py) is the only supported runtime.
 
 
 # ── PipelineStatus Enum ──────────────────────────────────────────────

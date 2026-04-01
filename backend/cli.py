@@ -849,14 +849,12 @@ def fix(
     repo_path: str = typer.Option("", "--repo", "-r", help="Path to local repo"),
     repo_name: str = typer.Option("", "--name", "-n", help="Repo name (for graph lookup)"),
     dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="Skip PR creation"),
-    react: bool = typer.Option(True, "--react/--no-react", help="ReAct pipeline (default) or fixed pipeline (--no-react)"),
 ):
     """
-    Run the AI agent to fix a bug. Uses ReAct pipeline by default.
+    Run the AI agent to fix a bug.
 
     Examples:
         python cli.py fix PROJ-1234 --title "Bug title" --desc "description" --repo /path/to/repo
-        python cli.py fix PROJ-1234 --no-react --repo /path/to/repo  # Use fixed pipeline
     """
     from agent.trace import RunTrace
 
@@ -874,19 +872,14 @@ def fix(
 
     console.print(Panel(
         f"[bold cyan]Ticket:[/bold cyan]    {ticket_id}\n"
-        f"[bold cyan]Pipeline:[/bold cyan]  {'ReAct' if react else 'Fixed (LangGraph)'}\n"
         f"[bold cyan]Dry run:[/bold cyan]   {dry_run}\n"
         f"[bold cyan]Repo:[/bold cyan]      {repo_path or '(auto-detect)'}",
         title="[bold]AI Deploy Agent[/bold]",
         border_style="cyan",
     ))
 
-    if react:
-        from agent.react_pipeline import run_ticket_react
-        result = run_ticket_react(work_order, trace=trace, dry_run=dry_run)
-    else:
-        from agent.pipeline import run_ticket
-        result = run_ticket(work_order, trace=trace, dry_run=dry_run)
+    from agent.react_pipeline import run_ticket_react
+    result = run_ticket_react(work_order, trace=trace, dry_run=dry_run)
 
     status = result.get("status", "unknown")
     pr_url = result.get("pr_url", "")

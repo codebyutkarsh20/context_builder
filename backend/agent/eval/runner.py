@@ -94,7 +94,7 @@ class EvalRunner:
         repo_cache_dir: Path | None = None,
     ):
         self.dataset_path = Path(dataset_path)
-        self.pipelines = pipelines or ["fixed", "react"]
+        self.pipelines = pipelines or ["react"]
         self.timeout_per_case = timeout_per_case
         self.dry_run = not create_prs
         self.results_dir = Path(results_dir)
@@ -251,13 +251,9 @@ class EvalRunner:
         )
 
     def _invoke_pipeline(self, pipeline: str, work_order: dict, trace: Any) -> dict:
-        """Call the appropriate pipeline entry point."""
-        if pipeline == "react":
-            from agent.react_pipeline import run_ticket_react
-            return run_ticket_react(work_order, trace=trace, dry_run=self.dry_run)
-        else:
-            from agent.pipeline import run_ticket
-            return run_ticket(work_order, trace=trace, dry_run=self.dry_run)
+        """Call the ReAct pipeline entry point."""
+        from agent.react_pipeline import run_ticket_react
+        return run_ticket_react(work_order, trace=trace, dry_run=self.dry_run)
 
     def _build_comparison(self, report: EvalRunReport) -> dict:
         """Build A/B comparison between two pipelines."""

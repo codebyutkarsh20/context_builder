@@ -141,13 +141,13 @@ class TestDryRunAPIIntegration:
 
 
 class TestDryRunInRunTicket:
-    """Test dry_run parameter in run_ticket function signature."""
+    """Test dry_run parameter in run_ticket_react function signature."""
 
-    def test_run_ticket_accepts_dry_run(self):
-        """run_ticket should accept dry_run kwarg without error."""
+    def test_run_ticket_react_accepts_dry_run(self):
+        """run_ticket_react should accept dry_run kwarg without error."""
         import inspect
-        from agent.pipeline import run_ticket
+        from agent.react_pipeline import run_ticket_react
 
-        sig = inspect.signature(run_ticket)
+        sig = inspect.signature(run_ticket_react)
         assert "dry_run" in sig.parameters
         assert sig.parameters["dry_run"].default is False
