@@ -30,8 +30,8 @@ app.add_typer(eval_app, name="eval")
 @eval_app.command("run")
 def eval_run(
     bug: str = typer.Option(None, "--bug", "-b", help="Run only this ticket_id"),
-    pipeline: str = typer.Option("both", "--pipeline", "-p",
-                                 help="Pipeline to run: 'fixed', 'react', or 'both'"),
+    pipeline: str = typer.Option("react", "--pipeline", "-p",
+                                 help="Pipeline to run: 'react' (default)"),
     dataset: str = typer.Option("eval/bugs.json", "--dataset", "-d", help="Path to bugs JSON"),
     timeout: int = typer.Option(600, "--timeout", help="Per-case timeout in seconds"),
     sentinel: bool = typer.Option(False, "--sentinel", help="Run only first 5 bugs (fast regression check)"),
@@ -49,7 +49,7 @@ def eval_run(
     """
     from agent.eval.runner import EvalRunner
 
-    pipelines = ["fixed", "react"] if pipeline == "both" else [pipeline]
+    pipelines = [pipeline]
 
     console.print(Panel(
         f"[bold cyan]Dataset:[/bold cyan]   {dataset}\n"
