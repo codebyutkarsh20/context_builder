@@ -31,27 +31,27 @@ TOKEN_ESTIMATE_RATIO = 0.25  # Rough chars-to-tokens for code
 
 # Layer 1: Per-tool output caps (chars)
 TOOL_OUTPUT_CAPS = {
-    "read_file": 6000,
-    "grep_repo": 4000,
-    "read_function": 4000,
-    "list_files": 2000,
-    "search_code": 4000,
-    "get_function_info": 2000,
-    "get_file_summary": 3000,
-    "get_file_structure": 3000,
-    "run_tests": 3000,
-    "request_review": 2000,
+    "read_file": 4000,        # ~50 lines at ~80 chars/line
+    "grep_repo": 2000,        # 10 matches at ~200 chars each
+    "read_function": 3000,    # Single function, ~30-60 lines
+    "list_files": 1500,       # Directory listing
+    "search_code": 2000,      # Semantic search results
+    "get_function_info": 1500,
+    "get_file_summary": 2000,
+    "get_file_structure": 2000,
+    "run_tests": 2000,        # Test output
+    "request_review": 1500,   # Review verdict + feedback
     "string_replace": 500,
     "check_syntax": 500,
     "create_file": 500,
     "create_sandbox": 500,
     "record_localization": 500,
-    "get_callers": 2000,
-    "get_blast_radius": 2000,
+    "get_callers": 1500,
+    "get_blast_radius": 1500,
     "submit_fix": 500,
     "escalate": 500,
 }
-DEFAULT_CAP = 4000
+DEFAULT_CAP = 2000
 
 
 def cap_tool_output(tool_name: str, output: str) -> str:

@@ -368,15 +368,16 @@ def _extract_function_brace_counting(
 # ---------------------------------------------------------------------------
 
 @tool
-def grep_repo(pattern: str, file_glob: str = "", max_results: int = 25) -> str:
+def grep_repo(pattern: str, file_glob: str = "", max_results: int = 10) -> str:
     """
-    Search for a regex pattern across all source files in the repo.
-    Returns matching lines with file:line_number format.
+    Search for a regex pattern across source files. Returns file:line matches.
+    Use this to FIND where code lives, then read_function to read it.
+    Keep max_results low (5-10) — you rarely need 25 matches.
 
     Args:
         pattern: Regex or literal string to search for
-        file_glob: Optional glob filter e.g. '*.py', '*.ts' (default: all source files)
-        max_results: Max number of matching lines to return (default 25)
+        file_glob: Optional glob filter e.g. '*.py' to narrow search
+        max_results: Max matches to return (default 10 — keep it small)
     """
     repo_path = getattr(_tls, 'repo_path', None)
     if not repo_path or not repo_path.exists():
@@ -408,16 +409,20 @@ def grep_repo(pattern: str, file_glob: str = "", max_results: int = 25) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def read_file(file_path: str, start_line: int = 1, end_line: int = 100) -> str:
+def read_file(file_path: str, start_line: int = 1, end_line: int = 50) -> str:
     """
-    Read a 100-line window of a file from the repo.
-    IMPORTANT: Jump, don't scroll — if you know the function name, use read_function instead.
-    Use grep_repo first to find the exact line numbers, then read only that window.
+    Read a 50-line window of a file. PREFER read_function when you know the function name
+    — it's more precise and wastes less context.
+
+    Only use read_file when you need:
+    - File header/imports (start_line=1, end_line=30)
+    - A specific line range from grep results
+    - Code that isn't inside a function
 
     Args:
         file_path: Relative path from repo root e.g. 'app/services/payment.py'
         start_line: First line to read (1-indexed, default 1)
-        end_line: Last line to read (default 100 — one focused window at a time)
+        end_line: Last line to read (default 50 — keep windows small)
     """
     repo_path = getattr(_tls, 'repo_path', None)
     if not repo_path:

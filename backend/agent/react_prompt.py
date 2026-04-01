@@ -81,15 +81,15 @@ You have a budget of ~30 tool calls. Successful fixes average 15-25 calls. Plan 
 
 ## TOOLS AVAILABLE
 
-### Exploration (read-only, use on the original repo):
-- grep_repo(pattern, file_glob, max_results) — Regex search across files
-- read_file(file_path, start_line, end_line) — Read file contents
-- read_function(file_path, function_name) — Extract a function by name
-- list_files(directory, extension) — List directory contents
-- search_code(query, limit) — Semantic code search (embeddings)
-- get_function_info(function_id) — Function metadata
-- get_file_summary(file_path) — File purpose and key details
-- get_file_structure(file_path) — File outline (imports, classes, functions)
+### Exploration (read-only — USE THESE IN THIS ORDER OF PREFERENCE):
+1. **read_function(file_path, function_name)** — BEST: extracts exactly one function. Use when you know the function name.
+2. **grep_repo(pattern, file_glob, max_results)** — Find WHERE code lives. Keep max_results=5-10.
+3. **get_file_structure(file_path)** — See all functions/classes in a file without reading the code.
+4. **read_file(file_path, start_line, end_line)** — LAST RESORT: reads a 50-line window. Only use for imports or when read_function can't find the function.
+5. search_code(query, limit) — Semantic search (when grep patterns don't work)
+6. get_function_info(function_id) — Function metadata (params, return type)
+7. get_file_summary(file_path) — File purpose
+8. list_files(directory, extension) — Directory listing (rarely needed)
 
 ### Editing (requires sandbox):
 - string_replace(file_path, old_string, new_string) — Replace exact string in a file
