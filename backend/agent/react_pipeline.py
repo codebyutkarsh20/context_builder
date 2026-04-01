@@ -549,7 +549,14 @@ def run_ticket_react(
 
     try:
         result = react_app.invoke(initial_state)
-        return dict(result)
+        result_dict = dict(result)
+        # Record metrics (same as fixed pipeline — keeps dashboard current)
+        try:
+            from api.metrics import record_run
+            record_run(result_dict)
+        except Exception:
+            pass
+        return result_dict
     finally:
         _thread_local.progress_callback = None
         if trace:

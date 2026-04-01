@@ -193,6 +193,19 @@ def _format_test_output(returncode: int, raw_output: str, timeout: int) -> str:
             + raw_output[-500:]
         )
 
+    # Exit code 2 = interrupted (KeyboardInterrupt, SIGINT)
+    # Exit code 3 = internal pytest error (not an assertion failure)
+    # Both are runner-level problems, not "tests failed due to wrong code".
+    if returncode in (2, 3):
+        label = "interrupted" if returncode == 2 else "internal pytest error"
+        logger.warning("Pytest %s (exit code %d)", label, returncode)
+        return (
+            f"error: pytest {label} (exit code {returncode}). "
+            "This is a runner-level issue, not an assertion failure.\n"
+            + raw_output[-500:]
+        )
+
+    # Exit code 1 = actual test assertion failures. This IS the agent's problem.
     logger.warning("Tests failed (exit code %d)", returncode)
     error_lines = []
     for line in raw_output.splitlines():
