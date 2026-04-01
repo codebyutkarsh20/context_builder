@@ -242,13 +242,21 @@ def react_loop(
             # Update guardrail state
             update_from_tool_result(tool_name, tool_args, str(result_str), gs)
 
-            # Check for terminal tools — only mark as terminal if NOT blocked by guardrail
+            # Check for terminal tools — only mark as terminal if NOT blocked
+            # AND the tool actually succeeded (returned "OK:", not "ERROR:")
             if tool_name == "submit_fix" and guardrail_error is None:
-                state["submitted"] = True
-                state["explanation"] = tool_args.get("explanation", "")
-                terminal = True
-                messages.append(ToolMessage(content=str(result_str), tool_call_id=tool_id))
-                break
+                result_text = str(result_str)
+                if result_text.startswith("OK:"):
+                    state["submitted"] = True
+                    state["explanation"] = tool_args.get("explanation", "")
+                    terminal = True
+                else:
+                    # submit_fix returned an error (e.g. no changes, commit failed)
+                    # NOT terminal — let the agent try to fix the issue
+                    logger.warning("submit_fix returned error: %s", result_text[:200])
+                messages.append(ToolMessage(content=result_text, tool_call_id=tool_id))
+                if terminal:
+                    break
 
             if tool_name == "escalate" and guardrail_error is None:
                 state["escalated"] = True
