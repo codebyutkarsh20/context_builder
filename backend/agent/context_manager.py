@@ -46,6 +46,8 @@ TOOL_OUTPUT_CAPS = {
     "create_file": 500,
     "create_sandbox": 500,
     "record_localization": 500,
+    "get_callers": 2000,
+    "get_blast_radius": 2000,
     "submit_fix": 500,
     "escalate": 500,
 }

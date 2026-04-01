@@ -741,12 +741,102 @@ def escalate(reason: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Multi-file coordination tools
+# ---------------------------------------------------------------------------
+
+@tool
+def get_callers(file_path: str, function_name: str = "") -> str:
+    """
+    Find files that call or import the specified file/function.
+    Use this AFTER editing a file to check if callers need updating too.
+    Especially important when you change a function signature, rename something,
+    or modify return values.
+
+    Args:
+        file_path: Relative path to the modified file e.g. 'flask/wrappers.py'
+        function_name: Optional specific function name to search for callers of
+    """
+    repo_name = getattr(_tls, "repo_name", "")
+    repo_path = getattr(_tls, "repo_path", None)
+
+    callers: list[str] = []
+
+    # Strategy 1: Query knowledge graph
+    try:
+        from agent.pipeline import _load_graph_data, _find_callers_from_graph
+        graph_data, _ = _load_graph_data(repo_name)
+        if graph_data:
+            fault_files = [file_path]
+            fault_fns = [function_name] if function_name else []
+            callers = _find_callers_from_graph(graph_data, fault_files, fault_fns)
+    except Exception:
+        pass
+
+    # Strategy 2: Fallback to grep
+    if not callers and repo_path:
+        try:
+            from agent.pipeline import _find_callers_via_grep
+            callers = _find_callers_via_grep(repo_path, [file_path])
+        except Exception:
+            pass
+
+    # Strategy 3: Simple grep if pipeline functions unavailable
+    if not callers and repo_path:
+        search_dir = getattr(_tls, "sandbox_path", None) or repo_path
+        stem = Path(file_path).stem
+        try:
+            result = subprocess.run(
+                ["grep", "-rl", "--include=*.py", f"import {stem}", str(search_dir)],
+                capture_output=True, text=True, timeout=10,
+            )
+            for line in result.stdout.strip().split("\n"):
+                if line and "test_" not in line and "conftest" not in line:
+                    try:
+                        rel = str(Path(line).relative_to(search_dir))
+                        if rel not in callers and rel != file_path:
+                            callers.append(rel)
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+
+    if not callers:
+        return f"No callers found for {file_path}" + (f"::{function_name}" if function_name else "") + ". This file may be a leaf node or the graph may not be indexed."
+
+    risk = "CRITICAL" if len(callers) > 5 else "HIGH" if len(callers) > 2 else "MEDIUM" if len(callers) > 0 else "LOW"
+    result_lines = [f"BLAST RADIUS: {risk} ({len(callers)} caller(s) found for {file_path})"]
+    for c in callers[:10]:
+        result_lines.append(f"  - {c}")
+    if len(callers) > 10:
+        result_lines.append(f"  ... and {len(callers) - 10} more")
+    result_lines.append("")
+    result_lines.append("ACTION: Read these files to check if your changes break them.")
+    result_lines.append("If you changed a function signature, return type, or removed something, update callers too.")
+    return "\n".join(result_lines)
+
+
+@tool
+def get_blast_radius(file_path: str) -> str:
+    """
+    Quick blast radius check for a file you modified. Returns the risk level
+    and list of dependent files. Call this after editing to decide if you need
+    to update other files.
+
+    Args:
+        file_path: Relative path to the modified file
+    """
+    # Delegate to get_callers with no function filter
+    return get_callers.invoke({"file_path": file_path, "function_name": ""})
+
+
+# ---------------------------------------------------------------------------
 # Tool collections
 # ---------------------------------------------------------------------------
 
 EDIT_TOOLS = [string_replace, check_syntax, create_file]
 SANDBOX_TOOLS = [create_sandbox, run_tests]
+MULTI_FILE_TOOLS = [get_callers, get_blast_radius]
 COMPLETION_TOOLS = [record_localization, request_review, submit_fix, escalate]
 
 # All react-specific tools (exploration tools are added from explore_tools.py)
-REACT_TOOLS = EDIT_TOOLS + SANDBOX_TOOLS + COMPLETION_TOOLS
+REACT_TOOLS = EDIT_TOOLS + SANDBOX_TOOLS + MULTI_FILE_TOOLS + COMPLETION_TOOLS
