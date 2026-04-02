@@ -7,7 +7,6 @@ from fastapi import FastAPI
 
 # Load .env from project root (one level up from backend/)
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-load_dotenv()  # Also check backend/.env
 
 import logging
 import os

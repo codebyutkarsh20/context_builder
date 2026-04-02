@@ -24,7 +24,7 @@ class TestLoggingConfig:
         content = src.read_text()
 
         # basicConfig must appear after load_dotenv
-        dotenv_pos = content.index("load_dotenv()")
+        dotenv_pos = content.index("load_dotenv(")
         basic_pos = content.index("logging.basicConfig")
         assert basic_pos > dotenv_pos, "basicConfig should be after load_dotenv"
 

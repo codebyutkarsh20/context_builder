@@ -425,11 +425,12 @@ def _run_case_in_child(pipeline: str, work_order: dict, result_path: str) -> Non
     # Child process must load .env since it doesn't inherit parent's dotenv state
     try:
         from dotenv import load_dotenv
-        load_dotenv()  # Loads from .env in cwd
-        # Also try backend/.env if we're running from project root
-        backend_env = Path(__file__).resolve().parent.parent.parent / ".env"
-        if backend_env.exists():
-            load_dotenv(backend_env)
+        # Always try to load from the project root
+        root_env = Path(__file__).resolve().parent.parent.parent.parent / ".env"
+        if root_env.exists():
+            load_dotenv(root_env)
+        else:
+            load_dotenv()  # Fallback
     except ImportError:
         pass  # dotenv not installed, rely on OS env
 

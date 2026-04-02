@@ -18,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Load .env so tests can find ANTHROPIC_API_KEY etc.
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
-load_dotenv()
 
 
 # ── Temp repo fixtures ──────────────────────────────────────────────────
