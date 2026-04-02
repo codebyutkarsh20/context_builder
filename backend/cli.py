@@ -39,13 +39,13 @@ def eval_run(
     output: str = typer.Option("eval/results", "--output", "-o", help="Results output directory"),
 ):
     """
-    Run the evaluation suite. Supports A/B comparison of fixed vs ReAct pipelines.
+    Run the evaluation suite on the ReAct pipeline.
 
     Examples:
-        python cli.py eval run                               # All bugs, both pipelines
-        python cli.py eval run --bug FLASK-2651 -p react     # Single bug, ReAct only
-        python cli.py eval run --sentinel                    # Fast 5-bug regression check
-        python cli.py eval run -p fixed --timeout 300        # Fixed only, 5min timeout
+        python cli.py eval run                               # All bugs (react)
+        python cli.py eval run --bug FLASK-2651             # Single bug (react)
+        python cli.py eval run --sentinel                   # Fast 5-bug regression check
+        python cli.py eval run --timeout 300                # 5min timeout per case
     """
     from agent.eval.runner import EvalRunner
 

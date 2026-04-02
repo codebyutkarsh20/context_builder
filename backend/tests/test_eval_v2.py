@@ -236,6 +236,20 @@ class TestScoring:
         score = score_case(FAILING_RESULT, SAMPLE_BUG, "fixed")
         assert score["test_pass"] is False
 
+    def test_full_pass_requires_test_pass(self):
+        from agent.eval.scoring import score_case
+
+        result = {
+            **PASSING_RESULT,
+            "test_result": "skipped: no tests found",
+        }
+        score = score_case(result, SAMPLE_BUG, "fixed")
+        assert score["localization_hit"] is True
+        assert score["fix_generated"] is True
+        assert score["patch_hits_target"] is True
+        assert score["test_pass"] is False
+        assert score["full_pass"] is False
+
     def test_cost_tracking(self):
         from agent.eval.scoring import score_case
 

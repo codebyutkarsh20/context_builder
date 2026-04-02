@@ -219,55 +219,39 @@ def print_summary(scores: list[dict]) -> None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bug", help="Run only this ticket_id")
+    parser.add_argument("--sentinel", action="store_true", help="Run first 5 bugs only")
+    parser.add_argument("--timeout", type=int, default=600, help="Per-case timeout in seconds")
+    parser.add_argument("--output", default=str(RESULTS_DIR), help="Results output directory")
+    parser.add_argument("--create-prs", action="store_true", help="Create real PRs (default: dry-run)")
+    # Legacy flags retained for compatibility; no longer used by EvalRunner.
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-clone", action="store_true")
     parser.add_argument("--no-graph", action="store_true")
-    # --react/--no-react removed: ReAct is the only supported pipeline
     args = parser.parse_args()
 
-    bugs = load_bugs(args.bug)
-    logger.info("Loaded %d bugs", len(bugs))
-    REPOS_DIR.mkdir(parents=True, exist_ok=True)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    if args.skip_build or args.skip_clone or args.no_graph:
+        logger.warning(
+            "Flags --skip-build/--skip-clone/--no-graph are legacy and ignored. "
+            "Use backend/cli.py eval run options for modern eval controls."
+        )
 
-    scores = []
-    for i, bug in enumerate(bugs):
-        logger.info("=" * 60)
-        logger.info("Bug %d/%d: %s", i + 1, len(bugs), bug["ticket_id"])
+    from agent.eval.runner import EvalRunner
+    from agent.eval.report import generate_markdown_report
 
-        if not args.skip_clone:
-            try:
-                repo_dir = clone_repo(bug)
-            except Exception as e:
-                logger.error("Clone failed: %s", e)
-                scores.append({"ticket_id": bug["ticket_id"], "full_pass": False,
-                               "error": str(e), **{k: False for k in
-                               ("localization_hit", "fix_generated", "review_approved", "patch_hits_target")},
-                               "duration_seconds": 0, "title": bug["title"],
-                               "found_files": [], "expected_files": bug.get("expected_files", []),
-                               "root_cause_match": False, "patch_count": 0,
-                               "review_verdict": "", "review_confidence": 0, "status": "failed"})
-                continue
-        else:
-            repo_dir = REPOS_DIR / bug["ticket_id"].lower()
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-        if not args.skip_build and not args.no_graph:
-            build_graph(bug, repo_dir)
+    runner = EvalRunner(
+        dataset_path=BUGS_FILE,
+        pipelines=["react"],
+        timeout_per_case=args.timeout,
+        create_prs=args.create_prs,
+        results_dir=output_dir,
+    )
+    eval_report = runner.run(bug_filter=args.bug, sentinel=args.sentinel)
 
-        result = run_pipeline(bug, repo_dir)
-        score = score_result(result, bug)
-        scores.append(score)
-
-        with open(RESULTS_DIR / f"{bug['ticket_id']}.json", "w") as f:
-            json.dump({"bug": bug, "score": score}, f, indent=2)
-
-    report = {"timestamp": time.time(), "total": len(scores), "scores": scores}
-    report_file = RESULTS_DIR / f"report_{int(time.time())}.json"
-    with open(report_file, "w") as f:
-        json.dump(report, f, indent=2)
-
-    print_summary(scores)
-    print(f"\nReport: {report_file}")
+    print(generate_markdown_report(eval_report))
+    print(f"\nLatest report: {output_dir / 'latest.json'}")
 
 
 if __name__ == "__main__":

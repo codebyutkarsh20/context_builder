@@ -253,9 +253,11 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
     hits_target = _score_patch_hits_target(result, expected_files)
     gt_match = _score_ground_truth_file_match(result, bug)
 
-    # full_pass requires: localization + fix + patches target the right files
+    test_ok = _score_test_pass(result)
+
+    # full_pass requires: localization + fix + patches on expected files + passing tests
     # (review_approved is informational, not a gate — Claude reviewing Claude has bias)
-    full_pass = loc_hit and fix_gen and hits_target
+    full_pass = loc_hit and fix_gen and hits_target and test_ok
 
     return {
         "ticket_id": bug["ticket_id"],
@@ -272,7 +274,7 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
         # New metrics
         "patch_correctness": patch_correctness,
         "multi_file_complete": _score_multi_file_complete(result, bug),
-        "test_pass": _score_test_pass(result),
+        "test_pass": test_ok,
         "patch_hits_target": hits_target,
 
         # Ground truth comparison
