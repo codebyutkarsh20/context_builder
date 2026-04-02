@@ -422,6 +422,17 @@ def _run_case_in_child(pipeline: str, work_order: dict, result_path: str) -> Non
     This runs in a separate process so it can be killed on timeout.
     All output goes to a JSON file that the parent reads.
     """
+    # Child process must load .env since it doesn't inherit parent's dotenv state
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()  # Loads from .env in cwd
+        # Also try backend/.env if we're running from project root
+        backend_env = Path(__file__).resolve().parent.parent.parent / ".env"
+        if backend_env.exists():
+            load_dotenv(backend_env)
+    except ImportError:
+        pass  # dotenv not installed, rely on OS env
+
     from agent.trace import RunTrace
 
     trace = RunTrace(
