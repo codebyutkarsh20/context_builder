@@ -255,9 +255,20 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
 
     test_ok = _score_test_pass(result)
 
-    # full_pass requires: localization + fix + patches on expected files + passing tests
-    # (review_approved is informational, not a gate — Claude reviewing Claude has bias)
+    # Classify test infrastructure status
+    test_result_raw = (result.get("test_result") or "").strip().lower()
+    infra_blocked = (
+        test_result_raw.startswith("skipped") or
+        test_result_raw.startswith("error") or
+        not test_result_raw  # no test result at all
+    )
+
+    # full_pass (strict): localization + fix + target files + passing tests
     full_pass = loc_hit and fix_gen and hits_target and test_ok
+
+    # agent_quality_pass (diagnostic): did the agent do its job correctly?
+    # Ignores test infra failures the agent can't control.
+    agent_quality_pass = loc_hit and fix_gen and hits_target
 
     return {
         "ticket_id": bug["ticket_id"],
@@ -293,9 +304,11 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
         "status": str(result.get("status", "unknown")),
         "error": result.get("error", ""),
 
-        # Derived — requires localization + fix + correct target files
-        # (NOT gated on review_approved — that's self-review bias)
+        # Derived — strict (requires passing tests)
         "full_pass": full_pass,
+        # Diagnostic — agent behavior quality (ignores test infra)
+        "agent_quality_pass": agent_quality_pass,
+        "infra_blocked": infra_blocked,
     }
 
 
@@ -337,6 +350,8 @@ def build_summary(scores: list[dict], pipeline: str | None = None) -> dict:
         }
 
     passes = sum(1 for s in scores if s.get("full_pass"))
+    quality_passes = sum(1 for s in scores if s.get("agent_quality_pass"))
+    infra_blocked_count = sum(1 for s in scores if s.get("infra_blocked"))
     loc_hits = sum(1 for s in scores if s.get("localization_hit"))
     root_matches = sum(1 for s in scores if s.get("root_cause_match"))
     fixes = sum(1 for s in scores if s.get("fix_generated"))
@@ -365,6 +380,10 @@ def build_summary(scores: list[dict], pipeline: str | None = None) -> dict:
             reasons.append("no_fix")
         if not s.get("review_approved"):
             reasons.append("not_approved")
+        if s.get("infra_blocked"):
+            reasons.append("infra_blocked")
+        elif not s.get("test_pass"):
+            reasons.append("test_failed")
         if s.get("error"):
             reasons.append("error")
         failures.append({
@@ -376,6 +395,8 @@ def build_summary(scores: list[dict], pipeline: str | None = None) -> dict:
     return {
         "total": total,
         "pass_rate": round(passes / total, 4),
+        "agent_quality_rate": round(quality_passes / total, 4),
+        "infra_blocked_count": infra_blocked_count,
         "localization_accuracy": round(loc_hits / total, 4),
         "root_cause_accuracy": round(root_matches / total, 4),
         "fix_rate": round(fixes / total, 4),
