@@ -282,15 +282,20 @@ function PatchCard({ patch }: { patch: { file_path: string; original_code: strin
 
 // ─── Trace Log Panel ────────────────────────────────────────────────────────
 
-type TraceFilter = 'all' | 'llm' | 'tools' | 'tests' | 'stages'
+type TraceFilter = 'all' | 'llm' | 'tools' | 'tests' | 'stages' | 'guardrails'
 
 const EVENT_STYLES: Record<string, { icon: typeof Zap; color: string; label: string }> = {
   stage_start: { icon: Layers, color: 'text-blue-400', label: 'Stage' },
   stage_end: { icon: Layers, color: 'text-blue-300', label: 'Stage End' },
-  llm_request: { icon: MessageSquare, color: 'text-purple-400', label: 'LLM Request' },
-  llm_response: { icon: MessageSquare, color: 'text-purple-300', label: 'LLM Response' },
+  llm_request: { icon: MessageSquare, color: 'text-purple-400', label: 'LLM Req' },
+  llm_response: { icon: MessageSquare, color: 'text-purple-300', label: 'LLM Resp' },
   tool_call: { icon: Wrench, color: 'text-orange-400', label: 'Tool Call' },
   tool_result: { icon: Wrench, color: 'text-orange-300', label: 'Tool Result' },
+  guardrail_event: { icon: Shield, color: 'text-red-400', label: 'Guardrail' },
+  state_transition: { icon: ArrowRight, color: 'text-cyan-400', label: 'Phase' },
+  context_compaction: { icon: Brain, color: 'text-yellow-400', label: 'Context' },
+  prompt_build: { icon: FileCode, color: 'text-green-400', label: 'Prompt' },
+  run_outcome: { icon: Target, color: 'text-emerald-400', label: 'Outcome' },
   patch_candidate: { icon: FileCode, color: 'text-green-400', label: 'Patch' },
   test_output: { icon: TestTube, color: 'text-lime-400', label: 'Test' },
   error: { icon: XCircle, color: 'text-red-400', label: 'Error' },
@@ -301,8 +306,9 @@ function matchesFilter(evt: TraceEvent, filter: TraceFilter): boolean {
   if (filter === 'all') return true
   if (filter === 'llm') return evt.event_type === 'llm_request' || evt.event_type === 'llm_response'
   if (filter === 'tools') return evt.event_type === 'tool_call' || evt.event_type === 'tool_result'
-  if (filter === 'tests') return evt.event_type === 'test_output'
-  if (filter === 'stages') return evt.event_type === 'stage_start' || evt.event_type === 'stage_end'
+  if (filter === 'tests') return evt.event_type === 'test_output' || (evt.event_type === 'tool_call' && evt.data?.tool_name === 'run_tests')
+  if (filter === 'stages') return evt.event_type === 'stage_start' || evt.event_type === 'stage_end' || evt.event_type === 'state_transition' || evt.event_type === 'run_outcome'
+  if (filter === 'guardrails') return evt.event_type === 'guardrail_event' || evt.event_type === 'context_compaction'
   return true
 }
 
@@ -321,24 +327,37 @@ function TraceEventRow({ evt }: { evt: TraceEvent }) {
   let summary = ''
   if (evt.event_type === 'stage_start') summary = `→ ${data.stage}`
   else if (evt.event_type === 'stage_end') summary = `✓ ${data.stage} (${formatDuration(data.duration_ms as number || 0)})`
-  else if (evt.event_type === 'llm_request') summary = `${data.model} → ${data.schema} (~${data.prompt_tokens_approx} tokens)`
-  else if (evt.event_type === 'llm_response') summary = `${data.model} ← ${data.schema} (${formatDuration(data.duration_ms as number || 0)})`
-  else if (evt.event_type === 'tool_call') summary = `${data.tool_name}(${JSON.stringify(data.args).slice(0, 80)})`
-  else if (evt.event_type === 'tool_result') summary = `${data.tool_name} (${formatDuration(data.duration_ms as number || 0)})`
+  else if (evt.event_type === 'llm_request') summary = `${data.model || 'llm'} [${data.phase || '?'}] ~${data.context_tokens || 0} tokens (${data.context_pct || 0}% ctx)`
+  else if (evt.event_type === 'llm_response') summary = `${data.model || 'llm'} in=${data.input_tokens || 0} out=${data.output_tokens || 0} $${Number(data.cost_usd || 0).toFixed(3)} (total $${Number(data.cumulative_cost_usd || 0).toFixed(3)})`
+  else if (evt.event_type === 'tool_call') summary = `[${data.phase || '?'}] ${data.tool_name}(${JSON.stringify(data.args || {}).slice(0, 80)})`
+  else if (evt.event_type === 'tool_result') summary = `${data.tool_name} (${formatDuration(data.duration_ms as number || 0)}) ${String(data.result_preview || '').slice(0, 60)}`
+  else if (evt.event_type === 'guardrail_event') summary = `${data.action === 'block' ? 'BLOCKED' : 'WARN'} ${data.tool_name}: ${String(data.message || '').slice(0, 80)}`
+  else if (evt.event_type === 'state_transition') summary = `${data.from_phase} → ${data.to_phase} (at call #${data.at_call}, $${Number(data.cost_usd_at_transition || 0).toFixed(3)})`
+  else if (evt.event_type === 'context_compaction') summary = `${data.action}: ${data.tokens_before} → ${data.tokens_after} tokens (saved ${data.tokens_saved})`
+  else if (evt.event_type === 'prompt_build') summary = `system=${data.system_prompt_tokens_approx || 0} tokens, kickstart=${data.kickstart_chars || 0} chars`
+  else if (evt.event_type === 'run_outcome') summary = `${String(data.outcome || '').toUpperCase()} — ${data.tool_call_count} calls, $${Number(data.cost_usd || 0).toFixed(3)}, ${data.elapsed_seconds || 0}s`
   else if (evt.event_type === 'patch_candidate') summary = `${data.file_path}`
   else if (evt.event_type === 'test_output') summary = (data.passed ? 'PASSED' : 'FAILED') + ` (${data.patches_applied} patches)`
   else if (evt.event_type === 'error') summary = String(data.message || '').slice(0, 120)
   else if (evt.event_type === 'info') summary = String(data.message || '').slice(0, 120)
 
   // Expandable detail content
-  const hasDetail = ['llm_request', 'llm_response', 'tool_call', 'tool_result', 'test_output', 'patch_candidate'].includes(evt.event_type)
+  const hasDetail = [
+    'llm_request', 'llm_response', 'tool_call', 'tool_result',
+    'test_output', 'patch_candidate', 'guardrail_event', 'run_outcome',
+    'prompt_build', 'context_compaction',
+  ].includes(evt.event_type)
 
   let detailContent = ''
   if (expanded) {
-    if (evt.event_type === 'llm_request') detailContent = String(data.prompt_preview || data.prompt_full || '')
-    else if (evt.event_type === 'llm_response') detailContent = JSON.stringify(data.output, null, 2)
-    else if (evt.event_type === 'tool_call') detailContent = JSON.stringify(data.args, null, 2)
-    else if (evt.event_type === 'tool_result') detailContent = String(data.result_preview || data.result_full || '')
+    if (evt.event_type === 'llm_request') detailContent = `Model: ${data.model}\nPhase: ${data.phase}\nContext tokens: ${data.context_tokens} (${data.context_pct}%)\nMessages: ${data.message_count}\nCost so far: $${data.cost_usd_so_far}`
+    else if (evt.event_type === 'llm_response') detailContent = `Input: ${data.input_tokens} tokens\nOutput: ${data.output_tokens} tokens\nCache creation: ${data.cache_creation_tokens || 0}\nCache read: ${data.cache_read_tokens || 0}\nCall cost: $${data.cost_usd}\nTotal cost: $${data.cumulative_cost_usd}`
+    else if (evt.event_type === 'tool_call') detailContent = `Phase: ${data.phase}\nCall #${data.call_number}\n\nArgs:\n${JSON.stringify(data.args, null, 2)}${data.reasoning ? `\n\nAgent reasoning:\n${data.reasoning}` : ''}`
+    else if (evt.event_type === 'tool_result') detailContent = String(data.result_preview || '')
+    else if (evt.event_type === 'guardrail_event') detailContent = `Tool: ${data.tool_name}\nAction: ${data.action}\nCall #${data.call_number}\n\n${data.message}`
+    else if (evt.event_type === 'run_outcome') detailContent = JSON.stringify(data, null, 2)
+    else if (evt.event_type === 'prompt_build') detailContent = `System prompt: ${data.system_prompt_chars} chars (~${data.system_prompt_tokens_approx} tokens)\nTask message: ${data.task_message_chars} chars\nKickstart context: ${data.kickstart_chars} chars\nConventions: ${data.conventions_chars} chars\nBusiness rules: ${data.business_rules_chars} chars\nHint files: ${JSON.stringify(data.hint_files)}`
+    else if (evt.event_type === 'context_compaction') detailContent = `Action: ${data.action}\nBefore: ${data.tokens_before} tokens\nAfter: ${data.tokens_after} tokens\nSaved: ${data.tokens_saved} tokens\nAt call: #${data.at_call}`
     else if (evt.event_type === 'test_output') detailContent = String(data.result || '')
     else if (evt.event_type === 'patch_candidate') detailContent = `File: ${data.file_path}\nExplanation: ${data.explanation}`
     else detailContent = JSON.stringify(data, null, 2)
@@ -403,10 +422,11 @@ function TraceLogPanel({ events, isLive }: { events: TraceEvent[]; isLive: boole
 
   const FILTERS: { key: TraceFilter; label: string; icon: typeof Zap }[] = [
     { key: 'all', label: 'All', icon: Filter },
-    { key: 'stages', label: 'Stages', icon: Layers },
+    { key: 'stages', label: 'Phases', icon: Layers },
     { key: 'llm', label: 'LLM', icon: MessageSquare },
     { key: 'tools', label: 'Tools', icon: Wrench },
     { key: 'tests', label: 'Tests', icon: TestTube },
+    { key: 'guardrails', label: 'Guards', icon: Shield },
   ]
 
   if (collapsed) {

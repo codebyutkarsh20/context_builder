@@ -255,7 +255,7 @@ export interface TraceEvent {
   index: number
   timestamp: number
   wall_time: string
-  event_type: 'stage_start' | 'stage_end' | 'llm_request' | 'llm_response' | 'tool_call' | 'tool_result' | 'patch_candidate' | 'test_output' | 'error' | 'info'
+  event_type: 'stage_start' | 'stage_end' | 'llm_request' | 'llm_response' | 'tool_call' | 'tool_result' | 'guardrail_event' | 'state_transition' | 'context_compaction' | 'prompt_build' | 'run_outcome' | 'patch_candidate' | 'test_output' | 'error' | 'info'
   stage: string
   data: Record<string, unknown>
 }
