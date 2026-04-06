@@ -109,8 +109,8 @@ def check_tool_call(
             missing.append("create_sandbox (no sandbox exists)")
         if not gs.tests_attempted:
             missing.append("run_tests (must attempt tests at least once)")
-        elif not gs.tests_passed:
-            # BUG: should also allow gs.tests_skipped — skipped means infra not available, not a failure
+        elif not gs.tests_passed and not gs.tests_skipped:
+            # Tests ran and FAILED (actual assertion failures) — block
             missing.append("run_tests (tests failed — fix the failures first)")
         if not gs.review_approved:
             missing.append("request_review (review must approve)")
