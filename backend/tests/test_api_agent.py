@@ -19,7 +19,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-BASE = "http://localhost:8000"
+BASE = "http://localhost:8001"
 
 
 def api(method, path, **kwargs):

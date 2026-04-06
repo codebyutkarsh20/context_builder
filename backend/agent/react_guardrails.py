@@ -97,8 +97,9 @@ def check_tool_call(
     # Sandbox gate
     if tool_name in SANDBOX_REQUIRED_TOOLS and not gs.sandbox_created:
         return (
-            "ERROR: You must call create_sandbox before using "
-            f"{tool_name}. Create a sandbox first, then edit/test."
+            f"ERROR: No sandbox exists — {tool_name} requires one.\n"
+            "NEXT STEP: Call create_sandbox() right now, then retry.\n"
+            "This is a required setup step, NOT a reason to escalate."
         )
 
     # Submit gate

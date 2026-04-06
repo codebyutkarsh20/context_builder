@@ -156,8 +156,9 @@ not from guessing the implementation."""
     if bug_category == "C":
         intent = state.get("intent", {})
         cat_c_note = (
-            "WARNING: Bug category C — concurrency, performance, or multi-service. "
-            "Auto-fix success rate is low; consider escalating early."
+            "NOTE: Bug shows complexity signals (category C). Attempt the fix — "
+            "escalate only if you make no progress after 3+ explore/edit cycles, "
+            "or the root cause spans 5+ files."
         )
         existing_notes = intent.get("notes", "")
         intent["notes"] = (existing_notes + "\n" + cat_c_note).strip() if existing_notes else cat_c_note

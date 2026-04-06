@@ -180,7 +180,8 @@ def _extract_tool_name(messages: list, tool_msg_index: int) -> str:
             for tc in msg.tool_calls:
                 if tc.get("id") == tool_call_id:
                     return tc.get("name", "unknown")
-            return msg.tool_calls[0].get("name", "unknown")
+            # This AIMessage has no matching ID — keep searching backwards
+            continue
     return "unknown"
 
 

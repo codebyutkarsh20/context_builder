@@ -61,24 +61,40 @@ def extract_repro_steps(description: str) -> list[str]:
 
 
 def classify_bug_category(title: str, description: str) -> str:
-    """Classify bug into Category A (auto-fix), B (might work), C (skip)."""
+    """Classify bug into Category A (auto-fix), B (might work), C (skip).
+
+    Category A: Clear logic/value bugs — high auto-fix success rate.
+    Category B: Moderate complexity — worth attempting.
+    Category C: Concurrency, perf, multi-service, UI — low success rate.
+    """
     text = f"{title} {description}".lower()
 
-    c_signals = [
-        "race condition", "concurrency", "deadlock", "performance", "slow", "timeout",
-        "n+1", "memory leak", "migration", "database migration", "schema change",
-        "multi-service", "event", "kafka", "rabbitmq", "queue", "environment",
-        "works locally", "works in dev", "only in prod", "ui", "visual", "layout",
-        "animation", "css", "architecture", "redesign", "refactor",
+    # Multi-word phrases — safe to substring-match
+    c_signals_phrase = [
+        "race condition", "concurrency", "deadlock",
+        "memory leak", "database migration", "schema change",
+        "multi-service", "works locally", "works in dev", "only in prod",
     ]
-    if any(s in text for s in c_signals):
+    if any(s in text for s in c_signals_phrase):
+        return "C"
+
+    # Single-word signals — require word boundaries to avoid false positives
+    # e.g. "slow" in "tests/slow", "timeout" in "test_timeout", "env" in "environment"
+    c_signals_word = [
+        r"\bslow\b", r"\btimeout\b", r"\bperformance\b", r"\bui\b", r"\bcss\b",
+        r"\blayout\b", r"\bvisual\b", r"\banimation\b", r"\barchitecture\b",
+        r"\bredesign\b", r"\brefactor\b", r"\bkafka\b", r"\brabbitmq\b",
+        r"\bn\+1\b",
+    ]
+    if any(re.search(pat, text) for pat in c_signals_word):
         return "C"
 
     a_signals = [
         "traceback", "exception", "error:", "typeerror", "attributeerror",
-        "none", "null", "undefined", "missing", "import", "not found",
-        "wrong value", "incorrect value", "returns wrong", "should return",
-        "off by one", "index out", "keyerror", "valueerror",
+        "valueerror", "keyerror", "indexerror", "none", "null", "undefined",
+        "missing", "import", "not found", "wrong value", "incorrect value",
+        "returns wrong", "should return", "off by one", "index out",
+        "str.split", "shlex", "incorrect", "broken", "fails silently",
     ]
     a_count = sum(1 for s in a_signals if s in text)
     if a_count >= 2:
