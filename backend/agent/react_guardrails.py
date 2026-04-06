@@ -97,8 +97,9 @@ def check_tool_call(
     # Sandbox gate
     if tool_name in SANDBOX_REQUIRED_TOOLS and not gs.sandbox_created:
         return (
-            "ERROR: You must call create_sandbox before using "
-            f"{tool_name}. Create a sandbox first, then edit/test."
+            f"ERROR: No sandbox exists — {tool_name} requires one.\n"
+            "NEXT STEP: Call create_sandbox() right now, then retry.\n"
+            "This is a required setup step, NOT a reason to escalate."
         )
 
     # Submit gate
@@ -109,7 +110,6 @@ def check_tool_call(
         if not gs.tests_attempted:
             missing.append("run_tests (must attempt tests at least once)")
         elif not gs.tests_passed and not gs.tests_skipped:
-            # Tests ran and FAILED (actual assertion failures) — block
             missing.append("run_tests (tests failed — fix the failures first)")
         if not gs.review_approved:
             missing.append("request_review (review must approve)")

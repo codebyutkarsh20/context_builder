@@ -35,7 +35,7 @@ pytestmark = pytest.mark.skipif(
     reason="E2E tests require live backend/frontend. Set RUN_E2E_TESTS=1 to run.",
 )
 
-BASE = "http://localhost:8000"
+BASE = "http://localhost:8001"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 
 # ──────────────────────────────────────────────────────────────────────

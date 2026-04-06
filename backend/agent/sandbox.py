@@ -83,7 +83,7 @@ def run_tests(
         if test_cmd_base in ("pytest", "python -m pytest"):
             cmd_parts = [sys.executable, "-m", "pytest"] + test_args
         else:
-            cmd_parts = test_cmd_base.split()
+            cmd_parts = shlex.split(test_cmd_base)
 
         # test_path (from agent) overrides test_pattern (from config)
         if test_path:

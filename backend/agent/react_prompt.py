@@ -51,17 +51,25 @@ def build_system_prompt(
 
 You have a budget of ~30 tool calls. Successful fixes average 15-25 calls. Plan ahead.
 
-### Phase 1: EXPLORE (budget: 6-10 calls)
-1. Start with grep_repo or read_function on the suspected file. Do NOT use list_files unless you have no idea where the code is.
-2. Read ONLY the buggy function, not entire files. Use read_function, not read_file when possible.
-3. If your first grep finds the file, go straight to reading the function. Don't keep grepping.
-4. Call record_localization as soon as you have a hypothesis. Don't over-explore.
+### Phase 1: EXPLORE (budget: 3-8 calls; use ≤3 if intent specifies exact file + function)
+1. Start with read_function on the suspected function — NOT list_files or read_file (whole file).
+2. If the intent specifies the exact file AND function: read it once, form hypothesis, move to Phase 2.
+3. Do NOT search for test coverage or verify imports before editing — that happens after create_sandbox.
+4. Call record_localization as soon as you have a hypothesis. Stop exploring immediately after.
 
-### Phase 2: EDIT (budget: 3-5 calls)
-5. Call create_sandbox (1 call).
-6. Apply your fix with string_replace (1-2 calls).
-7. Call check_syntax to verify (1 call).
-8. Optionally call get_blast_radius if you changed an interface (1 call).
+### Phase 2: EDIT — STRICT SEQUENCE (budget: 3-5 calls)
+
+  ╔══════════════════════════════════════════════════════╗
+  ║  MANDATORY ORDER — do not skip or reorder steps:    ║
+  ║  Step 1: create_sandbox()   ← ALWAYS FIRST          ║
+  ║  Step 2: string_replace()   ← apply your fix        ║
+  ║  Step 3: check_syntax()     ← verify no errors      ║
+  ║  Step 4: read_function()    ← confirm edit is right ║
+  ╚══════════════════════════════════════════════════════╝
+
+  You CANNOT call string_replace, create_file, or run_tests without a sandbox.
+  If you get "ERROR: No sandbox exists", call create_sandbox() immediately — it is
+  a 1-call setup step, NOT a reason to escalate.
 
 ### Phase 3: VERIFY (budget: 3-5 calls)
 9. Call run_tests with a specific test path (1-2 calls). If tests return "skipped" or "error", that's fine — the repo may lack deps. Move on.
@@ -71,6 +79,17 @@ You have a budget of ~30 tool calls. Successful fixes average 15-25 calls. Plan 
 ### Phase 4: FINISH (1-2 calls)
 12. Call submit_fix with your explanation.
 
+## RECOVERY PATTERNS — IF YOU HIT AN ERROR, DO THIS
+
+| Error Message | Recovery Action |
+|---------------|-----------------|
+| "No sandbox exists" | Call create_sandbox() NOW, then retry. Never escalate for this. |
+| "old_string not found in file" | Re-read function with read_function, get exact content, retry string_replace. |
+| "old_string appears N times" | Extend old_string with more surrounding context to make it unique. |
+| Tests return "skipped" or "error" | This is OK — proceed directly to request_review and submit_fix. |
+| "Cannot submit yet. Missing prerequisites" | Read the list — complete each missing step in order. |
+| "Path traversal blocked" | Use relative path from repo root (e.g. 'agent/sandbox.py' not '/tmp/...') |
+
 ## ANTI-PATTERNS — DO NOT DO THESE
 
 - **Grep spam**: If you've called grep_repo 5+ times without finding what you need, STOP and try a different approach (read_function, get_file_structure) or escalate.
@@ -78,6 +97,7 @@ You have a budget of ~30 tool calls. Successful fixes average 15-25 calls. Plan 
 - **Test spiral**: If run_tests fails twice, proceed to review/submit. Do not keep trying different test paths.
 - **Edit churn**: If string_replace fails twice on the same file, re-read the function first, then make ONE more attempt.
 - **Review loop**: If request_review rejects, make ONE fix attempt. If rejected again, escalate. Do not call request_review more than 2 times.
+- **Premature escalation**: Do NOT escalate after a single blocked tool call. Read the error, follow the recovery action above, and retry.
 
 ## TOOLS AVAILABLE
 
@@ -223,28 +243,43 @@ def build_task_message(work_order: dict, intent: dict) -> str:
     hint_modules = intent.get("likely_affected_modules", [])
     hint_functions = intent.get("likely_affected_functions", [])
 
-    start_hint = ""
-    if hint_functions:
+    # When bug location is pre-specified, skip wide exploration
+    location_known = bool(hint_functions and hint_modules)
+
+    if location_known:
+        start_hint = (
+            f"The bug location is pre-specified: function(s) {hint_functions} "
+            f"in {hint_modules}.\n"
+            f"FAST PATH: Read that function directly → confirm the fix → go straight to Phase 2.\n"
+            f"Use at most 3 explore calls before creating the sandbox."
+        )
+        budget_hint = "Budget: 30 calls max. With a pre-specified location, target 8-12 calls total."
+    elif hint_functions:
         start_hint = f"Start by reading function(s) {hint_functions} with read_function."
+        budget_hint = "Budget: 30 calls max. Successful fixes average 15-25 calls."
     elif hint_modules:
         start_hint = f"Start by examining {hint_modules} with grep_repo or read_function."
+        budget_hint = "Budget: 30 calls max. Successful fixes average 15-25 calls."
     else:
         start_hint = "Start by grepping for keywords from the bug description."
+        budget_hint = "Budget: 30 calls max. Successful fixes average 15-25 calls."
 
     return (
         f"Fix this bug: {work_order.get('title', '')}\n\n"
         f"{start_hint}\n\n"
-        f"EXAMPLE of an efficient 10-call fix:\n"
-        f"  1. read_function → find buggy code\n"
-        f"  2. grep_repo → confirm this is the only place\n"
-        f"  3. record_localization → log your hypothesis\n"
-        f"  4. create_sandbox → isolate for editing\n"
-        f"  5. string_replace → apply the fix\n"
-        f"  6. check_syntax → verify no errors\n"
-        f"  7. run_tests → attempt tests (OK if skipped)\n"
-        f"  8. request_review → get approval\n"
-        f"  9. submit_fix → done\n\n"
-        f"Budget: 30 calls max. Successful fixes average 15-25."
+        f"EFFICIENT 9-CALL FIX SEQUENCE (follow this order exactly):\n"
+        f"  1. read_function        → read the buggy function (1 call)\n"
+        f"  2. record_localization  → lock in your hypothesis (1 call)\n"
+        f"  3. create_sandbox       → REQUIRED before any edits or tests (1 call)\n"
+        f"  4. string_replace       → apply the minimal fix (1-2 calls)\n"
+        f"  5. check_syntax         → verify no syntax errors (1 call)\n"
+        f"  6. run_tests            → attempt tests — OK if skipped/error (1 call)\n"
+        f"  7. request_review       → get independent approval (1 call)\n"
+        f"  8. submit_fix           → done (1 call)\n\n"
+        f"CRITICAL: create_sandbox (step 3) must come before string_replace and run_tests.\n"
+        f"If you see 'No sandbox exists', call create_sandbox immediately — do not escalate.\n"
+        f"If create_sandbox returns 'uncommitted changes', escalate with that exact reason.\n\n"
+        f"{budget_hint}"
     )
 
 
