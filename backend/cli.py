@@ -37,6 +37,8 @@ def eval_run(
     sentinel: bool = typer.Option(False, "--sentinel", help="Run only first 5 bugs (fast regression check)"),
     create_prs: bool = typer.Option(False, "--create-prs", help="Create real PRs (default: dry-run)"),
     output: str = typer.Option("eval/results", "--output", "-o", help="Results output directory"),
+    build_graph: bool = typer.Option(False, "--build-graph", "-g",
+                                     help="Build knowledge graph before running agent (full system test)"),
 ):
     """
     Run the evaluation suite on the ReAct pipeline.
@@ -45,6 +47,7 @@ def eval_run(
         python cli.py eval run                                     # All bugs (react v3.0)
         python cli.py eval run --bug CB-001                        # Single bug
         python cli.py eval run --pipeline react,react_v2           # A/B: v3 vs v2 baseline
+        python cli.py eval run --build-graph                       # Full system (with knowledge graph)
         python cli.py eval run --sentinel                          # Fast 3-bug regression check
         python cli.py eval run --timeout 300                       # 5min timeout per case
     """
@@ -56,6 +59,7 @@ def eval_run(
     console.print(Panel(
         f"[bold cyan]Dataset:[/bold cyan]   {dataset}\n"
         f"[bold cyan]Pipelines:[/bold cyan] {', '.join(pipelines)}\n"
+        f"[bold cyan]Mode:[/bold cyan]      {'[green]With knowledge graph[/green]' if build_graph else '[yellow]Graph-less (exploration tools only)[/yellow]'}\n"
         f"[bold cyan]Sentinel:[/bold cyan]  {sentinel}\n"
         f"[bold cyan]Dry run:[/bold cyan]   {not create_prs}\n"
         f"[bold cyan]Timeout:[/bold cyan]   {timeout}s per case",
@@ -69,6 +73,7 @@ def eval_run(
         timeout_per_case=timeout,
         create_prs=create_prs,
         results_dir=Path(output),
+        build_graph=build_graph,
     )
 
     def _progress(tid: str, current: int, total: int) -> None:

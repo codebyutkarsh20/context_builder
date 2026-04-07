@@ -95,6 +95,7 @@ class EvalRunner:
         create_prs: bool = False,
         results_dir: Path | str = RESULTS_DIR,
         repo_cache_dir: Path | None = None,
+        build_graph: bool = False,
     ):
         self.dataset_path = Path(dataset_path)
         self.pipelines = pipelines or ["react"]
@@ -102,6 +103,7 @@ class EvalRunner:
         self.dry_run = not create_prs
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.build_graph = build_graph
         from agent.eval.repo_manager import RepoManager
         self.repo_manager = RepoManager(cache_dir=repo_cache_dir)
 
@@ -156,7 +158,7 @@ class EvalRunner:
             dataset_path=str(self.dataset_path),
             total_bugs=len(bugs),
             pipelines=list(self.pipelines),
-            graph_less=True,
+            graph_less=not self.build_graph,
             commit_sha=commit_sha,
         )
 
@@ -182,6 +184,20 @@ class EvalRunner:
                         error=str(e),
                     ))
                 continue
+
+            # Build knowledge graph (if requested)
+            if self.build_graph:
+                repo_name = bug.get("repo_name") or bug["ticket_id"].lower().replace("-", "_")
+                try:
+                    from agent.eval.graph_builder import build_eval_graph, DATA_DIR
+                    logger.info("Building graph for %s...", repo_name)
+                    build_eval_graph(repo_name, repo_path, data_dir=DATA_DIR)
+                    logger.info("Graph ready for %s", repo_name)
+                except Exception as e:
+                    logger.warning(
+                        "Graph build failed for %s (%s) — continuing without graph",
+                        repo_name, e,
+                    )
 
             # Run each pipeline
             for pipeline in self.pipelines:
