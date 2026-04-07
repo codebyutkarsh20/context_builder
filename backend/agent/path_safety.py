@@ -52,7 +52,8 @@ def safe_resolve(file_path: str, root: Path) -> Path | None:
             logger.warning("Path traversal attempt blocked: %s", file_path)
             return None
         return resolved
-    except Exception:
+    except (OSError, ValueError) as e:
+        logger.debug("Path resolution failed for %s: %s", file_path, e)
         return None
 
 
@@ -64,5 +65,6 @@ def safe_resolve_rglob(match: Path, root: Path) -> Path | None:
             logger.warning("Path traversal (rglob) blocked: %s", match)
             return None
         return resolved
-    except Exception:
+    except (OSError, ValueError) as e:
+        logger.debug("Rglob path resolution failed for %s: %s", match, e)
         return None
