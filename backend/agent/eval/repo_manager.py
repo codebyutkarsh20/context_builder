@@ -208,6 +208,25 @@ class RepoManager:
         except subprocess.SubprocessError:
             logger.warning("Failed to reset repo at %s", repo_dir)
 
+    @staticmethod
+    def _find_compat_python() -> str:
+        """Return path to Python 3.10.x if available via pyenv, else sys.executable.
+
+        Most SWE-bench instances target Python 3.8-3.10. Running them on Python 3.12+
+        causes failures (greenlet build errors, werkzeug API removals, py==1.10.0
+        incompatibility with Python 3.13). Using 3.10 avoids these issues.
+        """
+        pyenv_root = Path.home() / ".pyenv" / "versions"
+        if pyenv_root.exists():
+            for candidate in sorted(pyenv_root.iterdir(), reverse=True):
+                if candidate.name.startswith("3.10."):
+                    python = candidate / "bin" / "python"
+                    if python.exists():
+                        logger.info("Using pyenv Python %s for SWE-bench venv", candidate.name)
+                        return str(python)
+        logger.warning("Python 3.10.x not found in pyenv — falling back to %s", sys.executable)
+        return sys.executable
+
     def setup_venv(self, repo_dir: Path, bug: dict) -> Path | None:
         """Create an isolated virtualenv for a cloned repo and install test dependencies.
 
@@ -232,6 +251,8 @@ class RepoManager:
         Path or None
             Path to the venv directory, or None if setup failed non-fatally.
         """
+        # Always use absolute paths — subprocess cwd changes break relative paths
+        repo_dir = repo_dir.resolve()
         venv_dir = repo_dir.parent / f"{repo_dir.name}_venv"
         venv_python = venv_dir / "bin" / "python"
         venv_pytest = venv_dir / "bin" / "pytest"
@@ -245,10 +266,15 @@ class RepoManager:
 
         logger.info("Creating venv for %s at %s", repo_dir.name, venv_dir)
 
+        # Prefer Python 3.10 for SWE-bench repos — most SWE-bench instances target
+        # Python 3.8-3.10 and have deps that are incompatible with Python 3.12+
+        # (e.g., old greenlet, py==1.10.0, werkzeug api removals).
+        python_bin = self._find_compat_python()
+
         # Create venv
         try:
             subprocess.run(
-                [sys.executable, "-m", "venv", str(venv_dir)],
+                [python_bin, "-m", "venv", str(venv_dir)],
                 check=True, capture_output=True, text=True, timeout=120,
             )
         except subprocess.CalledProcessError as e:
@@ -263,7 +289,39 @@ class RepoManager:
             capture_output=True, timeout=60,
         )
 
-        # Run any custom setup_commands from the bug spec first
+        # Step 1: Install the package in editable mode first
+        # Try .in (unpinned) files before .txt (pinned) to avoid old-compiler failures
+        # on new Python (e.g., old greenlet pinned in tests.txt won't build on 3.13)
+        install_specs = [".[dev]", ".[testing]", ".[tests]", ".[test]", "."]
+        for spec in install_specs:
+            result = subprocess.run(
+                [pip, "install", "--quiet", "-e", spec],
+                cwd=str(repo_dir), capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode == 0:
+                logger.info("Installed %s with spec '%s'", repo_dir.name, spec)
+                break
+            logger.debug("Install spec '%s' failed: %s", spec, result.stderr[:80])
+
+        # Step 2: Werkzeug compat patch.
+        # Flask 2.0-2.2 (and similar 2021-era packages) require werkzeug 2.0.x:
+        # - werkzeug 2.1+ removed as_tuple from EnvironBuilder (breaks flask testing)
+        # - werkzeug 3.0+ removed url_quote (breaks flask import)
+        # pip with no upper bound installs the latest (3.x), so we downgrade after install.
+        pkg_name = repo_dir.name.split("_")[0]  # e.g., "flask" from "flask_d8c37f43"
+        import_check = subprocess.run(
+            [str(venv_dir / "bin" / "python"), "-c", f"import {pkg_name}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if import_check.returncode != 0 and "werkzeug" in import_check.stderr:
+            # Old package uses werkzeug API removed in 2.1+/3.0+ — pin to last compatible
+            logger.info("werkzeug incompatibility in %s — pinning to 2.0.3", pkg_name)
+            subprocess.run(
+                [pip, "install", "--quiet", "werkzeug==2.0.3"],
+                capture_output=True, timeout=60,
+            )
+
+        # Step 3: Run any custom setup_commands from the bug spec
         for cmd in bug.get("setup_commands", []):
             if not cmd.strip():
                 continue
@@ -276,33 +334,6 @@ class RepoManager:
                 )
             except Exception as e:
                 logger.warning("setup_command failed (continuing): %s", e)
-
-        # Try progressively simpler install specs until one succeeds
-        install_specs = [".[dev]", ".[testing]", ".[tests]", ".[test]", "."]
-        installed = False
-        for spec in install_specs:
-            try:
-                result = subprocess.run(
-                    [pip, "install", "--quiet", "-e", spec],
-                    cwd=str(repo_dir), capture_output=True, text=True, timeout=300,
-                )
-                if result.returncode == 0:
-                    logger.info("Installed %s with spec '%s'", repo_dir.name, spec)
-                    installed = True
-                    break
-                logger.debug("Install spec '%s' failed: %s", spec, result.stderr[:100])
-            except subprocess.TimeoutExpired:
-                logger.warning("Install timed out for spec '%s'", spec)
-                break
-
-        if not installed:
-            logger.warning("All install specs failed for %s — falling back to requirements.txt", repo_dir.name)
-            req_file = repo_dir / "requirements.txt"
-            if req_file.exists():
-                subprocess.run(
-                    [pip, "install", "--quiet", "-r", str(req_file)],
-                    capture_output=True, timeout=300,
-                )
 
         # Always ensure pytest is available
         subprocess.run(
