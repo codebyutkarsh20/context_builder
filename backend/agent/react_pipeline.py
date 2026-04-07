@@ -898,7 +898,7 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
         logger.info("EPR score: %.0f%% (%d/%d BRTs pass)", epr * 100, brt_pass_count, brt_total)
 
     try:
-        result = _structured_call("claude-sonnet-4-6", 800, VerifierResult, prompt)
+        result = _structured_call("claude-sonnet-4-6", 1200, VerifierResult, prompt)
         state["verifier_verdict"] = result.verdict
         state["verifier_confidence"] = result.confidence
         state["verifier_explanation"] = result.explanation
