@@ -21,6 +21,8 @@ from typing import Any
 
 from langchain_core.tools import tool
 
+from agent.path_safety import safe_resolve
+
 logger = logging.getLogger(__name__)
 
 # Thread-local state for sandbox context
@@ -80,57 +82,36 @@ def _resolve_sandbox_path(file_path: str) -> Path | None:
     if not sandbox:
         return None
 
-    p = Path(file_path)
+    # Try sandbox first via shared safe_resolve
+    result = safe_resolve(file_path, sandbox)
+    if result:
+        return result
 
-    # Auto-strip absolute sandbox or repo prefix if agent mistakenly used one
-    if p.is_absolute():
-        sandbox_str = str(sandbox.resolve())
-        if str(p).startswith(sandbox_str):
-            file_path = str(p)[len(sandbox_str):].lstrip("/")
-            p = Path(file_path)
-        else:
-            repo_path = getattr(_tls, "repo_path", None)
-            if repo_path:
-                repo_str = str(repo_path.resolve())
-                if str(p).startswith(repo_str):
-                    file_path = str(p)[len(repo_str):].lstrip("/")
-                    p = Path(file_path)
-                    logger.debug("Stripped repo prefix from absolute path: %s -> %s", p, file_path)
-                else:
-                    return None  # Absolute path outside both sandbox and repo
-            else:
-                return None
-
-    resolved = (sandbox / file_path).resolve()
-    # Path traversal check
-    if not str(resolved).startswith(str(sandbox.resolve())):
-        return None
-    return resolved
+    # Fallback: if an absolute repo-prefix path was given, strip it and
+    # resolve against the sandbox (the agent sometimes confuses the two).
+    repo_path = getattr(_tls, "repo_path", None)
+    if repo_path:
+        p = Path(file_path)
+        if p.is_absolute():
+            repo_str = str(repo_path.resolve())
+            resolved_p = str(p.resolve())
+            if resolved_p.startswith(repo_str):
+                relative = resolved_p[len(repo_str):].lstrip("/")
+                logger.debug("Stripped repo prefix from absolute path: %s -> %s", p, relative)
+                return safe_resolve(relative, sandbox)
+    return None
 
 
 def _resolve_repo_or_sandbox(file_path: str) -> Path | None:
     """Resolve a file path — sandbox if available, otherwise repo root."""
-    p = Path(file_path)
     sandbox = getattr(_tls, "sandbox_path", None)
     if sandbox:
-        if p.is_absolute():
-            resolved = p.resolve()
-            if str(resolved).startswith(str(sandbox.resolve())):
-                return resolved
-        else:
-            resolved = (sandbox / file_path).resolve()
-            if str(resolved).startswith(str(sandbox.resolve())):
-                return resolved
+        result = safe_resolve(file_path, sandbox)
+        if result:
+            return result
     repo_path = getattr(_tls, "repo_path", None)
     if repo_path:
-        if p.is_absolute():
-            resolved = p.resolve()
-            if str(resolved).startswith(str(repo_path.resolve())):
-                return resolved
-        else:
-            resolved = (repo_path / file_path).resolve()
-            if str(resolved).startswith(str(repo_path.resolve())):
-                return resolved
+        return safe_resolve(file_path, repo_path)
     return None
 
 

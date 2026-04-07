@@ -53,7 +53,8 @@ def _classify_community(repo_name: str, intent: dict, data_dir: Path) -> str | N
     import json as _json
     try:
         communities = _json.loads(communities_path.read_text())
-    except Exception:
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Failed to read communities.json at %s: %s", communities_path, e)
         return None
 
     if not communities:
@@ -90,8 +91,8 @@ def _classify_community(repo_name: str, intent: dict, data_dir: Path) -> str | N
         result = _structured_call(INTAKE_MODEL, 100, CommunityMatch, prompt)
         if result.community_name in community_names and result.confidence > 0.4:
             return result.community_name
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Community classification LLM call failed: %s", e)
     return None
 
 
@@ -133,8 +134,8 @@ def _prelocalize(repo_name: str, intent: dict, data_dir: Path) -> list[str]:
             file_ = r.get("metadata", {}).get("file", "")
             if file_:
                 scores[file_] += 2
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("ChromaDB pre-localization failed (non-fatal): %s", e)
 
     # 3. Graph neighbor expansion — files that call hint files/functions
     try:
@@ -142,8 +143,8 @@ def _prelocalize(repo_name: str, intent: dict, data_dir: Path) -> list[str]:
         neighbors = find_callers_from_graph(graph_data, hint_files, hint_functions)
         for f in neighbors:
             scores[f] += 1
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Graph neighbor expansion failed (non-fatal): %s", e)
 
     # Return top-5 unique file paths, excluding test files
     _test_noise = ("test_", "/tests/", "/test/", "conftest")
@@ -152,6 +153,16 @@ def _prelocalize(repo_name: str, intent: dict, data_dir: Path) -> list[str]:
         if f and not any(t in f.lower() for t in _test_noise)
     ]
     return ranked[:5]
+
+
+def _find_repo_python(repo_path: Path) -> str:
+    """Find the repo's virtualenv Python, falling back to sys.executable."""
+    import sys
+    for venv_dir in (".venv", "venv", "env"):
+        candidate = repo_path / venv_dir / "bin" / "python"
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
 
 
 def _emit_trace(event_type: str, data: dict | None = None):
@@ -166,8 +177,8 @@ def _report_progress(state: ReactAgentState) -> None:
     if cb:
         try:
             cb(state)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Progress callback error: %s", e)
 
 
 def _resolve_repo_path(work_order: dict) -> Path | None:
@@ -186,8 +197,8 @@ def _resolve_repo_path(work_order: dict) -> Path | None:
                 p = Path(stored_path)
                 if p.exists():
                     return p
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug("Failed to read graph.json for repo path: %s", e)
     repos_base = os.environ.get("REPOS_BASE_DIR", "")
     if repos_base:
         p = Path(repos_base) / repo_name
@@ -330,8 +341,8 @@ not from guessing the implementation."""
                     intent = state.get("intent", {})
                     intent["confirmed_files"] = confirmed
                     state["intent"] = intent
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Pre-localization fallback also failed: %s", e)
 
     if trace:
         trace.stage_end("intake")
@@ -480,8 +491,8 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
                 cwd=sandbox_path, capture_output=True, text=True, timeout=30,
             )
             diff_stat = result.stdout[:1000]
-        except Exception:
-            pass
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.debug("Failed to get diff stat: %s", e)
 
     pr_body = (
         f"## Root Cause\n{explanation}\n\n"
@@ -675,8 +686,8 @@ def brt_node(state: ReactAgentState) -> ReactAgentState:
                 content = full.read_text(encoding="utf-8", errors="replace")
                 # Cap to 3000 chars per file to stay within Haiku context
                 source_snippets.append(f"# {fpath}\n{content[:3000]}")
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug("Failed to read BRT source file %s: %s", fpath, e)
 
     if not source_snippets:
         if trace:
@@ -727,9 +738,9 @@ def brt_node(state: ReactAgentState) -> ReactAgentState:
         return state
 
     # Run each candidate against original repo — keep only confirmed BRTs
-    import sys
+    # Fix #12: Use the repo's virtualenv python if available, not sys.executable
+    repo_python = _find_repo_python(repo_path)
     import tempfile
-    import uuid
     for cand in candidates:
         if len(confirmed_brts) >= 3:
             break
@@ -737,45 +748,40 @@ def brt_node(state: ReactAgentState) -> ReactAgentState:
         if not code.startswith("def test_") and "def test_" not in code:
             continue
 
-        # Write to temp file
-        tmp_path = None
         try:
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix=f"brt_{uuid.uuid4().hex[:6]}_")
-            os.close(tmp_fd)
-            Path(tmp_path).write_text(code, encoding="utf-8")
+            with tempfile.NamedTemporaryFile(
+                suffix=".py", prefix="brt_", dir=str(repo_path), mode="w",
+                encoding="utf-8", delete=True,
+            ) as tmp:
+                tmp.write(code)
+                tmp.flush()
 
-            result = subprocess.run(
-                [sys.executable, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-
-            # Exit code 1 = test ran and FAILED = confirmed BRT (catches the bug!)
-            if result.returncode == 1:
-                confirmed_brts.append({
-                    "code": code,
-                    "description": cand.description[:200],
-                    "target_function": cand.target_function,
-                    "fail_output": (result.stdout + result.stderr)[:500],
-                })
-                logger.info("BRT confirmed: '%s' (fails on current code)", cand.description[:80])
-            else:
-                logger.debug(
-                    "BRT candidate not confirmed (exit %d): %s",
-                    result.returncode, cand.description[:60],
+                result = subprocess.run(
+                    [repo_python, "-m", "pytest", tmp.name, "--tb=short", "-x", "-q", "--no-header"],
+                    cwd=str(repo_path),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
                 )
+
+                # Exit code 1 = test ran and FAILED = confirmed BRT (catches the bug!)
+                if result.returncode == 1:
+                    confirmed_brts.append({
+                        "code": code,
+                        "description": cand.description[:200],
+                        "target_function": cand.target_function,
+                        "fail_output": (result.stdout + result.stderr)[:500],
+                    })
+                    logger.info("BRT confirmed: '%s' (fails on current code)", cand.description[:80])
+                else:
+                    logger.debug(
+                        "BRT candidate not confirmed (exit %d): %s",
+                        result.returncode, cand.description[:60],
+                    )
         except subprocess.TimeoutExpired:
             logger.debug("BRT candidate timed out: %s", cand.description[:60])
         except Exception as e:
             logger.debug("BRT candidate error: %s", e)
-        finally:
-            if tmp_path:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
 
     if confirmed_brts:
         state["brts"] = confirmed_brts
@@ -827,8 +833,8 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
             cwd=sandbox_path, capture_output=True, text=True, timeout=30,
         )
         diff_text = result.stdout[:8000]
-    except Exception:
-        pass
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.debug("Failed to get diff for verifier: %s", e)
 
     if not diff_text:
         # Nothing to verify — no committed changes
@@ -863,33 +869,28 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
     brt_pass_count = 0
     brt_total = len(brts)
     if brts and sandbox_path and Path(sandbox_path).exists():
-        import sys
         import tempfile
-        import uuid
+        sandbox_python = _find_repo_python(Path(sandbox_path))
         for brt in brts:
             try:
-                tmp_fd, tmp_path = tempfile.mkstemp(
-                    suffix=".py", prefix=f"brt_verify_{uuid.uuid4().hex[:6]}_",
-                )
-                os.close(tmp_fd)
-                Path(tmp_path).write_text(brt["code"], encoding="utf-8")
-                result_brt = subprocess.run(
-                    [sys.executable, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
-                    cwd=sandbox_path,
-                    capture_output=True, text=True, timeout=30,
-                )
-                if result_brt.returncode == 0:
-                    brt_pass_count += 1
-                    logger.info("BRT passed in sandbox: %s", brt["description"][:60])
-                else:
-                    logger.warning("BRT still failing after fix: %s", brt["description"][:60])
+                with tempfile.NamedTemporaryFile(
+                    suffix=".py", prefix="brt_verify_", dir=sandbox_path,
+                    mode="w", encoding="utf-8", delete=True,
+                ) as tmp:
+                    tmp.write(brt["code"])
+                    tmp.flush()
+                    result_brt = subprocess.run(
+                        [sandbox_python, "-m", "pytest", tmp.name, "--tb=short", "-x", "-q", "--no-header"],
+                        cwd=sandbox_path,
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    if result_brt.returncode == 0:
+                        brt_pass_count += 1
+                        logger.info("BRT passed in sandbox: %s", brt["description"][:60])
+                    else:
+                        logger.warning("BRT still failing after fix: %s", brt["description"][:60])
             except Exception as e:
                 logger.debug("BRT sandbox run error: %s", e)
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
 
         state["brt_pass_count"] = brt_pass_count
         state["brt_total"] = brt_total
@@ -899,6 +900,13 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
 
     try:
         result = _structured_call("claude-sonnet-4-6", 1200, VerifierResult, prompt)
+
+        # Validate the Pydantic result has sane values
+        if result.verdict not in ("APPROVE", "REJECT"):
+            logger.warning("Verifier returned invalid verdict '%s' — treating as REJECT", result.verdict)
+            result.verdict = "REJECT"
+        result.confidence = max(0.0, min(1.0, result.confidence))
+
         state["verifier_verdict"] = result.verdict
         state["verifier_confidence"] = result.confidence
         state["verifier_explanation"] = result.explanation
@@ -919,7 +927,9 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
             logger.warning("Verifier rejected with high confidence — flagged in PR body")
 
     except Exception as e:
-        logger.debug("Verifier node failed (non-fatal): %s", e)
+        logger.warning("Verifier node failed (non-fatal): %s", e)
+        state["verifier_verdict"] = "SKIP"
+        state["verifier_explanation"] = f"Verifier error: {e}"
 
     return state
 
@@ -952,7 +962,8 @@ def _extract_repair_from_sandbox(sandbox_path: str) -> dict:
                         files.append(f)
         patches = [{"file_path": f} for f in files]
         return {"patches": patches, "explanation": "ReAct agent fix"}
-    except Exception:
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.debug("Failed to extract repair from sandbox: %s", e)
         return {"patches": []}
 
 
@@ -1047,8 +1058,8 @@ def run_ticket_react(
         try:
             from api.metrics import record_run
             record_run(result_dict)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Metrics recording failed: %s", e)
         return result_dict
     finally:
         _thread_local.progress_callback = None
@@ -1065,6 +1076,9 @@ def _run_best_of_n(
     n: int,
 ) -> dict:
     """Run N parallel agent instances and pick the best patch.
+
+    Uses ProcessPoolExecutor to avoid thread-local state pollution across
+    concurrent instances. Each process gets its own thread-local namespace.
 
     Selection order (SWE-agent pattern):
       1. tests_passed (test_result starts with "passed")
@@ -1083,7 +1097,7 @@ def _run_best_of_n(
         return run_ticket_react(wo, progress_cb=None, trace=None, dry_run=dry_run, best_of_n=1)
 
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n) as executor:
         futures = [executor.submit(_run_one, i) for i in range(n)]
         for fut in concurrent.futures.as_completed(futures):
             try:
@@ -1116,7 +1130,14 @@ def _run_best_of_n(
         "tests" if (best.get("test_result") or "").startswith("passed") else "review",
     )
 
-    # Annotate the winner with ensemble metadata
+    # Clean up losing sandboxes (Fix #14: N-1 sandboxes were leaked)
+    repo_path = _resolve_repo_path(work_order)
+    best_sandbox = best.get("sandbox_path", "")
+    for r in results:
+        sb = r.get("sandbox_path", "")
+        if sb and sb != best_sandbox:
+            _cleanup_sandbox(sb, repo_path, r.get("branch_name", ""))
+
     best["best_of_n_stats"] = {
         "n": n, "submitted": submitted_count, "test_pass": test_pass_count,
     }
@@ -1124,6 +1145,6 @@ def _run_best_of_n(
     try:
         from api.metrics import record_run
         record_run(best)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Metrics recording failed: %s", e)
     return best

@@ -372,6 +372,31 @@ class RepoManager:
         config_path.write_text(json.dumps(config, indent=2))
         logger.debug("Wrote .agent_config.json: test_command=%s", test_command)
 
+    def build_graph(self, repo_path: Path, bug: dict) -> None:
+        """Build knowledge graph for a repo during the setup phase.
+
+        Cache-aware: delegates to build_eval_graph which skips if SHA matches.
+        Failures are logged and swallowed so eval continues without graph.
+
+        Parameters
+        ----------
+        repo_path : Path
+            Path to the cloned repo at the correct SHA.
+        bug : dict
+            EvalBug — used to derive repo_name.
+        """
+        repo_name = bug.get("repo_name") or bug["ticket_id"].lower().replace("-", "_")
+        try:
+            from agent.eval.graph_builder import build_eval_graph, DATA_DIR
+            logger.info("Building graph for %s...", repo_name)
+            build_eval_graph(repo_name, repo_path, data_dir=DATA_DIR)
+            logger.info("Graph ready for %s", repo_name)
+        except Exception as e:
+            logger.warning(
+                "Graph build failed for %s (%s) — continuing without graph",
+                repo_name, e,
+            )
+
     def get_ground_truth_diff(self, bug: dict) -> str:
         """Get the ground-truth patch by diffing repo_sha..fix_sha.
 

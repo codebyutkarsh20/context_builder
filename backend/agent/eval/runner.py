@@ -195,19 +195,9 @@ class EvalRunner:
                         bug["ticket_id"], e,
                     )
 
-            # Build knowledge graph (if requested)
+            # Build knowledge graph during repo setup (before per-bug timer)
             if self.build_graph:
-                repo_name = bug.get("repo_name") or bug["ticket_id"].lower().replace("-", "_")
-                try:
-                    from agent.eval.graph_builder import build_eval_graph, DATA_DIR
-                    logger.info("Building graph for %s...", repo_name)
-                    build_eval_graph(repo_name, repo_path, data_dir=DATA_DIR)
-                    logger.info("Graph ready for %s", repo_name)
-                except Exception as e:
-                    logger.warning(
-                        "Graph build failed for %s (%s) — continuing without graph",
-                        repo_name, e,
-                    )
+                self.repo_manager.build_graph(repo_path, bug)
 
             # Run each pipeline
             for pipeline in self.pipelines:

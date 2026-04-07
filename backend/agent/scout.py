@@ -16,12 +16,28 @@ from __future__ import annotations
 
 import json
 import logging
+import signal
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Aggregate timeout for scout_localize() pipeline
+# ---------------------------------------------------------------------------
+_SCOUT_TIMEOUT_SECONDS = 30
+
+
+class _ScoutTimeout(Exception):
+    """Raised when the Scout FL pipeline exceeds the aggregate timeout."""
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise _ScoutTimeout(f"Scout pipeline exceeded {_SCOUT_TIMEOUT_SECONDS}s timeout")
+
 
 # ---------------------------------------------------------------------------
 # Model aliases (sourced from llm.py constants)
@@ -520,143 +536,162 @@ def scout_localize(
         work_order.get("ticket_id", "?"),
     )
 
-    # -----------------------------------------------------------------------
-    # Load graph data once (shared by all agents)
-    # -----------------------------------------------------------------------
+    # -------------------------------------------------------------------
+    # Track partial results so we can return them if the pipeline times out
+    # -------------------------------------------------------------------
     graph_data: dict = {}
     enriched: dict = {}
-    try:
-        graph_data, enriched = load_graph_data(repo_name)
-    except Exception as exc:
-        logger.warning("scout: failed to load graph data: %s", exc)
-
-    business_rules = _load_business_rules(data_dir, repo_name)
-
-    # Accumulate cost (token-based estimate; we don't have exact counts from structured_call)
+    business_rules: list[dict] = []
     total_cost = 0.0
-
-    # -----------------------------------------------------------------------
-    # Agent 1 — Context Extractor (Haiku)
-    # -----------------------------------------------------------------------
     extracted: ExtractedContext = ExtractedContext(
         function_names=intent.get("likely_affected_functions", [])[:6],
         module_hints=intent.get("likely_affected_modules", [])[:6],
         bug_summary=intent.get("actual_behavior", work_order.get("title", "")),
     )
-    try:
-        extracted = _run_extractor(work_order, intent)
-        # Approximate cost: ~400 input tokens, ~150 output tokens for Haiku
-        total_cost += estimate_cost(_EXTRACTOR_MODEL, 400, 150)
-        logger.info(
-            "scout[1/3]: extracted %d functions, %d modules",
-            len(extracted.function_names),
-            len(extracted.module_hints),
-        )
-    except Exception as exc:
-        logger.error("scout[1/3]: Context Extractor failed (using fallback): %s", exc)
-        # extracted already holds the intent-seeded fallback above
-
-    # -----------------------------------------------------------------------
-    # Agent 2 — Graph-RAG Debugger (Sonnet)
-    # -----------------------------------------------------------------------
-    graph_summary = _summarise_graph(graph_data, enriched, extracted)
-    rules_summary = _summarise_business_rules(business_rules, extracted)
-
     debugger_output: GraphDebuggerOutput = GraphDebuggerOutput()
-    try:
-        debugger_output = _run_debugger(extracted, graph_summary, rules_summary, work_order)
-        # Approximate cost: ~900 input tokens, ~300 output tokens for Sonnet
-        total_cost += estimate_cost(_DEBUGGER_MODEL, 900, 300)
-        logger.info(
-            "scout[2/3]: Graph-RAG Debugger found %d suspects",
-            len(debugger_output.suspects),
-        )
-    except Exception as exc:
-        logger.error("scout[2/3]: Graph-RAG Debugger failed (using fallback): %s", exc)
-        # Build a minimal fallback from extracted entities + graph nodes
-        fallback_suspects: list[SuspectLocation] = []
-        file_set: set[str] = set()
-        for fn in extracted.function_names[:3]:
-            for node in graph_data.get("nodes", []):
-                node_label = (node.get("label") or node.get("id", "").split("::")[-1]).lower()
-                if fn.lower() in node_label and node.get("file"):
-                    f = node["file"]
-                    if f not in file_set:
-                        file_set.add(f)
-                        fallback_suspects.append(
-                            SuspectLocation(
-                                file=f,
-                                function=fn,
-                                confidence=0.4,
-                                reason=f"Graph node match for function '{fn}'",
-                            )
-                        )
-        for mod in extracted.module_hints[:2]:
-            for node in graph_data.get("nodes", []):
-                if node.get("type") == "file" and mod.lower() in (node.get("file") or "").lower():
-                    f = node["file"]
-                    if f not in file_set:
-                        file_set.add(f)
-                        fallback_suspects.append(
-                            SuspectLocation(
-                                file=f,
-                                function="",
-                                confidence=0.3,
-                                reason=f"Module hint match for '{mod}'",
-                            )
-                        )
-        debugger_output = GraphDebuggerOutput(suspects=fallback_suspects[:5])
-
-    # -----------------------------------------------------------------------
-    # Agent 3 — Verbal RL Re-ranker (Opus)
-    # -----------------------------------------------------------------------
-    failure_records = _extract_failure_records(graph_data, extracted)
-
     reranker_output: RerankerOutput = RerankerOutput()
-    if debugger_output.suspects:
+    failure_records: list[str] = []
+
+    # -------------------------------------------------------------------
+    # Aggregate timeout: abort the pipeline after _SCOUT_TIMEOUT_SECONDS
+    # -------------------------------------------------------------------
+    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.alarm(_SCOUT_TIMEOUT_SECONDS)
+    try:
+        # ---------------------------------------------------------------
+        # Load graph data once (shared by all agents)
+        # ---------------------------------------------------------------
         try:
-            reranker_output = _run_reranker(
-                debugger_output,
-                extracted,
-                business_rules,
-                failure_records,
-                graph_data,
-                work_order,
-            )
-            # Approximate cost: ~1000 input tokens, ~400 output tokens for Opus
-            total_cost += estimate_cost(_RERANKER_MODEL, 1000, 400)
+            graph_data, enriched = load_graph_data(repo_name)
+        except Exception as exc:
+            logger.warning("scout: failed to load graph data: %s", exc)
+
+        business_rules = _load_business_rules(data_dir, repo_name)
+
+        # ---------------------------------------------------------------
+        # Agent 1 — Context Extractor (Haiku)
+        # ---------------------------------------------------------------
+        try:
+            extracted = _run_extractor(work_order, intent)
+            # Approximate cost: ~400 input tokens, ~150 output tokens for Haiku
+            total_cost += estimate_cost(_EXTRACTOR_MODEL, 400, 150)
             logger.info(
-                "scout[3/3]: Re-ranker produced %d ranked locations",
-                len(reranker_output.ranked_locations),
+                "scout[1/3]: extracted %d functions, %d modules",
+                len(extracted.function_names),
+                len(extracted.module_hints),
             )
         except Exception as exc:
-            logger.error("scout[3/3]: Re-ranker failed (using debugger output as-is): %s", exc)
-            # Demote to ranked from debugger output unchanged
-            reranker_output = RerankerOutput(
-                ranked_locations=[
-                    RankedLocation(
-                        file=s.file,
-                        function=s.function,
-                        confidence=s.confidence,
-                        reason=s.reason,
-                    )
-                    for s in sorted(
-                        debugger_output.suspects,
-                        key=lambda s: s.confidence,
-                        reverse=True,
-                    )
-                ],
-                relevant_failure_records=failure_records,
-                additional_blast_radius=[],
+            logger.error("scout[1/3]: Context Extractor failed (using fallback): %s", exc)
+            # extracted already holds the intent-seeded fallback above
+
+        # ---------------------------------------------------------------
+        # Agent 2 — Graph-RAG Debugger (Sonnet)
+        # ---------------------------------------------------------------
+        graph_summary = _summarise_graph(graph_data, enriched, extracted)
+        rules_summary = _summarise_business_rules(business_rules, extracted)
+
+        try:
+            debugger_output = _run_debugger(extracted, graph_summary, rules_summary, work_order)
+            # Approximate cost: ~900 input tokens, ~300 output tokens for Sonnet
+            total_cost += estimate_cost(_DEBUGGER_MODEL, 900, 300)
+            logger.info(
+                "scout[2/3]: Graph-RAG Debugger found %d suspects",
+                len(debugger_output.suspects),
             )
-    else:
-        logger.warning("scout: no suspects from Agent 2 — skipping re-ranker")
-        reranker_output = RerankerOutput(
-            relevant_failure_records=failure_records,
+        except Exception as exc:
+            logger.error("scout[2/3]: Graph-RAG Debugger failed (using fallback): %s", exc)
+            # Build a minimal fallback from extracted entities + graph nodes
+            fallback_suspects: list[SuspectLocation] = []
+            file_set: set[str] = set()
+            for fn in extracted.function_names[:3]:
+                for node in graph_data.get("nodes", []):
+                    node_label = (node.get("label") or node.get("id", "").split("::")[-1]).lower()
+                    if fn.lower() in node_label and node.get("file"):
+                        f = node["file"]
+                        if f not in file_set:
+                            file_set.add(f)
+                            fallback_suspects.append(
+                                SuspectLocation(
+                                    file=f,
+                                    function=fn,
+                                    confidence=0.4,
+                                    reason=f"Graph node match for function '{fn}'",
+                                )
+                            )
+            for mod in extracted.module_hints[:2]:
+                for node in graph_data.get("nodes", []):
+                    if node.get("type") == "file" and mod.lower() in (node.get("file") or "").lower():
+                        f = node["file"]
+                        if f not in file_set:
+                            file_set.add(f)
+                            fallback_suspects.append(
+                                SuspectLocation(
+                                    file=f,
+                                    function="",
+                                    confidence=0.3,
+                                    reason=f"Module hint match for '{mod}'",
+                                )
+                            )
+            debugger_output = GraphDebuggerOutput(suspects=fallback_suspects[:5])
+
+        # ---------------------------------------------------------------
+        # Agent 3 — Verbal RL Re-ranker (Opus)
+        # ---------------------------------------------------------------
+        failure_records = _extract_failure_records(graph_data, extracted)
+
+        if debugger_output.suspects:
+            try:
+                reranker_output = _run_reranker(
+                    debugger_output,
+                    extracted,
+                    business_rules,
+                    failure_records,
+                    graph_data,
+                    work_order,
+                )
+                # Approximate cost: ~1000 input tokens, ~400 output tokens for Opus
+                total_cost += estimate_cost(_RERANKER_MODEL, 1000, 400)
+                logger.info(
+                    "scout[3/3]: Re-ranker produced %d ranked locations",
+                    len(reranker_output.ranked_locations),
+                )
+            except Exception as exc:
+                logger.error("scout[3/3]: Re-ranker failed (using debugger output as-is): %s", exc)
+                # Demote to ranked from debugger output unchanged
+                reranker_output = RerankerOutput(
+                    ranked_locations=[
+                        RankedLocation(
+                            file=s.file,
+                            function=s.function,
+                            confidence=s.confidence,
+                            reason=s.reason,
+                        )
+                        for s in sorted(
+                            debugger_output.suspects,
+                            key=lambda s: s.confidence,
+                            reverse=True,
+                        )
+                    ],
+                    relevant_failure_records=failure_records,
+                    additional_blast_radius=[],
+                )
+        else:
+            logger.warning("scout: no suspects from Agent 2 — skipping re-ranker")
+            reranker_output = RerankerOutput(
+                relevant_failure_records=failure_records,
+            )
+
+    except _ScoutTimeout:
+        logger.warning(
+            "scout: pipeline exceeded %ds aggregate timeout — returning partial results",
+            _SCOUT_TIMEOUT_SECONDS,
         )
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
     # -----------------------------------------------------------------------
-    # Assemble final report
+    # Assemble final report (uses whatever partial results are available)
     # -----------------------------------------------------------------------
     top_locations: list[dict[str, Any]] = [
         {
