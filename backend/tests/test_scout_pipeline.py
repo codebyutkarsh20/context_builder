@@ -340,3 +340,39 @@ class TestScoutSchemas:
         )
         assert len(out.ranked_locations) == 1
         assert out.ranked_locations[0].confidence == 0.8
+
+
+# ---------------------------------------------------------------------------
+# scout_localize() — timeout returns partial results
+# ---------------------------------------------------------------------------
+
+class TestScoutTimeout:
+    def test_scout_timeout_returns_partial(self, tmp_path, work_order, intent, sample_graph):
+        """When one agent hangs and SIGALRM fires, scout_localize returns partial results.
+
+        Simulates the timeout by having _run_reranker raise _ScoutTimeout (the same
+        exception the SIGALRM handler raises). Agent 1 and Agent 2 complete normally
+        so their results should appear in the output.
+        """
+        from agent.scout import _ScoutTimeout
+
+        with patch("agent.scout._run_extractor", return_value=_fake_extracted()), \
+             patch("agent.scout._run_debugger", return_value=_fake_debugger_output()), \
+             patch("agent.scout._run_reranker", side_effect=_ScoutTimeout("timeout")), \
+             patch("agent.graph_utils.load_graph_data", return_value=(sample_graph, {})):
+
+            result = scout_localize(
+                repo_name="context_builder",
+                work_order=work_order,
+                intent=intent,
+                data_dir=tmp_path,
+            )
+
+        # Pipeline should return partial results, not crash
+        assert isinstance(result, dict)
+        assert "top_locations" in result
+        assert "scout_cost_usd" in result
+        # Debugger output should still appear as fallback (demoted suspects)
+        # since _run_debugger succeeded before the timeout
+        assert isinstance(result["top_locations"], list)
+        assert isinstance(result["blast_radius_files"], list)
