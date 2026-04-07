@@ -315,6 +315,29 @@ def _extract_failure_records(
 
 
 # ---------------------------------------------------------------------------
+# Shared helper — bug text assembly
+# ---------------------------------------------------------------------------
+
+
+def _build_bug_text(work_order: dict, intent: dict, max_chars: int = 400) -> str:
+    """Build a one-line bug summary string from work_order + intent fields.
+
+    Used by both _run_extractor (scout) and _classify_community (react_pipeline)
+    to avoid duplicating the field-assembly logic.
+    """
+    parts = [
+        work_order.get("title", ""),
+        work_order.get("description", "")[:200],
+        work_order.get("affected_component", "") or "",
+        intent.get("actual_behavior", ""),
+        intent.get("expected_behavior", ""),
+        " ".join(intent.get("likely_affected_functions", [])),
+        " ".join(intent.get("likely_affected_modules", [])),
+    ]
+    return " ".join(filter(None, parts))[:max_chars]
+
+
+# ---------------------------------------------------------------------------
 # Agent 1 — Context Extractor (Haiku)
 # ---------------------------------------------------------------------------
 
@@ -328,6 +351,7 @@ def _run_extractor(work_order: dict, intent: dict) -> ExtractedContext:
     """
     from agent.llm import structured_call
 
+    bug_text = _build_bug_text(work_order, intent, max_chars=600)
     title = work_order.get("title", "")
     description = work_order.get("description", "")[:600]
     component = work_order.get("affected_component") or ""
@@ -338,6 +362,7 @@ def _run_extractor(work_order: dict, intent: dict) -> ExtractedContext:
 
     prompt = f"""You are a code analyst. Extract structured fault-localisation entities from this bug report.
 
+BUG SUMMARY: {bug_text}
 BUG TITLE: {title}
 COMPONENT: {component}
 DESCRIPTION: {description}

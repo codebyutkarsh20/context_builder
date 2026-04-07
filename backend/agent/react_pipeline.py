@@ -73,12 +73,8 @@ def _classify_community(repo_name: str, intent: dict, data_dir: Path) -> str | N
         community_name: str
         confidence: float  # 0.0-1.0
 
-    bug_text = " ".join(filter(None, [
-        intent.get("actual_behavior", ""),
-        intent.get("expected_behavior", ""),
-        " ".join(intent.get("likely_affected_functions", [])),
-        " ".join(intent.get("likely_affected_modules", [])),
-    ]))[:400]
+    from agent.scout import _build_bug_text
+    bug_text = _build_bug_text(work_order={}, intent=intent, max_chars=400)
 
     prompt = (
         f"Bug description: {bug_text}\n\n"
@@ -208,23 +204,13 @@ def _resolve_repo_path(work_order: dict) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
-# Node 1: INTAKE (reused from pipeline.py)
+# intake_node helpers
 # ---------------------------------------------------------------------------
 
-def intake_node(state: ReactAgentState) -> ReactAgentState:
-    """Translate bug ticket into technical spec — same logic as pipeline.py intake."""
-    _thread_local.current_stage = "intake"
-    trace = _get_trace()
-    if trace:
-        trace.stage_start("intake")
-    logger.info("=== REACT INTAKE: Translating bug ticket ===")
-    state["status"] = PipelineStatus.INTAKE
-    _report_progress(state)
 
-    work_order = state.get("work_order", {})
-
+def _translate_intent(work_order: dict) -> dict:
+    """LLM call to translate a bug ticket into a structured intent; fallback on error."""
     from agent.llm import structured_call as _structured_call, INTAKE_MODEL
-    from agent.intake_helpers import extract_stack_trace_hints, extract_repro_steps, classify_bug_category
     from agent.types import IntentAnalysis
 
     prompt = f"""Translate this bug ticket into a technical specification.
@@ -241,10 +227,10 @@ not from guessing the implementation."""
 
     try:
         result = _structured_call(INTAKE_MODEL, 1000, IntentAnalysis, prompt)
-        state["intent"] = result.model_dump()
+        return result.model_dump()
     except Exception as e:
         logger.error("Intent translation failed: %s", e)
-        state["intent"] = {
+        return {
             "expected_behavior": work_order.get("title", ""),
             "actual_behavior": work_order.get("description", ""),
             "likely_affected_modules": [],
@@ -253,7 +239,12 @@ not from guessing the implementation."""
             "severity": work_order.get("priority", "medium"),
         }
 
-    # Stack trace hints
+
+def _enrich_with_stack_hints(state: ReactAgentState) -> ReactAgentState:
+    """Extract stack trace hints from bug description and inject notes into intent."""
+    from agent.intake_helpers import extract_stack_trace_hints
+
+    work_order = state.get("work_order", {})
     description = work_order.get("description", "")
     stack_hints = extract_stack_trace_hints(description)
     if stack_hints:
@@ -267,31 +258,11 @@ not from guessing the implementation."""
         existing_notes = intent.get("notes", "")
         intent["notes"] = (existing_notes + "\n" + stack_note).strip() if existing_notes else stack_note
         state["intent"] = intent
+    return state
 
-    # Repro steps
-    repro_steps = extract_repro_steps(description)
-    if repro_steps:
-        work_order["repro_steps"] = repro_steps
-        state["work_order"] = work_order
 
-    # Bug category
-    bug_category = classify_bug_category(work_order.get("title", ""), description)
-    work_order["bug_category"] = bug_category
-    state["work_order"] = work_order
-
-    if bug_category == "C":
-        intent = state.get("intent", {})
-        cat_c_note = (
-            "NOTE: Bug shows complexity signals (category C). Attempt the fix — "
-            "escalate only if you make no progress after 3+ explore/edit cycles, "
-            "or the root cause spans 5+ files."
-        )
-        existing_notes = intent.get("notes", "")
-        intent["notes"] = (existing_notes + "\n" + cat_c_note).strip() if existing_notes else cat_c_note
-        state["intent"] = intent
-
-    repo_name = work_order.get("repo_name", "")
-
+def _run_localization(state: ReactAgentState, repo_name: str) -> ReactAgentState:
+    """Community classification + Scout FL + pre-localization fallback."""
     # Step 1: Community classifier — map bug ticket to a code cluster in 1 Haiku call.
     # Narrows the search space before any file-level localization.
     community_name: str | None = None
@@ -315,7 +286,7 @@ not from guessing the implementation."""
         if repo_name and not _scout_disabled:
             from agent.scout import scout_localize
             scout_report = scout_localize(
-                repo_name, work_order, state.get("intent", {}), DATA_DIR,
+                repo_name, state.get("work_order", {}), state.get("intent", {}), DATA_DIR,
                 community_name=community_name,
             )
             top_locs = scout_report.get("top_locations", [])
@@ -343,6 +314,59 @@ not from guessing the implementation."""
                     state["intent"] = intent
         except Exception as e:
             logger.debug("Pre-localization fallback also failed: %s", e)
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Node 1: INTAKE (reused from pipeline.py)
+# ---------------------------------------------------------------------------
+
+def intake_node(state: ReactAgentState) -> ReactAgentState:
+    """Translate bug ticket into technical spec — same logic as pipeline.py intake."""
+    _thread_local.current_stage = "intake"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("intake")
+    logger.info("=== REACT INTAKE: Translating bug ticket ===")
+    state["status"] = PipelineStatus.INTAKE
+    _report_progress(state)
+
+    work_order = state.get("work_order", {})
+
+    # 1. Translate ticket into structured intent
+    state["intent"] = _translate_intent(work_order)
+
+    # 2. Enrich with stack trace hints
+    state = _enrich_with_stack_hints(state)
+
+    # 3. Repro steps + bug category
+    from agent.intake_helpers import extract_repro_steps, classify_bug_category
+    description = work_order.get("description", "")
+
+    repro_steps = extract_repro_steps(description)
+    if repro_steps:
+        work_order["repro_steps"] = repro_steps
+        state["work_order"] = work_order
+
+    bug_category = classify_bug_category(work_order.get("title", ""), description)
+    work_order["bug_category"] = bug_category
+    state["work_order"] = work_order
+
+    if bug_category == "C":
+        intent = state.get("intent", {})
+        cat_c_note = (
+            "NOTE: Bug shows complexity signals (category C). Attempt the fix — "
+            "escalate only if you make no progress after 3+ explore/edit cycles, "
+            "or the root cause spans 5+ files."
+        )
+        existing_notes = intent.get("notes", "")
+        intent["notes"] = (existing_notes + "\n" + cat_c_note).strip() if existing_notes else cat_c_note
+        state["intent"] = intent
+
+    # 4. Localization: community detection + Scout FL + fallback
+    repo_name = work_order.get("repo_name", "")
+    state = _run_localization(state, repo_name)
 
     if trace:
         trace.stage_end("intake")
@@ -437,6 +461,122 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
 
 
 # ---------------------------------------------------------------------------
+# finalize_node helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_pr_body(state: ReactAgentState, ticket_id: str, sandbox_path: str) -> tuple[str, str]:
+    """Construct the PR body markdown and title from agent state. Returns (pr_title, pr_body)."""
+    explanation = state.get("explanation", "Automated fix")
+    review = state.get("review", {})
+    test_result = state.get("test_result", "not run")
+
+    # Get diff for PR body
+    diff_stat = ""
+    if sandbox_path and Path(sandbox_path).exists():
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--stat", "HEAD~1"],
+                cwd=sandbox_path, capture_output=True, text=True, timeout=30,
+            )
+            diff_stat = result.stdout[:1000]
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.debug("Failed to get diff stat: %s", e)
+
+    pr_body = (
+        f"## Root Cause\n{explanation}\n\n"
+        f"## Review\n"
+        f"- Verdict: {review.get('verdict', 'N/A')}\n"
+        f"- Confidence: {review.get('confidence', 0):.0%}\n\n"
+        f"## Tests\n```\n{test_result[:2000]}\n```\n\n"
+        f"## Changes\n```\n{diff_stat}\n```\n\n"
+        f"---\n*Generated by AI Deploy Agent (ReAct) — {ticket_id}*"
+    )
+    pr_title = f"fix({ticket_id}): {explanation[:60]}"
+    return pr_title, pr_body
+
+
+def _push_and_create_pr(
+    sandbox_path: str, branch_name: str, base_branch: str, pr_title: str, pr_body: str,
+) -> dict:
+    """Git push + gh pr create. Returns dict with 'pr_url' and optional 'error'."""
+    result_info: dict[str, str] = {}
+    try:
+        gh_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+        if gh_token:
+            subprocess.run(
+                ["git", "config", "credential.helper", ""],
+                cwd=sandbox_path, capture_output=True, timeout=10,
+            )
+            # Set remote URL with token
+            remote_url = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=sandbox_path, capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+            if remote_url and "github.com" in remote_url:
+                auth_url = remote_url.replace(
+                    "https://", f"https://x-access-token:{gh_token}@"
+                )
+                subprocess.run(
+                    ["git", "remote", "set-url", "origin", auth_url],
+                    cwd=sandbox_path, capture_output=True, timeout=10,
+                )
+
+        push_result = subprocess.run(
+            ["git", "push", "-u", "origin", branch_name],
+            cwd=sandbox_path, capture_output=True, text=True, timeout=60,
+        )
+        if push_result.returncode != 0:
+            logger.error("Push failed: %s", push_result.stderr)
+            result_info["error"] = f"Push failed: {push_result.stderr[:200]}"
+            result_info["pr_url"] = f"branch://{branch_name}"
+        else:
+            # Create PR via gh CLI
+            pr_result = subprocess.run(
+                ["gh", "pr", "create",
+                 "--title", pr_title,
+                 "--body", pr_body,
+                 "--base", base_branch,
+                 "--head", branch_name],
+                cwd=sandbox_path, capture_output=True, text=True, timeout=30,
+            )
+            if pr_result.returncode == 0:
+                result_info["pr_url"] = pr_result.stdout.strip()
+                logger.info("PR created: %s", result_info["pr_url"])
+            else:
+                logger.error("PR creation failed: %s", pr_result.stderr)
+                result_info["pr_url"] = f"branch://{branch_name}"
+                result_info["error"] = f"PR creation failed: {pr_result.stderr[:200]}"
+    except Exception as e:
+        result_info["error"] = f"PR creation error: {e}"
+        result_info["pr_url"] = f"branch://{branch_name}"
+    return result_info
+
+
+def _populate_repair_and_localization(
+    state: ReactAgentState, sandbox_path: str, repo_path: Path | None,
+) -> ReactAgentState:
+    """Extract repair info from sandbox diff and backfill localization if missing."""
+    if not sandbox_path or not Path(sandbox_path).exists():
+        return state
+    repair = _extract_repair_from_sandbox(sandbox_path)
+    state["repair"] = repair
+    # Derive localization from what the agent actually modified
+    fault_files = [
+        p["file_path"] for p in repair.get("patches", [])
+        if not p["file_path"].startswith("test") and "/test" not in p["file_path"]
+    ]
+    if fault_files and not state.get("localization", {}).get("fault_files"):
+        state["localization"] = {
+            "fault_files": fault_files,
+            "fault_functions": [],
+            "root_cause_hypothesis": state.get("explanation", ""),
+            "confidence": 0.8,
+        }
+    return state
+
+
+# ---------------------------------------------------------------------------
 # Node 3: FINALIZE (PR creation or escalation)
 # ---------------------------------------------------------------------------
 
@@ -477,33 +617,8 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
         _cleanup_sandbox(sandbox_path, repo_path, branch_name)
         return state
 
-    # Build PR body
-    explanation = state.get("explanation", "Automated fix")
-    review = state.get("review", {})
-    test_result = state.get("test_result", "not run")
-
-    # Get diff for PR body
-    diff_stat = ""
-    if sandbox_path and Path(sandbox_path).exists():
-        try:
-            result = subprocess.run(
-                ["git", "diff", "--stat", "HEAD~1"],
-                cwd=sandbox_path, capture_output=True, text=True, timeout=30,
-            )
-            diff_stat = result.stdout[:1000]
-        except (subprocess.SubprocessError, OSError) as e:
-            logger.debug("Failed to get diff stat: %s", e)
-
-    pr_body = (
-        f"## Root Cause\n{explanation}\n\n"
-        f"## Review\n"
-        f"- Verdict: {review.get('verdict', 'N/A')}\n"
-        f"- Confidence: {review.get('confidence', 0):.0%}\n\n"
-        f"## Tests\n```\n{test_result[:2000]}\n```\n\n"
-        f"## Changes\n```\n{diff_stat}\n```\n\n"
-        f"---\n*Generated by AI Deploy Agent (ReAct) — {ticket_id}*"
-    )
-    pr_title = f"fix({ticket_id}): {explanation[:60]}"
+    # Build PR title + body
+    pr_title, pr_body = _build_pr_body(state, ticket_id, sandbox_path)
 
     if dry_run:
         logger.info("DRY RUN — skipping PR creation")
@@ -511,34 +626,21 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
         state["status"] = PipelineStatus.DONE
 
         # Populate repair + localization for eval compatibility
-        if sandbox_path and Path(sandbox_path).exists():
-            repair = _extract_repair_from_sandbox(sandbox_path)
-            state["repair"] = repair
-            # Derive localization from what the agent actually modified
-            fault_files = [
-                p["file_path"] for p in repair.get("patches", [])
-                if not p["file_path"].startswith("test") and "/test" not in p["file_path"]
-            ]
-            if fault_files and not state.get("localization", {}).get("fault_files"):
-                state["localization"] = {
-                    "fault_files": fault_files,
-                    "fault_functions": [],
-                    "root_cause_hypothesis": state.get("explanation", ""),
-                    "confidence": 0.8,
-                }
+        state = _populate_repair_and_localization(state, sandbox_path, repo_path)
 
-            # Run ground-truth tests before cleanup — only if the agent didn't already
-            # pass them (avoids double-running). This is the authoritative test signal
-            # for eval scoring (full_pass metric).
-            test_already_passed = (state.get("test_result") or "").strip().lower().startswith("passed")
-            if not test_already_passed and repair.get("patches"):
-                try:
-                    from agent.sandbox import run_tests as _run_tests
-                    gt_result = _run_tests(Path(sandbox_path), repo_path=repo_path)
-                    state["test_result"] = gt_result[:2000]
-                    logger.info("Ground-truth tests (dry-run eval): %s", gt_result[:120])
-                except Exception as e:
-                    logger.debug("Ground-truth test execution skipped: %s", e)
+        # Run ground-truth tests before cleanup — only if the agent didn't already
+        # pass them (avoids double-running). This is the authoritative test signal
+        # for eval scoring (full_pass metric).
+        repair = state.get("repair", {})
+        test_already_passed = (state.get("test_result") or "").strip().lower().startswith("passed")
+        if not test_already_passed and repair.get("patches"):
+            try:
+                from agent.sandbox import run_tests as _run_tests
+                gt_result = _run_tests(Path(sandbox_path), repo_path=repo_path)
+                state["test_result"] = gt_result[:2000]
+                logger.info("Ground-truth tests (dry-run eval): %s", gt_result[:120])
+            except Exception as e:
+                logger.debug("Ground-truth test execution skipped: %s", e)
 
         _report_progress(state)
         if trace:
@@ -548,74 +650,15 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
 
     # Push and create PR
     if sandbox_path and Path(sandbox_path).exists() and branch_name:
-        try:
-            gh_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
-            if gh_token:
-                subprocess.run(
-                    ["git", "config", "credential.helper", ""],
-                    cwd=sandbox_path, capture_output=True, timeout=10,
-                )
-                # Set remote URL with token
-                remote_url = subprocess.run(
-                    ["git", "remote", "get-url", "origin"],
-                    cwd=sandbox_path, capture_output=True, text=True, timeout=10,
-                ).stdout.strip()
-                if remote_url and "github.com" in remote_url:
-                    auth_url = remote_url.replace(
-                        "https://", f"https://x-access-token:{gh_token}@"
-                    )
-                    subprocess.run(
-                        ["git", "remote", "set-url", "origin", auth_url],
-                        cwd=sandbox_path, capture_output=True, timeout=10,
-                    )
-
-            push_result = subprocess.run(
-                ["git", "push", "-u", "origin", branch_name],
-                cwd=sandbox_path, capture_output=True, text=True, timeout=60,
-            )
-            if push_result.returncode != 0:
-                logger.error("Push failed: %s", push_result.stderr)
-                state["error"] = f"Push failed: {push_result.stderr[:200]}"
-                state["pr_url"] = f"branch://{branch_name}"
-            else:
-                # Create PR via gh CLI
-                pr_result = subprocess.run(
-                    ["gh", "pr", "create",
-                     "--title", pr_title,
-                     "--body", pr_body,
-                     "--base", base_branch,
-                     "--head", branch_name],
-                    cwd=sandbox_path, capture_output=True, text=True, timeout=30,
-                )
-                if pr_result.returncode == 0:
-                    pr_url = pr_result.stdout.strip()
-                    state["pr_url"] = pr_url
-                    logger.info("PR created: %s", pr_url)
-                else:
-                    logger.error("PR creation failed: %s", pr_result.stderr)
-                    state["pr_url"] = f"branch://{branch_name}"
-                    state["error"] = f"PR creation failed: {pr_result.stderr[:200]}"
-        except Exception as e:
-            state["error"] = f"PR creation error: {e}"
-            state["pr_url"] = f"branch://{branch_name}"
+        pr_info = _push_and_create_pr(sandbox_path, branch_name, base_branch, pr_title, pr_body)
+        state["pr_url"] = pr_info.get("pr_url", f"branch://{branch_name}")
+        if "error" in pr_info:
+            state["error"] = pr_info["error"]
 
     state["status"] = PipelineStatus.DONE
 
     # Populate repair + localization for eval compatibility
-    if sandbox_path and Path(sandbox_path).exists():
-        repair = _extract_repair_from_sandbox(sandbox_path)
-        state["repair"] = repair
-        fault_files = [
-            p["file_path"] for p in repair.get("patches", [])
-            if not p["file_path"].startswith("test") and "/test" not in p["file_path"]
-        ]
-        if fault_files and not state.get("localization", {}).get("fault_files"):
-            state["localization"] = {
-                "fault_files": fault_files,
-                "fault_functions": [],
-                "root_cause_hypothesis": state.get("explanation", ""),
-                "confidence": 0.8,
-            }
+    state = _populate_repair_and_localization(state, sandbox_path, repo_path)
 
     _report_progress(state)
     if trace:
@@ -623,6 +666,84 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
     _cleanup_sandbox(sandbox_path, repo_path, branch_name)
     return state
 
+
+# ---------------------------------------------------------------------------
+# brt_node helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_brt_source_snippets(repo_path: Path, hint_files: list[str]) -> list[str]:
+    """Read source code from hint files, capped to 3000 chars each for Haiku context."""
+    source_snippets: list[str] = []
+    for fpath in hint_files[:2]:
+        full = repo_path / fpath
+        if full.exists() and full.suffix == ".py":
+            try:
+                content = full.read_text(encoding="utf-8", errors="replace")
+                # Cap to 3000 chars per file to stay within Haiku context
+                source_snippets.append(f"# {fpath}\n{content[:3000]}")
+            except OSError as e:
+                logger.debug("Failed to read BRT source file %s: %s", fpath, e)
+    return source_snippets
+
+
+def _run_brt_candidates(candidates: list, repo_path: Path, repo_python: str) -> list[dict]:
+    """Execute BRT candidates against the original repo; return confirmed BRTs (max 3)."""
+    import tempfile
+
+    confirmed_brts: list[dict] = []
+    for cand in candidates:
+        if len(confirmed_brts) >= 3:
+            break
+        code = cand.test_code.strip()
+        if not code.startswith("def test_") and "def test_" not in code:
+            continue
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                suffix=".py", prefix="brt_", dir=str(repo_path), mode="w",
+                encoding="utf-8", delete=False,
+            ) as tmp:
+                tmp.write(code)
+                tmp_path = tmp.name
+            # File is closed before subprocess reads it (avoids TOCTOU race)
+            result = subprocess.run(
+                [repo_python, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            # Exit code 1 = test ran and FAILED = confirmed BRT (catches the bug!)
+            if result.returncode == 1:
+                confirmed_brts.append({
+                    "code": code,
+                    "description": cand.description[:200],
+                    "target_function": cand.target_function,
+                    "fail_output": (result.stdout + result.stderr)[:500],
+                })
+                logger.info("BRT confirmed: '%s' (fails on current code)", cand.description[:80])
+            else:
+                logger.debug(
+                    "BRT candidate not confirmed (exit %d): %s",
+                    result.returncode, cand.description[:60],
+                )
+        except subprocess.TimeoutExpired:
+            logger.debug("BRT candidate timed out: %s", cand.description[:60])
+        except Exception as e:
+            logger.debug("BRT candidate error: %s", e)
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
+
+    return confirmed_brts
+
+
+# ---------------------------------------------------------------------------
+# Node 4: BRT (Bug Reproduction Test)
+# ---------------------------------------------------------------------------
 
 def brt_node(state: ReactAgentState) -> ReactAgentState:
     """Bug Reproduction Test (BRT) generator — runs before the fix loop.
@@ -677,18 +798,8 @@ def brt_node(state: ReactAgentState) -> ReactAgentState:
             trace.stage_end("brt")
         return state
 
-    # Read source code of suspected functions
-    source_snippets: list[str] = []
-    for fpath in hint_files[:2]:
-        full = repo_path / fpath
-        if full.exists() and full.suffix == ".py":
-            try:
-                content = full.read_text(encoding="utf-8", errors="replace")
-                # Cap to 3000 chars per file to stay within Haiku context
-                source_snippets.append(f"# {fpath}\n{content[:3000]}")
-            except OSError as e:
-                logger.debug("Failed to read BRT source file %s: %s", fpath, e)
-
+    # 1. Read source code of suspected functions
+    source_snippets = _read_brt_source_snippets(repo_path, hint_files)
     if not source_snippets:
         if trace:
             trace.stage_end("brt")
@@ -696,7 +807,7 @@ def brt_node(state: ReactAgentState) -> ReactAgentState:
 
     source_context = "\n\n".join(source_snippets)
 
-    # Generate BRT candidates with Haiku (cheap, fast)
+    # 2. Generate BRT candidates with Haiku (cheap, fast)
     from agent.llm import structured_call as _structured_call, INTAKE_MODEL
     from pydantic import BaseModel
 
@@ -726,7 +837,6 @@ def brt_node(state: ReactAgentState) -> ReactAgentState:
         "Import using the relative module path shown in the source (e.g. 'from backend.app import foo')."
     )
 
-    confirmed_brts: list[dict] = []
     try:
         batch = _structured_call(INTAKE_MODEL, 3500, BRTBatch, prompt)
         candidates = batch.candidates[:6]
@@ -737,55 +847,10 @@ def brt_node(state: ReactAgentState) -> ReactAgentState:
             trace.stage_end("brt")
         return state
 
-    # Run each candidate against original repo — keep only confirmed BRTs
+    # 3. Run candidates against original repo — keep only confirmed BRTs
     # Fix #12: Use the repo's virtualenv python if available, not sys.executable
     repo_python = _find_repo_python(repo_path)
-    import tempfile
-    for cand in candidates:
-        if len(confirmed_brts) >= 3:
-            break
-        code = cand.test_code.strip()
-        if not code.startswith("def test_") and "def test_" not in code:
-            continue
-
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                suffix=".py", prefix="brt_", dir=str(repo_path), mode="w",
-                encoding="utf-8", delete=False,
-            ) as tmp:
-                tmp.write(code)
-                tmp_path = tmp.name
-            # File is closed before subprocess reads it (avoids TOCTOU race)
-            result = subprocess.run(
-                [repo_python, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-
-            # Exit code 1 = test ran and FAILED = confirmed BRT (catches the bug!)
-            if result.returncode == 1:
-                confirmed_brts.append({
-                    "code": code,
-                    "description": cand.description[:200],
-                    "target_function": cand.target_function,
-                    "fail_output": (result.stdout + result.stderr)[:500],
-                })
-                logger.info("BRT confirmed: '%s' (fails on current code)", cand.description[:80])
-            else:
-                logger.debug(
-                    "BRT candidate not confirmed (exit %d): %s",
-                    result.returncode, cand.description[:60],
-                )
-        except subprocess.TimeoutExpired:
-            logger.debug("BRT candidate timed out: %s", cand.description[:60])
-        except Exception as e:
-            logger.debug("BRT candidate error: %s", e)
-        finally:
-            if tmp_path:
-                Path(tmp_path).unlink(missing_ok=True)
+    confirmed_brts = _run_brt_candidates(candidates, repo_path, repo_python)
 
     if confirmed_brts:
         state["brts"] = confirmed_brts
