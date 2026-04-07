@@ -185,6 +185,16 @@ class EvalRunner:
                     ))
                 continue
 
+            # Set up isolated virtualenv for external (SWE-bench) repos
+            if not bug.get("local_repo_path"):
+                try:
+                    self.repo_manager.setup_venv(repo_path, bug)
+                except Exception as e:
+                    logger.warning(
+                        "Venv setup failed for %s (%s) — tests may use system Python",
+                        bug["ticket_id"], e,
+                    )
+
             # Build knowledge graph (if requested)
             if self.build_graph:
                 repo_name = bug.get("repo_name") or bug["ticket_id"].lower().replace("-", "_")

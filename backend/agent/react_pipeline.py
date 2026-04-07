@@ -717,7 +717,7 @@ def brt_node(state: ReactAgentState) -> ReactAgentState:
 
     confirmed_brts: list[dict] = []
     try:
-        batch = _structured_call(INTAKE_MODEL, 2000, BRTBatch, prompt)
+        batch = _structured_call(INTAKE_MODEL, 3500, BRTBatch, prompt)
         candidates = batch.candidates[:6]
         logger.info("BRT node: generated %d candidates", len(candidates))
     except Exception as e:

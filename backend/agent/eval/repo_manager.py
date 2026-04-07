@@ -4,10 +4,12 @@ repo_manager.py — Git clone, SHA checkout, caching, and cleanup for eval repos
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -205,6 +207,139 @@ class RepoManager:
             )
         except subprocess.SubprocessError:
             logger.warning("Failed to reset repo at %s", repo_dir)
+
+    def setup_venv(self, repo_dir: Path, bug: dict) -> Path | None:
+        """Create an isolated virtualenv for a cloned repo and install test dependencies.
+
+        Creates the venv at ``{repo_dir.parent}/{repo_dir.name}_venv/``, tries common
+        test-extra install specs (``.[dev]``, ``.[testing]``, ``.[tests]``, ``.[test]``)
+        before falling back to plain ``pip install -e .``.  Always ensures pytest is
+        installed.  Writes ``{repo_dir}/.agent_config.json`` so the sandbox picks up the
+        venv's pytest instead of ``sys.executable``.
+
+        Cache-aware: skips reinstallation if ``{venv_dir}/.install_ok`` exists and the
+        venv python is still present.
+
+        Parameters
+        ----------
+        repo_dir : Path
+            Path to the cloned repo (must contain setup.py / pyproject.toml).
+        bug : dict
+            EvalBug — used to pull ``setup_commands`` and ``test_command`` overrides.
+
+        Returns
+        -------
+        Path or None
+            Path to the venv directory, or None if setup failed non-fatally.
+        """
+        venv_dir = repo_dir.parent / f"{repo_dir.name}_venv"
+        venv_python = venv_dir / "bin" / "python"
+        venv_pytest = venv_dir / "bin" / "pytest"
+        stamp = venv_dir / ".install_ok"
+
+        # Cache hit — skip if venv exists and stamp is present
+        if stamp.exists() and venv_python.exists():
+            logger.info("Venv cache hit: %s", venv_dir)
+            self._write_agent_config(repo_dir, venv_pytest, bug)
+            return venv_dir
+
+        logger.info("Creating venv for %s at %s", repo_dir.name, venv_dir)
+
+        # Create venv
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "venv", str(venv_dir)],
+                check=True, capture_output=True, text=True, timeout=120,
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error("Failed to create venv for %s: %s", repo_dir.name, e.stderr[:200])
+            return None
+
+        pip = str(venv_dir / "bin" / "pip")
+
+        # Upgrade pip silently
+        subprocess.run(
+            [pip, "install", "--quiet", "--upgrade", "pip"],
+            capture_output=True, timeout=60,
+        )
+
+        # Run any custom setup_commands from the bug spec first
+        for cmd in bug.get("setup_commands", []):
+            if not cmd.strip():
+                continue
+            logger.info("Running setup_command: %s", cmd)
+            try:
+                subprocess.run(
+                    cmd, shell=True, cwd=str(repo_dir),
+                    env={**os.environ, "PATH": f"{venv_dir / 'bin'}:{os.environ.get('PATH', '')}"},
+                    capture_output=True, text=True, timeout=300,
+                )
+            except Exception as e:
+                logger.warning("setup_command failed (continuing): %s", e)
+
+        # Try progressively simpler install specs until one succeeds
+        install_specs = [".[dev]", ".[testing]", ".[tests]", ".[test]", "."]
+        installed = False
+        for spec in install_specs:
+            try:
+                result = subprocess.run(
+                    [pip, "install", "--quiet", "-e", spec],
+                    cwd=str(repo_dir), capture_output=True, text=True, timeout=300,
+                )
+                if result.returncode == 0:
+                    logger.info("Installed %s with spec '%s'", repo_dir.name, spec)
+                    installed = True
+                    break
+                logger.debug("Install spec '%s' failed: %s", spec, result.stderr[:100])
+            except subprocess.TimeoutExpired:
+                logger.warning("Install timed out for spec '%s'", spec)
+                break
+
+        if not installed:
+            logger.warning("All install specs failed for %s — falling back to requirements.txt", repo_dir.name)
+            req_file = repo_dir / "requirements.txt"
+            if req_file.exists():
+                subprocess.run(
+                    [pip, "install", "--quiet", "-r", str(req_file)],
+                    capture_output=True, timeout=300,
+                )
+
+        # Always ensure pytest is available
+        subprocess.run(
+            [pip, "install", "--quiet", "pytest", "pytest-timeout"],
+            capture_output=True, timeout=120,
+        )
+
+        # Write stamp
+        stamp.write_text("ok")
+
+        self._write_agent_config(repo_dir, venv_pytest, bug)
+        logger.info("Venv ready: %s", venv_dir)
+        return venv_dir
+
+    def _write_agent_config(self, repo_dir: Path, venv_pytest: Path, bug: dict) -> None:
+        """Write .agent_config.json so the sandbox uses the venv pytest."""
+        pytest_path = str(venv_pytest)
+
+        # Build test_command: prefer bug's test_command, else use venv pytest with default args
+        test_cmd_override = bug.get("test_command")
+        if test_cmd_override:
+            # Replace bare 'pytest' with full path if the command starts with it
+            if test_cmd_override.startswith("pytest "):
+                test_command = pytest_path + test_cmd_override[len("pytest"):]
+            else:
+                test_command = test_cmd_override
+        else:
+            test_command = f"{pytest_path} -x --timeout=60 -q"
+
+        config = {
+            "test_command": test_command,
+            "pytest_path": pytest_path,
+        }
+
+        config_path = repo_dir / ".agent_config.json"
+        config_path.write_text(json.dumps(config, indent=2))
+        logger.debug("Wrote .agent_config.json: test_command=%s", test_command)
 
     def get_ground_truth_diff(self, bug: dict) -> str:
         """Get the ground-truth patch by diffing repo_sha..fix_sha.
