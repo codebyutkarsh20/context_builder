@@ -12,6 +12,7 @@ from .report import generate_markdown_report, generate_json_report
 from .regression import check_regression_gate, detect_regressions
 from .repo_manager import RepoManager
 from .pr_tracker import PRTracker
+from .ab_eval import run_ab_eval, format_comparison_table
 
 __all__ = [
     "load_eval_dataset",
@@ -26,4 +27,6 @@ __all__ = [
     "detect_regressions",
     "RepoManager",
     "PRTracker",
+    "run_ab_eval",
+    "format_comparison_table",
 ]

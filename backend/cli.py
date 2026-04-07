@@ -500,6 +500,58 @@ def _fmt_args(tool_name: str, args: dict, full: bool) -> str:
     return "  ".join(parts)[:120]
 
 
+@eval_app.command("ab")
+def eval_ab(
+    bug: str = typer.Option(None, "--bug", "-b", help="Run only this ticket_id"),
+    dataset: str = typer.Option("eval/bugs.json", "--dataset", "-d", help="Path to bugs JSON"),
+    timeout: int = typer.Option(600, "--timeout", help="Per-case timeout in seconds"),
+    sentinel: bool = typer.Option(False, "--sentinel", help="Run only first 5 bugs (fast regression check)"),
+    output: str = typer.Option("eval/results", "--output", "-o", help="Results output directory"),
+    build_graph: bool = typer.Option(False, "--build-graph", "-g",
+                                     help="Build knowledge graph before running agent"),
+):
+    """
+    Run A/B comparison: full pipeline (scout+BRT) vs baseline (no scout, no BRT).
+
+    Runs the eval suite twice — once with all features enabled, once with
+    scout and BRT disabled — then prints a comparison table.
+
+    Examples:
+        python cli.py eval ab                                  # Full A/B on all bugs
+        python cli.py eval ab --bug CB-001                     # Single bug comparison
+        python cli.py eval ab --sentinel                       # Quick 5-bug comparison
+        python cli.py eval ab --build-graph                    # With knowledge graph
+    """
+    from agent.eval.ab_eval import run_ab_eval, format_comparison_table
+
+    console.print(Panel(
+        f"[bold cyan]Dataset:[/bold cyan]   {dataset}\n"
+        f"[bold cyan]Arms:[/bold cyan]      A=full (scout+BRT)  vs  B=baseline (no scout, no BRT)\n"
+        f"[bold cyan]Mode:[/bold cyan]      {'[green]With knowledge graph[/green]' if build_graph else '[yellow]Graph-less (exploration tools only)[/yellow]'}\n"
+        f"[bold cyan]Sentinel:[/bold cyan]  {sentinel}\n"
+        f"[bold cyan]Timeout:[/bold cyan]   {timeout}s per case",
+        title="[bold]A/B Eval Comparison[/bold]",
+        border_style="magenta",
+    ))
+
+    def _progress(arm: str, tid: str, current: int, total: int) -> None:
+        arm_label = "[green]FULL[/green]" if arm == "full" else "[yellow]BASE[/yellow]"
+        console.print(f"  {arm_label} Completed {current}/{total}: {tid}")
+
+    comparison = run_ab_eval(
+        dataset_path=Path(dataset),
+        bug_filter=bug,
+        sentinel=sentinel,
+        timeout_per_case=timeout,
+        results_dir=Path(output),
+        build_graph=build_graph,
+        progress_cb=_progress,
+    )
+
+    # Print formatted comparison
+    console.print(format_comparison_table(comparison))
+
+
 @app.command()
 def build(
     repo_path: str = typer.Argument(..., help="Path to any local Git repository"),
