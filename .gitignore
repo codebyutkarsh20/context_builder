@@ -46,3 +46,13 @@ PRD.md
 # Eval runtime artifacts (cloned repos + result traces)
 backend/eval/repos/
 backend/eval/results/
+
+# IDE / AI tool config files (local tooling, not project config)
+.cursorrules
+.windsurfrules
+.mcp.json
+.opencode.json
+GEMINI.md
+
+# SWE-bench raw download (large, regenerated via CLI)
+backend/eval/swe_bugs.json
