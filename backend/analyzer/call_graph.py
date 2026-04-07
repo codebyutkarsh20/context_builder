@@ -276,6 +276,11 @@ class CallGraphBuilder:
         # Phase 6: external call detection
         self._detect_external_calls(G)
 
+        # Phase 6b: TESTED_BY edges (code-review-graph pattern)
+        # Links test files → source files they import. Enables Council tier to check
+        # "what tests cover this function?" without scanning the whole test suite.
+        self._add_tested_by_edges(G)
+
         # Phase 7: PageRank — use edge weights so CALLS edges (weight=3.0) dominate
         # hotspot scoring over structural CONTAINS edges (weight=0.5).
         try:
@@ -558,6 +563,41 @@ class CallGraphBuilder:
 
                 if ext_calls and node_id in G:
                     G.nodes[node_id]["external_calls"] = sorted(ext_calls)[:20]  # cap
+
+    def _add_tested_by_edges(self, G: nx.DiGraph) -> None:
+        """Add TESTED_BY edges: test_file → source_file (code-review-graph pattern).
+
+        Scans test files for imports that resolve to known source files.
+        These edges let the Council tier check test coverage without searching.
+        """
+        _test_markers = ("test_", "_test", "/tests/", "/test/", "conftest")
+        test_files = [pf for pf in self._parsed if any(m in pf.get("path", "") for m in _test_markers)]
+
+        for test_pf in test_files:
+            test_path = test_pf.get("path", "")
+            test_node_id = test_path  # File node id
+
+            # Add test file node if not already present
+            if test_node_id not in G:
+                G.add_node(test_node_id, type="file", label=test_path, file=test_path)
+
+            # Walk imports to find source files this test covers
+            for imp in test_pf.get("imports", []):
+                module = imp.get("module", "") if isinstance(imp, dict) else str(imp)
+                if not module:
+                    continue
+                # Match module against known source file paths
+                for src_path in self._known_paths:
+                    if src_path in _test_markers:
+                        continue  # Don't link test → test
+                    # Module "auth.utils" matches "auth/utils.py"
+                    src_stem = src_path.replace("/", ".").replace("\\", ".").rstrip(".py")
+                    if module == src_stem or src_path.endswith(module.replace(".", "/") + ".py"):
+                        if src_path not in G:
+                            G.add_node(src_path, type="file", label=src_path, file=src_path)
+                        edge_key = (test_node_id, src_path)
+                        if not G.has_edge(*edge_key):
+                            G.add_edge(test_node_id, src_path, type="TESTED_BY", weight=0.5)
 
     # ------------------------------------------------------------------
     # Serialisation

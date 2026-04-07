@@ -1072,6 +1072,406 @@ def check_syntax(file_path: str) -> str:
         return f"ERROR: {e}"
 
 
+# ---------------------------------------------------------------------------
+# Graph-native tools — query the knowledge graph directly (no grep needed)
+# ---------------------------------------------------------------------------
+
+@tool
+def get_call_chain(function_name: str, depth: int = 2) -> str:
+    """
+    Get the call chain around a function: who calls it (callers) and what
+    it calls (callees), up to the specified hop depth. Uses the pre-built
+    knowledge graph — much faster than grep.
+
+    Args:
+        function_name: Function name to look up (e.g. 'verify_password')
+        depth: Number of hops to traverse (default 2, max 3)
+    """
+    from agent.graph_utils import load_graph_data
+    data_dir = getattr(_tls, 'data_dir', None)
+    repo_name = getattr(_tls, 'repo_name', '')
+    if not repo_name:
+        return "ERROR: repo context not set"
+
+    depth = min(int(depth), 3)
+    graph_data, _ = load_graph_data(repo_name)
+    nodes = {n.get("id", ""): n for n in graph_data.get("nodes", [])}
+    edges = graph_data.get("edges", [])
+
+    fn_lower = function_name.lower()
+    seed_ids = {
+        nid for nid, n in nodes.items()
+        if (n.get("label") or nid.split("::")[-1]).lower() == fn_lower
+    }
+    if not seed_ids:
+        # Partial match fallback
+        seed_ids = set(list({
+            nid for nid, n in nodes.items()
+            if fn_lower in (n.get("label") or nid.split("::")[-1]).lower()
+        })[:5])
+
+    if not seed_ids:
+        return f"No function named '{function_name}' found in graph."
+
+    callers: list[str] = []
+    callees: list[str] = []
+
+    for hop in range(depth):
+        current = set(seed_ids) if hop == 0 else set()
+        for edge in edges:
+            if edge.get("type") not in ("CALLS", "IMPORTS"):
+                continue
+            src, tgt = edge.get("source", ""), edge.get("target", "")
+            if tgt in seed_ids:
+                name = (nodes.get(src, {}).get("label") or src.split("::")[-1])
+                file_ = nodes.get(src, {}).get("file", src.split("::")[0])
+                ls = nodes.get(src, {}).get("line_start", "")
+                entry = f"  {'  ' * hop}↑ {name} ({file_}" + (f":{ls}" if ls else "") + ")"
+                if entry not in callers:
+                    callers.append(entry)
+            if src in seed_ids:
+                name = (nodes.get(tgt, {}).get("label") or tgt.split("::")[-1])
+                file_ = nodes.get(tgt, {}).get("file", tgt.split("::")[0])
+                ls = nodes.get(tgt, {}).get("line_start", "")
+                entry = f"  {'  ' * hop}↓ {name} ({file_}" + (f":{ls}" if ls else "") + ")"
+                if entry not in callees:
+                    callees.append(entry)
+
+    lines = [f"Call chain for '{function_name}' (depth={depth}):"]
+    if callers:
+        lines.append("CALLERS (who calls this function):")
+        lines.extend(callers[:15])
+    else:
+        lines.append("CALLERS: none found")
+    if callees:
+        lines.append("CALLEES (what this function calls):")
+        lines.extend(callees[:15])
+    else:
+        lines.append("CALLEES: none found")
+    return _cap("\n".join(lines))
+
+
+@tool
+def get_business_rules_for(function_name: str) -> str:
+    """
+    Get business rules and constraints linked to a function from the
+    knowledge graph. Faster than grep — queries pre-extracted rules.
+
+    Args:
+        function_name: Function or file name to look up business rules for
+    """
+    data_dir = getattr(_tls, 'data_dir', None)
+    repo_name = getattr(_tls, 'repo_name', '')
+    if not repo_name:
+        return "ERROR: repo context not set"
+
+    from pathlib import Path as _Path
+    import json as _json
+    base = data_dir or _Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
+    rules_path = base / repo_name / "business_rules.json"
+    if not rules_path.exists():
+        return f"No business_rules.json found for repo '{repo_name}'."
+
+    try:
+        all_rules = _json.loads(rules_path.read_text())
+    except Exception as e:
+        return f"ERROR reading business rules: {e}"
+
+    fn_lower = function_name.lower()
+    matches = [
+        r for r in all_rules
+        if fn_lower in r.get("file", "").lower()
+        or fn_lower in r.get("function_id", "").lower()
+        or fn_lower in r.get("description", "").lower()
+    ]
+
+    if not matches:
+        return f"No business rules found for '{function_name}'. This may be a safe area to modify."
+
+    lines = [f"Business rules for '{function_name}' ({len(matches)} found):"]
+    for r in matches[:10]:
+        sev = r.get("severity", "unknown").upper()
+        desc = r.get("description", "")[:200]
+        src = r.get("source", "")
+        flag = " ⚠ DO NOT VIOLATE" if sev in ("CRITICAL", "HIGH") else ""
+        lines.append(f"  [{sev}]{flag} {desc}")
+        if src:
+            lines.append(f"    Source: {src}")
+    return _cap("\n".join(lines))
+
+
+@tool
+def get_failure_history(function_name: str) -> str:
+    """
+    Get past incidents and failure records linked to a function.
+    Shows what went wrong here before — critical for understanding risk.
+
+    Args:
+        function_name: Function or file name to look up failure history for
+    """
+    data_dir = getattr(_tls, 'data_dir', None)
+    repo_name = getattr(_tls, 'repo_name', '')
+    if not repo_name:
+        return "ERROR: repo context not set"
+
+    # Try Neo4j first
+    try:
+        from graph.neo4j_client import neo4j_client
+        if neo4j_client.is_connected():
+            rows = neo4j_client.run(
+                "MATCH (fr:FailureRecord)-[:RESULTED_IN_CHANGE]->(n) "
+                "WHERE (n:Function OR n:File) "
+                "  AND (n.name CONTAINS $fn OR n.path CONTAINS $fn) "
+                "  AND fr.repo = $repo "
+                "RETURN fr.message AS message, fr.date AS date, fr.issue_ref AS ref, "
+                "       fr.severity_hint AS sev "
+                "ORDER BY fr.date DESC LIMIT 10",
+                {"fn": function_name, "repo": repo_name},
+            )
+            if rows:
+                lines = [f"Failure history for '{function_name}' ({len(rows)} records):"]
+                for row in rows:
+                    ref = f" ({row['ref']})" if row.get("ref") else ""
+                    sev = f"[{row['sev'].upper()}] " if row.get("sev") else ""
+                    lines.append(f"  {sev}[{row.get('date', '?')}]{ref} {row.get('message', '')[:200]}")
+                return _cap("\n".join(lines))
+    except Exception:
+        pass
+
+    return f"No failure history found for '{function_name}' (Neo4j not connected or no records)."
+
+
+@tool
+def get_blast_radius(function_name: str) -> str:
+    """
+    Find all files that directly call or import a function. Use this before
+    making changes to understand the impact — critical for avoiding regressions.
+
+    Args:
+        function_name: Function name to find callers for
+    """
+    from agent.graph_utils import load_graph_data
+    repo_name = getattr(_tls, 'repo_name', '')
+    if not repo_name:
+        return "ERROR: repo context not set"
+
+    graph_data, _ = load_graph_data(repo_name)
+    nodes = {n.get("id", ""): n for n in graph_data.get("nodes", [])}
+    edges = graph_data.get("edges", [])
+
+    fn_lower = function_name.lower()
+    seed_ids = {
+        nid for nid, n in nodes.items()
+        if fn_lower in (n.get("label") or nid.split("::")[-1]).lower()
+    }
+
+    callers: dict[str, int] = {}
+    for edge in edges:
+        if edge.get("type") not in ("CALLS", "IMPORTS"):
+            continue
+        if edge.get("target", "") in seed_ids:
+            src_file = edge.get("source", "").split("::")[0]
+            if src_file:
+                callers[src_file] = callers.get(src_file, 0) + 1
+
+    if not callers:
+        return f"No callers found for '{function_name}'. Change has LOW blast radius."
+
+    sorted_callers = sorted(callers.items(), key=lambda x: x[1], reverse=True)
+    risk = "CRITICAL" if len(callers) > 8 else "HIGH" if len(callers) > 3 else "MEDIUM"
+    lines = [
+        f"Blast radius for '{function_name}': {len(callers)} callers — Risk: {risk}",
+        "Files that call this function:",
+    ]
+    for f, count in sorted_callers[:15]:
+        lines.append(f"  - {f} ({count} call{'s' if count > 1 else ''})")
+    if len(callers) > 15:
+        lines.append(f"  ... {len(callers) - 15} more files")
+    lines.append("\nConsider whether your change will break any of these callers.")
+    return _cap("\n".join(lines))
+
+
+@tool
+def screen_files(file_paths: str, bug_description: str) -> str:
+    """
+    Screen multiple files for relevance to a bug using fast parallel LLM calls
+    (Minions pattern). Each file is independently rated for relevance.
+    Use when you have 5+ candidate files and need to narrow down quickly.
+
+    Args:
+        file_paths: Comma-separated list of relative file paths to screen
+        bug_description: Short description of the bug you're investigating
+    """
+    repo_path = getattr(_tls, 'repo_path', None)
+    if not repo_path:
+        return "ERROR: repo path not set"
+
+    files = [f.strip() for f in file_paths.split(",") if f.strip()]
+    if not files:
+        return "ERROR: no files provided"
+    if len(files) > 20:
+        files = files[:20]
+
+    import concurrent.futures
+    from agent.llm import structured_call as _structured_call, INTAKE_MODEL
+    from pydantic import BaseModel
+
+    class FileRelevance(BaseModel):
+        relevant: bool
+        confidence: float  # 0.0-1.0
+        reason: str        # one sentence
+
+    def _screen_one(fpath: str) -> tuple[str, bool, float, str]:
+        try:
+            resolved = repo_path / fpath
+            if not resolved.exists():
+                return fpath, False, 0.0, "file not found"
+            content = resolved.read_text(encoding="utf-8", errors="replace")[:3000]
+            prompt = (
+                f"Bug: {bug_description}\n\n"
+                f"File: {fpath}\n```\n{content}\n```\n\n"
+                "Is this file likely relevant to the bug? "
+                "Answer with relevant=true/false, confidence 0.0-1.0, and one-sentence reason."
+            )
+            result = _structured_call(INTAKE_MODEL, 200, FileRelevance, prompt)
+            return fpath, result.relevant, result.confidence, result.reason
+        except Exception as e:
+            return fpath, False, 0.0, f"error: {e}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_screen_one, f): f for f in files}
+        results = []
+        for fut in concurrent.futures.as_completed(futures):
+            results.append(fut.result())
+
+    # Sort: relevant first, then by confidence
+    results.sort(key=lambda x: (not x[1], -x[2]))
+
+    lines = [f"File screening results ({len(files)} files screened for: '{bug_description[:60]}'):"]
+    lines.append("")
+    relevant_count = sum(1 for r in results if r[1])
+    lines.append(f"RELEVANT ({relevant_count} files):")
+    for fpath, rel, conf, reason in results:
+        if rel:
+            lines.append(f"  ✓ {fpath} (confidence: {conf:.0%}) — {reason}")
+    if relevant_count == 0:
+        lines.append("  (none)")
+    lines.append("")
+    lines.append(f"NOT RELEVANT ({len(results) - relevant_count} files):")
+    for fpath, rel, conf, reason in results:
+        if not rel:
+            lines.append(f"  ✗ {fpath} — {reason}")
+    return _cap("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Tool 14 — search_subagent
+# ---------------------------------------------------------------------------
+
+@tool
+def search_subagent(query: str, context: str = "") -> str:
+    """Search the codebase using an isolated search specialist (Haiku). The search runs in its own context — your conversation stays clean. Returns file:line-range spans relevant to your query. Use this instead of multiple grep_repo calls when you need to find where something lives.
+
+    Args:
+        query: What to search for (function name, concept, pattern, etc.)
+        context: Bug description or additional context about what you're looking for
+    """
+    # Lazy imports to avoid circular dependencies
+    try:
+        from langchain_anthropic import ChatAnthropic
+        from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+    except ImportError as e:
+        return f"ERROR: langchain_anthropic not available — {e}. Use grep_repo instead."
+
+    # Build the subset of tools available to the search subagent
+    search_tools = [grep_repo, read_file, read_function, list_files]
+
+    try:
+        haiku = ChatAnthropic(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2048,
+        ).bind_tools(search_tools)
+    except Exception as e:
+        return f"ERROR: Could not initialise Haiku model — {e}. Use grep_repo instead."
+
+    # Build focused system prompt
+    context_clause = f"\nContext: {context}" if context else ""
+    system_prompt = (
+        f"You are a search specialist. Find code relevant to: {query}.{context_clause}\n"
+        "Return ONLY file:line-range spans. Be terse.\n"
+        "Use grep_repo to find patterns, read_file/read_function to confirm, list_files to explore.\n"
+        "When you have enough spans, output them as plain text like:\n"
+        "  path/to/file.py:10-45\n"
+        "  path/to/other.py:120-135\n"
+        "Do not explain — just return the spans."
+    )
+
+    messages: list = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"Find code spans for: {query}"),
+    ]
+
+    # Build a tool executor map
+    tool_map = {t.name: t for t in search_tools}
+
+    max_iterations = 8
+    iteration = 0
+    final_answer = ""
+
+    try:
+        while iteration < max_iterations:
+            iteration += 1
+            response = haiku.invoke(messages)
+            messages.append(response)
+
+            # Check if Haiku wants to call tools
+            tool_calls = getattr(response, "tool_calls", None) or []
+
+            if not tool_calls:
+                # No tool calls — this is the final answer
+                final_answer = response.content if isinstance(response.content, str) else str(response.content)
+                break
+
+            # Execute each tool call and append results
+            for tc in tool_calls:
+                tool_name = tc.get("name", "")
+                tool_args = tc.get("args", {})
+                tool_call_id = tc.get("id", f"call_{iteration}")
+
+                tool_fn = tool_map.get(tool_name)
+                if tool_fn is None:
+                    tool_result = f"ERROR: unknown tool '{tool_name}'"
+                else:
+                    try:
+                        tool_result = tool_fn.invoke(tool_args)
+                    except Exception as te:
+                        tool_result = f"ERROR running {tool_name}: {te}"
+
+                messages.append(
+                    ToolMessage(content=str(tool_result), tool_call_id=tool_call_id)
+                )
+
+        else:
+            # Hit iteration limit — ask for final answer without tools
+            messages.append(
+                HumanMessage(content="You've used 8 tool calls. Return your final file:line-range spans now.")
+            )
+            final_response = haiku.invoke(messages)
+            final_answer = (
+                final_response.content
+                if isinstance(final_response.content, str)
+                else str(final_response.content)
+            )
+
+    except Exception as e:
+        return f"Search subagent failed: {e}. Use grep_repo directly."
+
+    if not final_answer or not final_answer.strip():
+        return f"Search subagent found no results for: {query}"
+
+    return f"Search results for '{query}':\n{final_answer.strip()}"
+
+
 # Exploration tools — READ-ONLY. The agent uses these to understand the codebase.
 # string_replace and check_syntax are intentionally excluded: direct edits during
 # exploration leave the main repo dirty, which blocks git worktree creation in the
@@ -1085,6 +1485,12 @@ ALL_TOOLS = [
     get_function_info,
     get_file_summary,
     get_file_structure,
+    get_call_chain,
+    get_business_rules_for,
+    get_failure_history,
+    get_blast_radius,
+    screen_files,
+    search_subagent,
 ]
 
 

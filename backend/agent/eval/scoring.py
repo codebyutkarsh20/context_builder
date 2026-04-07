@@ -204,6 +204,21 @@ def _score_test_pass(result: dict) -> bool:
     return test_result.strip().lower().startswith("passed")
 
 
+def _score_brt_pass(result: dict) -> bool:
+    """Did all confirmed Bug Reproduction Tests pass after the fix?"""
+    brts = result.get("brts", [])
+    if not brts:
+        return False  # No BRTs = can't verify via BRT (not a failure)
+    brt_pass = result.get("brt_pass_count", 0)
+    brt_total = result.get("brt_total", len(brts))
+    return brt_total > 0 and brt_pass == brt_total
+
+
+def _get_epr_score(result: dict) -> float:
+    """Get the Ensemble Pass Rate score (fraction of BRTs that pass)."""
+    return float(result.get("epr_score", 0.0))
+
+
 def _score_patch_hits_target(result: dict, expected_files: list[str]) -> bool:
     """Do the agent's patches target at least one expected file?
 
@@ -254,6 +269,8 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
     gt_match = _score_ground_truth_file_match(result, bug)
 
     test_ok = _score_test_pass(result)
+    brt_ok = _score_brt_pass(result)
+    epr = _get_epr_score(result)
 
     # Classify test infrastructure status
     test_result_raw = (result.get("test_result") or "").strip().lower()
@@ -265,6 +282,10 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
 
     # full_pass (strict): localization + fix + target files + passing tests
     full_pass = loc_hit and fix_gen and hits_target and test_ok
+
+    # brt_full_pass: like full_pass but uses BRTs as the test signal (more precise)
+    # When BRTs exist, this is the most reliable "did the agent fix the actual bug" signal
+    brt_full_pass = loc_hit and fix_gen and hits_target and brt_ok if result.get("brts") else False
 
     # agent_quality_pass (diagnostic): did the agent do its job correctly?
     # Ignores test infra failures the agent can't control.
@@ -306,6 +327,11 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
 
         # Derived — strict (requires passing tests)
         "full_pass": full_pass,
+        # BRT-based pass (most reliable when BRTs exist)
+        "brt_full_pass": brt_full_pass,
+        "brt_pass": brt_ok,
+        "epr_score": epr,
+        "brt_count": len(result.get("brts", [])),
         # Diagnostic — agent behavior quality (ignores test infra)
         "agent_quality_pass": agent_quality_pass,
         "infra_blocked": infra_blocked,

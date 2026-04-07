@@ -17,12 +17,39 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 
 
+def build_brt_section(brts: list[dict]) -> str:
+    """Build the BRT objective function section for the system prompt."""
+    if not brts:
+        return ""
+    lines = [
+        "\n## BUG REPRODUCTION TESTS (BRTs) — YOUR OBJECTIVE FUNCTION",
+        "",
+        "These tests were CONFIRMED to FAIL on the current (broken) codebase.",
+        "Your fix is correct when ALL of these tests PASS.",
+        "After applying your fix, call run_brt to verify.",
+        "",
+    ]
+    for i, brt in enumerate(brts, 1):
+        lines.append(f"### BRT {i}: {brt.get('description', '')}")
+        lines.append(f"Target: `{brt.get('target_function', '?')}`")
+        lines.append("```python")
+        lines.append(brt.get("code", "").strip())
+        lines.append("```")
+        lines.append("")
+    lines.append(
+        "IMPORTANT: Do NOT modify the BRTs themselves. "
+        "Fix the production code so these tests pass naturally."
+    )
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     work_order: dict,
     intent: dict,
     kickstart_context: str,
     conventions_section: str = "",
     business_rules_section: str = "",
+    brts: list[dict] | None = None,
 ) -> str:
     """Build the full system prompt for the ReAct agent.
 
@@ -44,6 +71,9 @@ def build_system_prompt(
 
     notes = intent.get("notes", "")
     notes_str = f"\nNOTES:\n{notes}" if notes else ""
+
+    brt_section = build_brt_section(brts or [])
+    has_brts = bool(brts)
 
     return f"""You are an AI software engineer fixing a production bug in repo `{repo_name}`.
 
@@ -72,8 +102,8 @@ You have a budget of ~30 tool calls. Successful fixes average 15-25 calls. Plan 
   a 1-call setup step, NOT a reason to escalate.
 
 ### Phase 3: VERIFY (budget: 3-5 calls)
-9. Call run_tests with a specific test path (1-2 calls). If tests return "skipped" or "error", that's fine — the repo may lack deps. Move on.
-10. Do NOT retry run_tests more than 2 times. If tests can't run, proceed.
+{"9. Call run_brt() — run the Bug Reproduction Tests on your fix. ALL BRTs must pass before submitting. If a BRT still fails, read that test, understand what it checks, then fix the production code (NOT the test)." if has_brts else "9. Call run_tests with a specific test path (1-2 calls). If tests return 'skipped' or 'error', that's fine — the repo may lack deps. Move on."}
+10. {"Call run_tests for the full test suite after BRTs pass." if has_brts else "Do NOT retry run_tests more than 2 times. If tests can't run, proceed."}
 11. Call request_review (1 call). If review approves, submit. If review requests changes, make ONE attempt to fix, then submit or escalate.
 
 ### Phase 4: FINISH (1-2 calls)
@@ -118,6 +148,7 @@ You have a budget of ~30 tool calls. Successful fixes average 15-25 calls. Plan 
 
 ### Sandbox & Testing:
 - create_sandbox() — Create git worktree sandbox (call once before editing)
+- run_brt() — Run confirmed Bug Reproduction Tests on your fix. When BRTs were generated, call this BEFORE run_tests. Fix is correct when all BRTs pass.
 - run_tests(test_path) — Run tests + linters on your changes. **Always pass a specific
   test_path** targeting the test file(s) relevant to your fix (e.g. 'tests/test_helpers.py::TestJSON').
   Running without test_path triggers auto-detect which may fail on repos that need special setup.
@@ -181,8 +212,10 @@ Likely affected modules: {intent.get('likely_affected_modules', [])}
 Likely affected functions: {intent.get('likely_affected_functions', [])}
 Fix type: {intent.get('fix_type', 'bug_fix')}
 Severity: {intent.get('severity', 'medium')}
+{f"Pre-localized files (high confidence — start here): {intent.get('confirmed_files', [])}" if intent.get('confirmed_files') else ""}
 {criteria_str}
 {notes_str}
+{brt_section}
 {kickstart_context}
 {conventions_section}
 {business_rules_section}

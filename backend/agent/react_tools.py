@@ -499,6 +499,11 @@ def run_tests(test_path: str = "") -> str:
     except Exception as e:
         results.append(f"Linters: skipped ({e})")
 
+    # Speculative review (cavekit pattern): start the reviewer in a background thread
+    # the moment tests begin. By the time tests finish, the review is already done.
+    # Wall time = max(test_time, review_time) instead of test_time + review_time.
+    _start_speculative_review(sandbox)
+
     # Step 2: Run tests through sandbox.run_tests which handles:
     # - .agent_config.json (setup_commands, test_command, test_args, test_env, test_timeout)
     # - Auto-detection (pytest, npm test, make test)
@@ -511,6 +516,68 @@ def run_tests(test_path: str = "") -> str:
         return classified + "\n" + "\n".join(results)
     except Exception as e:
         return f"error: test execution failed ({e})"
+
+
+def _start_speculative_review(sandbox: Path) -> None:
+    """Launch a background thread to pre-compute the review while tests run.
+
+    cavekit speculative review pattern: review starts the moment a patch is
+    committed. By the time run_tests() returns, the review is often complete.
+    Wall time = max(test_time, review_time) instead of test_time + review_time.
+
+    Result stored in _tls.speculative_review_result for request_review() to pick up.
+    """
+    import concurrent.futures
+    # Skip if review already in flight
+    if getattr(_tls, "speculative_review_future", None) is not None:
+        return
+
+    try:
+        diff_result = subprocess.run(
+            ["git", "diff", "HEAD~1"],
+            cwd=str(sandbox), capture_output=True, text=True, timeout=15,
+        )
+        diff_text = diff_result.stdout[:6000]
+    except Exception:
+        diff_text = ""
+
+    if not diff_text:
+        return
+
+    repo_name = getattr(_tls, "repo_name", "")
+    modified_files = [
+        line[3:].strip() for line in diff_text.splitlines()
+        if line.startswith("+++ b/")
+    ]
+
+    def _do_review() -> dict:
+        try:
+            from agent.graph_utils import build_reviewer_context
+            ctx = build_reviewer_context(repo_name, modified_files) if repo_name and modified_files else ""
+            from agent.llm import structured_call as _sc
+            from pydantic import BaseModel
+
+            class QuickReview(BaseModel):
+                verdict: str      # "APPROVE" or "REJECT"
+                confidence: float
+                summary: str      # 1-2 sentence verdict summary
+
+            prompt = (
+                "You are reviewing a code patch. Be concise.\n\n"
+                f"PATCH:\n```diff\n{diff_text}\n```\n\n"
+                + (f"CONTEXT:\n{ctx[:1000]}\n\n" if ctx else "")
+                + "Does this patch look correct and safe? APPROVE or REJECT with confidence and 1-sentence summary."
+            )
+            result = _sc("claude-sonnet-4-6", 300, QuickReview, prompt)
+            return {"verdict": result.verdict, "confidence": result.confidence, "summary": result.summary}
+        except Exception as e:
+            return {"verdict": "APPROVE", "confidence": 0.5, "summary": f"Speculative review failed: {e}"}
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_do_review)
+    _tls.speculative_review_future = future
+    _tls.speculative_review_executor = executor
+    logger.debug("Speculative review started in background")
 
 
 def _classify_sandbox_output(test_output: str) -> str:
@@ -532,6 +599,87 @@ def _classify_sandbox_output(test_output: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# BRT tool — run confirmed Bug Reproduction Tests in the sandbox
+# ---------------------------------------------------------------------------
+
+@tool
+def run_brt() -> str:
+    """
+    Run the confirmed Bug Reproduction Tests (BRTs) on your patched code in the sandbox.
+    BRTs are tests that were confirmed to FAIL on the broken code.
+    Your fix is correct when ALL BRTs pass (exit 0).
+
+    Call this in Phase 3 BEFORE run_tests. If a BRT still fails after your fix:
+    - Read the BRT code to understand what behaviour it checks
+    - Fix the production code (NOT the test) so the assertion passes
+    - Call run_brt again to verify
+    """
+    sandbox = getattr(_tls, "sandbox_path", None)
+    if not sandbox or not sandbox.exists():
+        return "ERROR: No sandbox exists. Call create_sandbox first."
+
+    # Retrieve BRTs from the thread-local state copy stored during react_loop setup
+    brts = getattr(_tls, "brts", [])
+    if not brts:
+        return "No Bug Reproduction Tests were generated for this bug (non-Python repo or no confirmed BRTs). Use run_tests instead."
+
+    results = []
+    pass_count = 0
+
+    for i, brt in enumerate(brts, 1):
+        code = brt.get("code", "").strip()
+        if not code:
+            continue
+
+        tmp_path = None
+        try:
+            import tempfile
+            import uuid
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                suffix=".py", prefix=f"brt_{i}_{uuid.uuid4().hex[:4]}_",
+            )
+            os.close(tmp_fd)
+            Path(tmp_path).write_text(code, encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
+                cwd=str(sandbox),
+                capture_output=True, text=True, timeout=30,
+            )
+
+            output = (result.stdout + result.stderr).strip()
+            if result.returncode == 0:
+                pass_count += 1
+                results.append(f"BRT {i} ✓ PASSED — {brt.get('description', '')[:80]}")
+            else:
+                fail_summary = output[:300] if output else "(no output)"
+                results.append(
+                    f"BRT {i} ✗ FAILED — {brt.get('description', '')[:80]}\n"
+                    f"  Output: {fail_summary}"
+                )
+        except subprocess.TimeoutExpired:
+            results.append(f"BRT {i} ✗ TIMEOUT — {brt.get('description', '')[:60]}")
+        except Exception as e:
+            results.append(f"BRT {i} ✗ ERROR — {e}")
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    total = len(brts)
+    epr = pass_count / total if total > 0 else 0.0
+    header = f"BRT Results: {pass_count}/{total} passed (EPR={epr:.0%})"
+    if pass_count == total:
+        header += " ✓ ALL PASS — your fix is verified. Proceed to run_tests then request_review."
+    else:
+        header += f" ✗ {total - pass_count} STILL FAILING — fix the production code and retry."
+
+    return header + "\n\n" + "\n".join(results)
+
+
+# ---------------------------------------------------------------------------
 # Completion tools
 # ---------------------------------------------------------------------------
 
@@ -550,6 +698,40 @@ def request_review(explanation: str) -> str:
         return "ERROR: No sandbox exists. Cannot review without changes."
 
     repo_name = getattr(_tls, "repo_name", "")
+
+    # Check if speculative review already completed (zero-latency path)
+    spec_future = getattr(_tls, "speculative_review_future", None)
+    if spec_future is not None:
+        try:
+            import concurrent.futures
+            if spec_future.done():
+                spec_result = spec_future.result(timeout=1)
+                verdict = spec_result.get("verdict", "APPROVE")
+                conf = spec_result.get("confidence", 0.5)
+                summary = spec_result.get("summary", "")
+                logger.info("Speculative review result ready (zero latency): %s %.0f%%", verdict, conf * 100)
+                # Speculative review is a quick pre-check; still run full Opus review below
+                spec_note = f"[Speculative pre-check: {verdict} {conf:.0%} — {summary}]\n\n"
+            else:
+                # Not done yet — wait up to 5s before falling through to normal review
+                try:
+                    spec_result = spec_future.result(timeout=5)
+                    verdict = spec_result.get("verdict", "APPROVE")
+                    conf = spec_result.get("confidence", 0.5)
+                    summary = spec_result.get("summary", "")
+                    spec_note = f"[Speculative pre-check: {verdict} {conf:.0%} — {summary}]\n\n"
+                except concurrent.futures.TimeoutError:
+                    spec_note = ""
+        except Exception:
+            spec_note = ""
+        finally:
+            _tls.speculative_review_future = None
+            executor = getattr(_tls, "speculative_review_executor", None)
+            if executor:
+                executor.shutdown(wait=False)
+                _tls.speculative_review_executor = None
+    else:
+        spec_note = ""
 
     # Collect the diff
     try:
@@ -620,7 +802,7 @@ verdict: APPROVE if all checks pass. CHANGES_REQUESTED if any fail. ESCALATE if 
         confidence = review_dict.get("confidence", 0)
         feedback = review_dict.get("feedback", "")
 
-        response = f"REVIEW VERDICT: {verdict} (confidence: {confidence:.0%})\n\nChecks:\n{checks_str}"
+        response = spec_note + f"REVIEW VERDICT: {verdict} (confidence: {confidence:.0%})\n\nChecks:\n{checks_str}"
         if feedback:
             response += f"\n\nFeedback: {feedback}"
 
@@ -864,8 +1046,8 @@ def get_blast_radius(file_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 EDIT_TOOLS = [string_replace, check_syntax, create_file]
-SANDBOX_TOOLS = [create_sandbox, run_tests]
-MULTI_FILE_TOOLS = [get_callers, get_blast_radius]
+SANDBOX_TOOLS = [create_sandbox, run_tests, run_brt]
+MULTI_FILE_TOOLS = [get_callers]
 COMPLETION_TOOLS = [record_localization, request_review, submit_fix, escalate]
 
 # All react-specific tools (exploration tools are added from explore_tools.py)

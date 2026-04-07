@@ -31,7 +31,7 @@ app.add_typer(eval_app, name="eval")
 def eval_run(
     bug: str = typer.Option(None, "--bug", "-b", help="Run only this ticket_id"),
     pipeline: str = typer.Option("react", "--pipeline", "-p",
-                                 help="Pipeline to run: 'react' (default)"),
+                                 help="Pipeline(s) to run: 'react' (v3.0), 'react_v2' (v2.0 baseline), or 'react,react_v2' for A/B"),
     dataset: str = typer.Option("eval/bugs.json", "--dataset", "-d", help="Path to bugs JSON"),
     timeout: int = typer.Option(600, "--timeout", help="Per-case timeout in seconds"),
     sentinel: bool = typer.Option(False, "--sentinel", help="Run only first 5 bugs (fast regression check)"),
@@ -42,14 +42,16 @@ def eval_run(
     Run the evaluation suite on the ReAct pipeline.
 
     Examples:
-        python cli.py eval run                               # All bugs (react)
-        python cli.py eval run --bug FLASK-2651             # Single bug (react)
-        python cli.py eval run --sentinel                   # Fast 5-bug regression check
-        python cli.py eval run --timeout 300                # 5min timeout per case
+        python cli.py eval run                                     # All bugs (react v3.0)
+        python cli.py eval run --bug CB-001                        # Single bug
+        python cli.py eval run --pipeline react,react_v2           # A/B: v3 vs v2 baseline
+        python cli.py eval run --sentinel                          # Fast 3-bug regression check
+        python cli.py eval run --timeout 300                       # 5min timeout per case
     """
     from agent.eval.runner import EvalRunner
 
-    pipelines = [pipeline]
+    # Support comma-separated pipelines for A/B comparison
+    pipelines = [p.strip() for p in pipeline.split(",")]
 
     console.print(Panel(
         f"[bold cyan]Dataset:[/bold cyan]   {dataset}\n"
@@ -212,6 +214,287 @@ def eval_track_prs(
     ))
 
 
+@eval_app.command("trace")
+def eval_trace(
+    bug: str = typer.Option(None, "--bug", "-b", help="Ticket ID to show (e.g. CB-003)"),
+    pipeline: str = typer.Option(None, "--pipeline", "-p", help="Pipeline to show (react or react_v2)"),
+    run_id: str = typer.Option(None, "--run", "-r", help="Run ID (default: latest)"),
+    results_dir: str = typer.Option("eval/results", "--dir", "-d", help="Results directory"),
+    full: bool = typer.Option(False, "--full", "-f", help="Show full tool output (not just preview)"),
+):
+    """
+    Show step-by-step agent trace for a bug run.
+
+    Examples:
+        python cli.py eval trace --bug CB-003
+        python cli.py eval trace --bug CB-003 --pipeline react
+        python cli.py eval trace --bug CB-003 --run d52c4a80 --full
+        python cli.py eval trace                          # list available traces
+    """
+    import json
+    from rich.rule import Rule
+    from rich.text import Text
+
+    traces_dir = Path(results_dir) / "traces"
+    if not traces_dir.exists():
+        console.print("[yellow]No traces found. Run eval first.[/yellow]")
+        raise typer.Exit(1)
+
+    # Resolve run_id — default to latest
+    if run_id is None:
+        runs = sorted(traces_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not runs:
+            console.print("[yellow]No trace runs found.[/yellow]")
+            raise typer.Exit(1)
+        run_dir = runs[0]
+        run_id = run_dir.name
+    else:
+        run_dir = traces_dir / run_id
+        if not run_dir.exists():
+            console.print(f"[red]Run '{run_id}' not found in {traces_dir}[/red]")
+            raise typer.Exit(1)
+
+    # Find matching trace files
+    trace_files = sorted(run_dir.glob("*.json"))
+    if bug:
+        trace_files = [f for f in trace_files if f.stem.startswith(bug)]
+    if pipeline:
+        trace_files = [f for f in trace_files if f.stem.endswith(f"_{pipeline}")]
+
+    if not trace_files:
+        available = [f.stem for f in sorted(run_dir.glob("*.json"))]
+        console.print(f"[yellow]No matching traces in run '{run_id}'.[/yellow]")
+        console.print(f"Available: {', '.join(available)}")
+        raise typer.Exit(1)
+
+    # If multiple matches and no specific selection, list them
+    if len(trace_files) > 1 and not (bug and pipeline):
+        console.print(f"\n[bold]Run:[/bold] {run_id}  |  [bold]Traces:[/bold]")
+        for f in trace_files:
+            data = json.loads(f.read_text())
+            outcome = data.get("run_outcome", {})
+            summary = data.get("summary", {})
+            status = outcome.get("outcome", "?")
+            cost = summary.get("total_cost_usd", 0)
+            calls = summary.get("total_tool_calls", 0)
+            color = "green" if status == "submitted" else "red" if status == "escalated" else "yellow"
+            console.print(
+                f"  [cyan]{f.stem}[/cyan]  [{color}]{status}[/{color}]  "
+                f"{calls} calls  ${cost:.2f}"
+            )
+        console.print("\n[dim]Use --bug and --pipeline to drill into a specific trace.[/dim]")
+        return
+
+    # Print each matching trace
+    for trace_file in trace_files:
+        _print_trace(console, trace_file, run_id, full)
+
+
+def _print_trace(console: "Console", trace_file: "Path", run_id: str, full: bool) -> None:
+    """Pretty-print a single agent trace file."""
+    import json
+    from rich.rule import Rule
+    from rich.text import Text
+    from rich.padding import Padding
+
+    data = json.loads(trace_file.read_text())
+    ticket_id, pipeline_name = trace_file.stem.rsplit("_", 1)
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    outcome = data.get("run_outcome", {})
+    summary = data.get("summary", {})
+    status = outcome.get("outcome", "?")
+    cost = summary.get("total_cost_usd", 0)
+    calls = summary.get("total_tool_calls", 0)
+    duration = outcome.get("elapsed_seconds", 0)
+    tokens = summary.get("total_tokens", 0)
+
+    status_color = "green" if status == "submitted" else "red" if status == "escalated" else "yellow"
+    tests_ok = outcome.get("tests_passed", False)
+    tests_skip = outcome.get("tests_skipped", False)
+    test_str = "[green]tests PASS[/green]" if tests_ok else (
+        "[yellow]tests SKIPPED[/yellow]" if tests_skip else "[red]tests FAIL[/red]"
+    )
+
+    console.print()
+    console.print(Panel(
+        f"[bold cyan]{ticket_id}[/bold cyan]  |  [bold]{pipeline_name}[/bold] pipeline  |  "
+        f"[{status_color}]{status.upper()}[/{status_color}]  |  "
+        f"{calls} tool calls  ${cost:.2f}  {duration:.0f}s  {tokens:,} tokens  |  {test_str}",
+        title=f"[bold]Agent Trace[/bold] — run {run_id}",
+        border_style=status_color,
+    ))
+
+    # ── Stage timings ────────────────────────────────────────────────────────
+    stage_timings = data.get("stage_timings", {})
+    timing_parts = []
+    for stage, t in stage_timings.items():
+        dur = t.get("duration_ms", 0) / 1000
+        if dur > 0.1:
+            timing_parts.append(f"{stage}={dur:.1f}s")
+    if timing_parts:
+        console.print(f"[dim]Stage timings: {' → '.join(timing_parts)}[/dim]")
+
+    # ── Phase breakdown ──────────────────────────────────────────────────────
+    phases = data.get("phase_breakdown", {})
+    if phases:
+        phase_parts = []
+        for ph, info in phases.items():
+            tc = info.get("tool_calls", 0)
+            tools = ", ".join(info.get("tools_used", []))
+            phase_parts.append(f"[bold]{ph}[/bold]({tc})")
+        console.print(f"Phases: {' → '.join(phase_parts)}")
+
+    # ── Events ──────────────────────────────────────────────────────────────
+    events = data.get("events", [])
+    console.print()
+
+    # Track current phase for transition markers
+    current_phase = "explore"
+    call_num = 0
+    # Pair tool_calls with their following tool_result
+    # Build index: call_number → (tool_call_event, tool_result_event)
+    tool_pairs: dict[int, dict] = {}
+    transitions: dict[int, dict] = {}  # call_number → transition
+
+    for e in events:
+        et = e["event_type"]
+        d = e.get("data", {})
+        if et == "tool_call":
+            n = d.get("call_number", 0)
+            tool_pairs.setdefault(n, {})["call"] = e
+        elif et == "tool_result":
+            # tool_result doesn't have call_number, match by proximity
+            # find the last tool_call without a result
+            pass
+        elif et == "state_transition":
+            n = d.get("at_call", 0)
+            transitions[n] = d
+
+    # Re-pair results sequentially
+    result_queue = [e for e in events if e["event_type"] == "tool_result"]
+    result_idx = 0
+    for n in sorted(tool_pairs.keys()):
+        if result_idx < len(result_queue):
+            tool_pairs[n]["result"] = result_queue[result_idx]
+            result_idx += 1
+
+    # Print each tool call
+    PHASE_COLORS = {
+        "explore": "cyan", "edit": "yellow", "test": "blue",
+        "review": "magenta", "submit": "green", "other": "dim",
+    }
+
+    for n in sorted(tool_pairs.keys()):
+        pair = tool_pairs[n]
+        call_e = pair.get("call")
+        result_e = pair.get("result")
+        if not call_e:
+            continue
+
+        cd = call_e["data"]
+        ts = call_e["timestamp"]
+        tool_name = cd.get("tool_name", "?")
+        phase = cd.get("phase", "other")
+        args = cd.get("args", {})
+        reasoning = cd.get("reasoning", "")
+        phase_color = PHASE_COLORS.get(phase, "white")
+
+        # Print transition marker before the call that triggered it
+        if n in transitions:
+            t = transitions[n]
+            console.print(
+                f"\n  [dim]── phase: [bold]{t['from_phase']}[/bold] → "
+                f"[bold]{t['to_phase']}[/bold]  "
+                f"(call #{t['at_call']}, ${t.get('cost_usd_at_transition', 0):.3f}) ──[/dim]"
+            )
+
+        # Format args as a short string
+        args_str = _fmt_args(tool_name, args, full)
+
+        # Call line
+        console.print(
+            f"  [dim]{n:>2}[/dim]  [{phase_color}]{phase:<8}[/{phase_color}]  "
+            f"[bold white]{tool_name}[/bold white]  [dim]{args_str}[/dim]  "
+            f"[dim]{ts:.1f}s[/dim]"
+        )
+
+        # Reasoning (if present)
+        if reasoning:
+            short = reasoning[:180].replace("\n", " ")
+            console.print(f"       [italic dim]↳ {short}[/italic dim]")
+
+        # Result
+        if result_e:
+            rd = result_e["data"]
+            preview = rd.get("result_preview", rd.get("result", str(rd)))
+            if not full:
+                preview = str(preview)[:200].replace("\n", " ↵ ")
+            ok = not any(x in str(preview).lower() for x in ("error:", "not found", "failed", "usage error"))
+            result_icon = "[green]✓[/green]" if ok else "[red]✗[/red]"
+            dur_ms = rd.get("duration_ms", 0)
+            console.print(f"       {result_icon} [{dur_ms}ms] [dim]{preview}[/dim]")
+
+    # ── Final outcome ─────────────────────────────────────────────────────────
+    console.print()
+    console.print(Rule(style="dim"))
+    escalate_reason = outcome.get("escalate_reason", "")
+    loc_found = outcome.get("localization_found", False)
+    sandbox_ok = outcome.get("sandbox_created", False)
+
+    console.print(
+        f"[bold]Outcome:[/bold] [{status_color}]{status}[/{status_color}]  "
+        f"loc={'[green]HIT[/green]' if loc_found else '[red]MISS[/red]'}  "
+        f"sandbox={'[green]YES[/green]' if sandbox_ok else '[dim]NO[/dim]'}  "
+        f"tests={'[green]PASS[/green]' if tests_ok else ('[yellow]SKIP[/yellow]' if tests_skip else '[red]FAIL[/red]')}"
+    )
+    if escalate_reason:
+        console.print(f"[red]Escalate reason:[/red] {escalate_reason[:200]}")
+
+    # ── Wasted calls ─────────────────────────────────────────────────────────
+    wasted = data.get("wasted_calls", {})
+    if wasted.get("max_grep_streak", 0) > 2:
+        console.print(f"[yellow]⚠ grep streak: {wasted['max_grep_streak']} consecutive greps[/yellow]")
+    if wasted.get("test_attempts", 0) > 2:
+        console.print(f"[yellow]⚠ test attempts: {wasted['test_attempts']} (retry loop?)[/yellow]")
+
+
+def _fmt_args(tool_name: str, args: dict, full: bool) -> str:
+    """Format tool args into a short readable string."""
+    if not args:
+        return ""
+    # Tool-specific formatting
+    if tool_name in ("read_function", "read_file"):
+        fp = args.get("file_path", "")
+        fn = args.get("function_name", "")
+        return f"{fp}::{fn}" if fn else fp
+    if tool_name == "string_replace":
+        fp = args.get("file_path", "")
+        old = args.get("old_string", "")[:60].replace("\n", "↵")
+        new = args.get("new_string", "")[:60].replace("\n", "↵")
+        return f"{fp}  [{old}] → [{new}]" if not full else f"{fp}"
+    if tool_name == "grep_repo":
+        return f"pattern={args.get('pattern', '')!r}"
+    if tool_name == "run_tests":
+        return args.get("test_path", "") or args.get("test_command", "")
+    if tool_name == "record_localization":
+        files = args.get("fault_files", [])
+        return ", ".join(files[:3])
+    if tool_name in ("request_review", "submit_fix"):
+        expl = args.get("explanation", "")[:80].replace("\n", " ")
+        return expl
+    if tool_name == "list_files":
+        return args.get("directory", "")
+    # Default: join all values
+    parts = []
+    for k, v in args.items():
+        if isinstance(v, str) and v:
+            parts.append(f"{v[:50]}")
+        elif isinstance(v, list):
+            parts.append(str(v)[:50])
+    return "  ".join(parts)[:120]
+
+
 @app.command()
 def build(
     repo_path: str = typer.Argument(..., help="Path to any local Git repository"),
@@ -273,6 +556,29 @@ def build(
         console.print(f"  [green]✓[/green] {len(graph_data['nodes'])} nodes, "
                       f"{len(graph_data['edges'])} edges, "
                       f"top hotspot: [bold]{graph_data['hotspots'][0]['label'] if graph_data['hotspots'] else 'n/a'}[/bold]")
+        # Leiden community detection — clusters codebase into named modules
+        # Enables Scout tier: ticket → community in 1 Haiku call instead of full-codebase search
+        progress.update(task, description="[cyan]Running Leiden community detection...", completed=53)
+        try:
+            from graph.community import build_communities, annotate_graph_with_communities
+            communities = build_communities(graph_data)
+            graph_data = annotate_graph_with_communities(graph_data, communities)
+            community_names = [c["name"] for c in communities]
+            console.print(f"  [green]✓[/green] {len(communities)} communities detected: {', '.join(community_names[:6])}"
+                          + (f" +{len(communities)-6} more" if len(communities) > 6 else ""))
+            # Store communities alongside graph.json for community classifier
+            import json as _json_c
+            _comm_out = Path(f"/tmp/context_builder/{repo_name}")
+            _comm_out.mkdir(parents=True, exist_ok=True)
+            (_comm_out / "communities.json").write_text(_json_c.dumps(communities, default=str))
+        except Exception as e:
+            console.print(f"  [dim]  Community detection skipped: {e}[/dim]")
+            communities = []
+
+        # Write graph.json for agent kickstart and dashboard fallback
+        _graph_out = Path(f"/tmp/context_builder/{repo_name}")
+        _graph_out.mkdir(parents=True, exist_ok=True)
+        import json as _json2; (_graph_out / "graph.json").write_text(_json2.dumps(graph_data, default=str))
 
         progress.update(task, description="[cyan]Analyzing git history...", completed=50)
         git_analyzer = GitAnalyzer(path)
@@ -919,6 +1225,177 @@ def _print_hotspots(hotspots: list):
     for i, h in enumerate(hotspots, 1):
         table.add_row(str(i), h["label"], h["type"], f"{h['pagerank']:.4f}")
     console.print(table)
+
+
+@app.command()
+def update(
+    repo_path: str = typer.Argument(..., help="Path to the repo to incrementally update"),
+    name: str = typer.Option(None, "--name", "-n", help="Override repo name"),
+    since: str = typer.Option("", "--since", help="Only re-index files changed since this git ref (e.g. HEAD~1)"),
+):
+    """
+    Incrementally update a repo's knowledge graph — only re-parses changed files.
+
+    Uses SHA-256 content hashing (code-review-graph pattern): compares current file
+    hashes against the stored graph, re-parses only files that changed.
+    <2s re-index for a single-file change vs. 30s+ for a full rebuild.
+
+    Examples:
+        python cli.py update ~/projects/my-api          # Hash-based incremental
+        python cli.py update ~/projects/my-api --since HEAD~3  # Git diff range
+    """
+    import hashlib
+    import json as _json
+    from analyzer.code_parser import CodeParser
+    from analyzer.call_graph import CallGraphBuilder
+
+    path = Path(repo_path).expanduser().resolve()
+    if not path.exists():
+        console.print(f"[red]Error:[/red] Path does not exist: {path}")
+        raise typer.Exit(1)
+
+    repo_name = name or path.name
+    data_dir = Path(f"/tmp/context_builder/{repo_name}")
+
+    graph_path = data_dir / "graph.json"
+    if not graph_path.exists():
+        console.print(f"[yellow]No existing graph for '{repo_name}'. Run 'build' first.[/yellow]")
+        raise typer.Exit(1)
+
+    existing_graph = _json.loads(graph_path.read_text())
+
+    # Build hash index of existing file nodes
+    old_hashes: dict[str, str] = {}
+    for node in existing_graph.get("nodes", []):
+        if node.get("type") == "file":
+            fpath = node.get("file") or node.get("id", "")
+            if fpath and node.get("content_hash"):
+                old_hashes[fpath] = node["content_hash"]
+
+    # Find changed files
+    changed_files: list[str] = []
+
+    if since:
+        # Use git diff for explicit range
+        try:
+            import subprocess as _sp
+            result = _sp.run(
+                ["git", "diff", "--name-only", since, "HEAD"],
+                cwd=str(path), capture_output=True, text=True, timeout=15,
+            )
+            changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
+        except Exception as e:
+            console.print(f"[yellow]git diff failed: {e} — falling back to hash comparison[/yellow]")
+
+    if not changed_files:
+        # Hash-based detection: compare current SHA-256 of each source file
+        src_extensions = {".py", ".js", ".ts", ".tsx", ".jsx", ".java", ".go", ".rs"}
+        for fpath in old_hashes:
+            full = path / fpath
+            if not full.exists():
+                changed_files.append(fpath)  # deleted
+                continue
+            try:
+                content = full.read_bytes()
+                current_hash = hashlib.sha256(content).hexdigest()[:16]
+                if old_hashes[fpath] != current_hash:
+                    changed_files.append(fpath)
+            except Exception:
+                pass
+        # Also detect genuinely new files
+        for ext in src_extensions:
+            for f in path.rglob(f"*{ext}"):
+                try:
+                    rel = str(f.relative_to(path))
+                except ValueError:
+                    continue
+                if rel not in old_hashes:
+                    _skip = ("__pycache__", "node_modules", ".venv", "venv", "dist", "build")
+                    if not any(s in rel for s in _skip):
+                        changed_files.append(rel)
+
+    if not changed_files:
+        console.print(f"[green]No changes detected for '{repo_name}'. Graph is up to date.[/green]")
+        return
+
+    console.print(f"[cyan]Re-indexing {len(changed_files)} changed file(s) for '{repo_name}'...[/cyan]")
+    for f in changed_files[:10]:
+        console.print(f"  [dim]  {f}[/dim]")
+    if len(changed_files) > 10:
+        console.print(f"  [dim]  ... +{len(changed_files) - 10} more[/dim]")
+
+    # Re-parse only changed files
+    parser = CodeParser(path)
+    reparsed = []
+    for fpath in changed_files:
+        full = path / fpath
+        if full.exists():
+            try:
+                parsed = parser.parse_file(full)
+                if parsed:
+                    reparsed.append(parsed)
+            except Exception as e:
+                console.print(f"  [yellow]⚠ Parse error in {fpath}: {e}[/yellow]")
+
+    if not reparsed:
+        console.print("[yellow]No files successfully re-parsed.[/yellow]")
+        return
+
+    # Rebuild partial call graph for changed files
+    cg = CallGraphBuilder(reparsed)
+    new_graph_data = cg.build()
+
+    # Merge: remove old nodes/edges for changed files, add new ones
+    changed_set = set(changed_files)
+    kept_nodes = [
+        n for n in existing_graph.get("nodes", [])
+        if (n.get("file") or n.get("id", "").split("::")[0]) not in changed_set
+    ]
+    kept_edges = [
+        e for e in existing_graph.get("edges", [])
+        if (e.get("source", "").split("::")[0]) not in changed_set
+        and (e.get("target", "").split("::")[0]) not in changed_set
+    ]
+
+    # Add new content hashes to new nodes
+    for node in new_graph_data.get("nodes", []):
+        if node.get("type") == "file":
+            fpath = node.get("file") or node.get("id", "")
+            full = path / fpath
+            if full.exists():
+                try:
+                    content = full.read_bytes()
+                    node["content_hash"] = hashlib.sha256(content).hexdigest()[:16]
+                except Exception:
+                    pass
+
+    merged_graph = {
+        **existing_graph,
+        "nodes": kept_nodes + new_graph_data.get("nodes", []),
+        "edges": kept_edges + new_graph_data.get("edges", []),
+    }
+    merged_graph["stats"] = {
+        **existing_graph.get("stats", {}),
+        "last_updated": str(Path(repo_path).stat().st_mtime),
+        "files_reindexed": len(changed_files),
+    }
+
+    graph_path.write_text(_json.dumps(merged_graph, default=str))
+    console.print(
+        f"[green]✓[/green] Updated: {len(reparsed)} files re-indexed | "
+        f"{len(merged_graph['nodes'])} nodes | {len(merged_graph['edges'])} edges"
+    )
+
+    # Re-embed changed nodes
+    try:
+        from embeddings.embedder import NodeEmbedder, build_enriched_nodes
+        new_enriched = build_enriched_nodes(reparsed, new_graph_data, [], [], [])
+        embedder = NodeEmbedder(repo_name, Path("/tmp/context_builder"))
+        embed_count = embedder.update_embeddings(new_enriched)
+        if embed_count:
+            console.print(f"[green]✓[/green] Updated {embed_count} embeddings in ChromaDB")
+    except Exception as e:
+        console.print(f"[dim]Embeddings update skipped: {e}[/dim]")
 
 
 if __name__ == "__main__":

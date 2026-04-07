@@ -79,23 +79,33 @@ def run_tests(
             except Exception as e:
                 logger.warning("Setup command failed: %s — %s", cmd, e)
 
+        # Determine working directory (test_cwd lets frontend/subproject configs work)
+        test_cwd = agent_config.test_cwd
+        run_dir = (worktree_path / test_cwd) if test_cwd else worktree_path
+
         # Build test command
         if test_cmd_base in ("pytest", "python -m pytest"):
             cmd_parts = [sys.executable, "-m", "pytest"] + test_args
         else:
-            cmd_parts = shlex.split(test_cmd_base)
+            cmd_parts = shlex.split(test_cmd_base) + list(test_args)
 
-        # test_path (from agent) overrides test_pattern (from config)
-        if test_path:
-            cmd_parts.append(test_path)
-        elif test_pattern:
-            cmd_parts.append(test_pattern)
+        # npm/yarn/pnpm: never append a path — the test suite is defined in package.json
+        _npm_runners = ("npm", "yarn", "pnpm", "bun")
+        is_npm = cmd_parts[0] in _npm_runners or (
+            cmd_parts[0] == "npx" and len(cmd_parts) > 1 and "vitest" in cmd_parts[1]
+        )
+        if not is_npm:
+            # test_path (from agent) overrides test_pattern (from config)
+            if test_path:
+                cmd_parts.append(test_path)
+            elif test_pattern:
+                cmd_parts.append(test_pattern)
 
-        logger.info("Running tests (config-driven) in %s: %s", worktree_path, " ".join(cmd_parts))
+        logger.info("Running tests (config-driven) in %s: %s", run_dir, " ".join(cmd_parts))
         try:
             result = subprocess.run(
                 cmd_parts,
-                cwd=str(worktree_path),
+                cwd=str(run_dir),
                 env=env,
                 capture_output=True,
                 text=True,

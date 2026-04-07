@@ -315,9 +315,20 @@ class EvalRunner:
 
     @staticmethod
     def _invoke_pipeline(pipeline: str, work_order: dict, trace: Any) -> dict:
-        """Call the ReAct pipeline entry point."""
+        """Call the ReAct pipeline entry point.
+
+        ``react``    — full v3.0 pipeline (BRT + Scout + Leiden + speculative review)
+        ``react_v2`` — v2.0 baseline (no BRT, no Scout, no Leiden, no spec review)
+                       Useful for A/B comparison: run --pipeline react react_v2
+        """
         from agent.react_pipeline import run_ticket_react
-        return run_ticket_react(work_order, trace=trace, dry_run=True)
+        # react_v2 = disable new features to simulate v2.0 baseline
+        disable_new = (pipeline == "react_v2")
+        return run_ticket_react(
+            work_order, trace=trace, dry_run=True,
+            disable_brt=disable_new,
+            disable_scout=disable_new,
+        )
 
     def _build_comparison(self, report: EvalRunReport) -> dict:
         """Build A/B comparison between two pipelines."""

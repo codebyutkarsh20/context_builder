@@ -45,10 +45,17 @@ class RepoManager:
         Thread-safe: concurrent calls for the same repo will block on the lock.
         Cache-aware: if the repo already exists at the correct SHA, returns immediately.
 
+        Supports local repos via ``local_repo_path`` field in the bug dict.
+        When set, skips cloning and returns the local path directly (after
+        checking out the requested SHA). Useful for eval against the
+        context_builder repo itself.
+
         Parameters
         ----------
         bug : dict
-            EvalBug with repo_url, repo_sha, ticket_id, and optionally repo_name.
+            EvalBug with repo_url, repo_sha, ticket_id, and optionally:
+            - repo_name: short name for cache key
+            - local_repo_path: absolute path to an already-cloned local repo
 
         Returns
         -------
@@ -60,6 +67,42 @@ class RepoManager:
         RuntimeError
             If clone or checkout fails.
         """
+        # Local path shortcut — clone from local dir into cache to avoid touching
+        # the working directory. git clone file:///path is fast (hardlinks on same FS).
+        local_path = bug.get("local_repo_path")
+        if local_path:
+            local_dir = Path(local_path).resolve()
+            if not local_dir.exists():
+                raise RuntimeError(f"local_repo_path does not exist: {local_path}")
+            repo_sha = bug["repo_sha"]
+            ticket_id = bug["ticket_id"]
+            repo_name = bug.get("repo_name", "") or ticket_id.lower()
+            cache_key = f"{repo_name}_local_{repo_sha[:8]}"
+            repo_dir = self.cache_dir / cache_key
+            lock = self._get_lock(cache_key)
+
+            with lock:
+                if repo_dir.exists() and self._verify_sha(repo_dir, repo_sha):
+                    logger.info("Local cache hit: %s at %s", repo_name, repo_sha[:8])
+                    self._reset_repo(repo_dir)
+                    return repo_dir.resolve()
+
+                if repo_dir.exists():
+                    shutil.rmtree(repo_dir, ignore_errors=True)
+
+                logger.info("Cloning local repo %s → %s at %s", local_dir, repo_dir, repo_sha[:8])
+                # Clone from local path (fast — uses hardlinks on same filesystem)
+                subprocess.run(
+                    ["git", "clone", "--quiet", str(local_dir), str(repo_dir)],
+                    check=True, capture_output=True, text=True, timeout=CLONE_TIMEOUT,
+                )
+                subprocess.run(
+                    ["git", "checkout", "--quiet", repo_sha],
+                    cwd=repo_dir, check=True, capture_output=True,
+                    text=True, timeout=CHECKOUT_TIMEOUT,
+                )
+                return repo_dir.resolve()
+
         repo_url = bug["repo_url"]
         repo_sha = bug["repo_sha"]
         ticket_id = bug["ticket_id"]

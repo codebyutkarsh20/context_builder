@@ -223,6 +223,168 @@ def load_business_rules(repo_name: str, fault_files: list[str]) -> str:
     return "".join(sections)
 
 
+def _build_repo_map(graph_data: dict) -> str:
+    """Build directory-grouped file tree from graph.json file nodes. Cap at 60 lines."""
+    from collections import defaultdict
+
+    file_nodes = [n for n in graph_data.get("nodes", []) if n.get("type") == "file"]
+    if not file_nodes:
+        return ""
+
+    _skip = frozenset({"__pycache__", ".git", "node_modules", ".venv", "venv", "dist", "build", ".eggs"})
+    dirs: dict[str, list[str]] = defaultdict(list)
+    for node in file_nodes:
+        fpath = node.get("file") or node.get("id", "")
+        if not fpath:
+            continue
+        parent = str(Path(fpath).parent)
+        if any(s in parent for s in _skip):
+            continue
+        dirs[parent].append(fpath)
+
+    lines: list[str] = []
+    for dir_path in sorted(dirs.keys()):
+        if any(s in dir_path for s in _skip):
+            continue
+        files = sorted(dirs[dir_path])
+        dir_label = dir_path if dir_path != "." else "(root)"
+        lines.append(f"  {dir_label}/")
+        for f in files:
+            lines.append(f"    {Path(f).name}")
+        if len(lines) > 55:
+            remaining = sum(len(v) for v in dirs.values()) - len(lines)
+            if remaining > 0:
+                lines.append(f"    ... ({remaining} more files)")
+            break
+
+    if not lines:
+        return ""
+    return "REPO MAP (directory structure from graph):\n" + "\n".join(lines[:60])
+
+
+def _build_function_locator(
+    graph_data: dict, hint_functions: list[str], hint_files: list[str],
+) -> str:
+    """Map hint function names → file:line from graph nodes. Expands 1 hop via CALLS edges."""
+    if not hint_functions and not hint_files:
+        return ""
+
+    func_nodes = [n for n in graph_data.get("nodes", []) if n.get("type") == "function"]
+    edges = graph_data.get("edges", [])
+    hint_fn_lower = {f.lower() for f in hint_functions}
+    hint_file_set = set(hint_files)
+
+    # Direct matches: name match OR file match
+    matched: dict[str, dict] = {}
+    for node in func_nodes:
+        nid = node.get("id", "")
+        name = node.get("label") or nid.split("::")[-1]
+        if name.lower() in hint_fn_lower or node.get("file") in hint_file_set:
+            matched[nid] = node
+
+    # 1-hop expansion via CALLS edges
+    matched_ids = set(matched.keys())
+    func_by_id = {n.get("id", ""): n for n in func_nodes}
+    hop1: dict[str, dict] = {}
+    for edge in edges:
+        if edge.get("type") != "CALLS":
+            continue
+        src, tgt = edge.get("source", ""), edge.get("target", "")
+        for a, b in ((src, tgt), (tgt, src)):
+            if a in matched_ids and b not in matched_ids and b in func_by_id:
+                hop1[b] = func_by_id[b]
+
+    def _fmt(node: dict, tag: str = "") -> str:
+        nid = node.get("id", "")
+        name = node.get("label") or nid.split("::")[-1]
+        fpath = node.get("file", "?")
+        ls, le = node.get("line_start", ""), node.get("line_end", "")
+        loc = f" (line {ls}-{le})" if ls and le else ""
+        suffix = f"  [{tag}]" if tag else ""
+        return f"  {name} → {fpath}{loc}{suffix}"
+
+    entries: list[str] = [_fmt(n) for n in list(matched.values())[:15]]
+    entries += [_fmt(n, "1-hop") for n in list(hop1.values())[:5]]
+
+    if not entries:
+        return ""
+    return "FUNCTION LOCATOR (hint functions + 1-hop neighbors):\n" + "\n".join(entries[:20])
+
+
+def _build_call_subgraph(
+    graph_data: dict, hint_files: list[str], hint_functions: list[str],
+) -> str:
+    """Pre-filter call graph to 2-hop neighborhood of hint area. Cap at 25 edges."""
+    if not hint_files and not hint_functions:
+        return ""
+
+    edges = graph_data.get("edges", [])
+    hint_file_set = set(hint_files)
+    hint_fn_lower = {f.lower() for f in hint_functions}
+
+    # Build set of node ids that belong to the hint area
+    hint_ids: set[str] = set()
+    for node in graph_data.get("nodes", []):
+        nid = node.get("id", "")
+        name = node.get("label") or nid.split("::")[-1]
+        if node.get("file") in hint_file_set or name.lower() in hint_fn_lower:
+            hint_ids.add(nid)
+    # Also include bare file ids
+    hint_ids.update(hint_file_set)
+
+    _test_markers = ("test_", "/tests/", "/test/", "conftest")
+
+    inbound: list[str] = []
+    outbound: list[str] = []
+    test_links: list[str] = []
+    seen: set[str] = set()
+
+    for edge in edges:
+        etype = edge.get("type", "")
+        if etype not in ("CALLS", "IMPORTS"):
+            continue
+        src, tgt = edge.get("source", ""), edge.get("target", "")
+        src_file = src.split("::")[0]
+        tgt_file = tgt.split("::")[0]
+
+        is_hint_src = src_file in hint_file_set or src in hint_ids
+        is_hint_tgt = tgt_file in hint_file_set or tgt in hint_ids
+        if not is_hint_src and not is_hint_tgt:
+            continue
+
+        key = f"{src}→{tgt}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        src_label = src.split("::")[-1] if "::" in src else src_file
+        tgt_label = tgt.split("::")[-1] if "::" in tgt else tgt_file
+        line = f"  {src_file}::{src_label} —[{etype}]→ {tgt_file}::{tgt_label}"
+
+        is_test = any(m in src.lower() or m in tgt.lower() for m in _test_markers)
+        if is_test:
+            test_links.append(line)
+        elif is_hint_tgt and not is_hint_src:
+            inbound.append(line)
+        elif is_hint_src and not is_hint_tgt:
+            outbound.append(line)
+
+    parts: list[str] = []
+    if inbound:
+        parts.append("  INBOUND (callers of the hint area):")
+        parts.extend(inbound[:10])
+    if outbound:
+        parts.append("  OUTBOUND (what the hint area calls):")
+        parts.extend(outbound[:10])
+    if test_links:
+        parts.append("  TEST COVERAGE (test files touching hint area):")
+        parts.extend(test_links[:5])
+
+    if not parts:
+        return ""
+    return "CALL SUBGRAPH (2-hop around hint area):\n" + "\n".join(parts[:25])
+
+
 def build_kickstart_context(
     repo_name: str, repo_path: str | None, intent: dict, data_dir: Path,
 ) -> str:
@@ -236,6 +398,21 @@ def build_kickstart_context(
         intent.get("actual_behavior", ""),
         intent.get("expected_behavior", ""),
     ]))
+
+    # 0. Pre-built structural context (from stored graph — zero tool calls needed)
+    try:
+        graph_data_for_map, _ = load_graph_data(repo_name)
+        repo_map = _build_repo_map(graph_data_for_map)
+        func_locator = _build_function_locator(graph_data_for_map, hint_functions, hint_files)
+        call_subgraph = _build_call_subgraph(graph_data_for_map, hint_files, hint_functions)
+        orientation_parts = [p for p in [repo_map, func_locator, call_subgraph] if p]
+        if orientation_parts:
+            sections.append(
+                "REPO ORIENTATION (pre-built from stored graph — use this before calling list_files or grep):\n\n"
+                + "\n\n".join(orientation_parts)
+            )
+    except Exception as e:
+        logger.debug("Repo orientation build failed (non-fatal): %s", e)
 
     # 1. Vector search
     try:

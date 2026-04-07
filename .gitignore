@@ -35,3 +35,14 @@ data/
 .claude/
 AGENTS.md
 .gstack/
+
+# Agent runtime lock file
+.agent_lock
+
+# Research / planning docs (not source code)
+AI_Deploy_Agent_v3_Research.md
+PRD.md
+
+# Eval runtime artifacts (cloned repos + result traces)
+backend/eval/repos/
+backend/eval/results/

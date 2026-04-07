@@ -25,7 +25,7 @@ REQUIRED_FIELDS = {
 OPTIONAL_FIELDS = {
     "expected_patch_files", "category", "language", "repo_name",
     "swe_bench_id", "setup_commands", "test_command", "tags", "comments",
-    "estimated_cost_usd",
+    "estimated_cost_usd", "local_repo_path",
 }
 
 VALID_DIFFICULTIES = {"single-file", "multi-file"}
@@ -62,6 +62,7 @@ class EvalBug(TypedDict, total=False):
     tags: list[str]
     comments: list[str]
     estimated_cost_usd: float | None
+    local_repo_path: str | None  # Absolute path to local repo (skips GitHub clone)
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +151,9 @@ def _validate_bug(entry: dict, index: int) -> list[str]:
     if "priority" in entry and entry["priority"] not in VALID_PRIORITIES:
         errors.append(f"{prefix}: priority must be one of {VALID_PRIORITIES}, got '{entry['priority']}'")
 
-    # repo_url format
+    # repo_url format (skip validation for local repos that supply local_repo_path)
     repo_url = entry.get("repo_url", "")
-    if repo_url and not repo_url.startswith("https://github.com/"):
+    if repo_url and not entry.get("local_repo_path") and not repo_url.startswith("https://github.com/"):
         errors.append(f"{prefix}: repo_url must be a GitHub URL, got '{repo_url}'")
 
     # SHA format

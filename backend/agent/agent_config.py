@@ -63,6 +63,11 @@ class AgentConfig:
         """Shell commands to run before tests (e.g., 'pip install -r requirements.txt')."""
         return self._cfg.get("setup_commands", [])
 
+    @property
+    def test_cwd(self) -> str:
+        """Subdirectory (relative to repo root) to run tests from. Empty = repo root."""
+        return self._cfg.get("test_cwd", "")
+
     # ---- Exploration ----
 
     @property

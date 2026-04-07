@@ -120,17 +120,22 @@ def _ab_comparison_section(report: Any) -> str:
         f"|-----|{'------|' * 3}",
     ]
 
-    for entry in per_bug:
-        tid = entry["ticket_id"]
-        r1 = entry.get(p1, {})
-        r2 = entry.get(p2, {})
+    for tid, per_pipeline in per_bug.items():
+        r1 = per_pipeline.get(p1, {})
+        r2 = per_pipeline.get(p2, {})
 
         def _fmt(r: dict) -> str:
             if r.get("pass"):
                 return f"PASS (${r.get('cost', 0):.2f}, {r.get('duration', 0):.0f}s)"
             return "FAIL"
 
-        lines.append(f"| {tid} | {_fmt(r1)} | {_fmt(r2)} | {entry.get('winner', '?')} |")
+        if r1.get("pass") and not r2.get("pass"):
+            winner = p1
+        elif r2.get("pass") and not r1.get("pass"):
+            winner = p2
+        else:
+            winner = "tie"
+        lines.append(f"| {tid} | {_fmt(r1)} | {_fmt(r2)} | {winner} |")
 
     # Delta summary
     deltas = comp.get("deltas", {})
@@ -149,6 +154,8 @@ def _ab_comparison_section(report: Any) -> str:
                 lines.append(f"| {metric} | ${v1:.2f} | ${v2:.2f} | {sign}${delta:.2f} |")
             elif "duration" in metric or "seconds" in metric:
                 lines.append(f"| {metric} | {v1:.0f}s | {v2:.0f}s | {sign}{delta:.0f}s |")
+            elif "tool_calls" in metric or "calls" in metric:
+                lines.append(f"| {metric} | {v1:.1f} | {v2:.1f} | {sign}{delta:.1f} |")
             else:
                 lines.append(f"| {metric} | {v1:.0%} | {v2:.0%} | {sign}{delta:.0%} |")
 

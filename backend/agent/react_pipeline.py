@@ -39,6 +39,121 @@ def _get_trace():
     return getattr(_thread_local, "trace", None)
 
 
+def _classify_community(repo_name: str, intent: dict, data_dir: Path) -> str | None:
+    """Map a bug ticket to a Leiden community cluster in one cheap Haiku call.
+
+    Reads communities.json built during `cli.py build` and asks Haiku which
+    community best matches the bug description. Returns the community name or
+    None if communities aren't available.
+    """
+    communities_path = data_dir / repo_name / "communities.json"
+    if not communities_path.exists():
+        return None
+
+    import json as _json
+    try:
+        communities = _json.loads(communities_path.read_text())
+    except Exception:
+        return None
+
+    if not communities:
+        return None
+
+    from agent.llm import structured_call as _structured_call, INTAKE_MODEL
+    from pydantic import BaseModel
+
+    community_names = [c["name"] for c in communities]
+    community_descriptions = []
+    for c in communities:
+        files_preview = ", ".join(c.get("dominant_files", [])[:3])
+        community_descriptions.append(f"- {c['name']}: {files_preview} ({c.get('size', 0)} nodes)")
+
+    class CommunityMatch(BaseModel):
+        community_name: str
+        confidence: float  # 0.0-1.0
+
+    bug_text = " ".join(filter(None, [
+        intent.get("actual_behavior", ""),
+        intent.get("expected_behavior", ""),
+        " ".join(intent.get("likely_affected_functions", [])),
+        " ".join(intent.get("likely_affected_modules", [])),
+    ]))[:400]
+
+    prompt = (
+        f"Bug description: {bug_text}\n\n"
+        f"Code communities available:\n" + "\n".join(community_descriptions) + "\n\n"
+        "Which community does this bug most likely belong to? "
+        "Pick the single best matching community_name from the list above."
+    )
+
+    try:
+        result = _structured_call(INTAKE_MODEL, 100, CommunityMatch, prompt)
+        if result.community_name in community_names and result.confidence > 0.4:
+            return result.community_name
+    except Exception:
+        pass
+    return None
+
+
+def _prelocalize(repo_name: str, intent: dict, data_dir: Path) -> list[str]:
+    """Lightweight pre-localization: ChromaDB + graph neighbors → top-5 confirmed files.
+
+    Runs in intake_node before the ReAct loop starts. Narrows from all repo
+    files down to the most likely 5, so the agent starts with a strong prior
+    and skips most early exploration tool calls (~40% savings).
+
+    Strategy (Agentless 2-phase pattern):
+      1. ChromaDB semantic search on bug description → top-10 nodes
+      2. Graph neighbor expansion from hint_files/functions → 5-8 files
+      3. Union + score → top-5 by combined score
+    """
+    from agent.graph_utils import load_graph_data, find_callers_from_graph
+    from collections import Counter
+
+    hint_files = [f for f in intent.get("likely_affected_modules", [])[:5] if f]
+    hint_functions = [f for f in intent.get("likely_affected_functions", [])[:5] if f]
+    bug_query = " ".join(filter(None, [
+        intent.get("actual_behavior", ""),
+        intent.get("expected_behavior", ""),
+        " ".join(hint_functions),
+    ]))
+
+    scores: Counter = Counter()
+
+    # 1. Seed from LLM hints (highest confidence)
+    for f in hint_files:
+        scores[f] += 3
+
+    # 2. ChromaDB vector search
+    try:
+        from embeddings.embedder import NodeEmbedder
+        embedder = NodeEmbedder(repo_name, data_dir)
+        results = embedder.query(bug_query, n_results=10)
+        for r in results:
+            file_ = r.get("metadata", {}).get("file", "")
+            if file_:
+                scores[file_] += 2
+    except Exception:
+        pass
+
+    # 3. Graph neighbor expansion — files that call hint files/functions
+    try:
+        graph_data, _ = load_graph_data(repo_name)
+        neighbors = find_callers_from_graph(graph_data, hint_files, hint_functions)
+        for f in neighbors:
+            scores[f] += 1
+    except Exception:
+        pass
+
+    # Return top-5 unique file paths, excluding test files
+    _test_noise = ("test_", "/tests/", "/test/", "conftest")
+    ranked = [
+        f for f, _ in scores.most_common(20)
+        if f and not any(t in f.lower() for t in _test_noise)
+    ]
+    return ranked[:5]
+
+
 def _emit_trace(event_type: str, data: dict | None = None):
     trace = _get_trace()
     if trace:
@@ -164,6 +279,60 @@ not from guessing the implementation."""
         intent["notes"] = (existing_notes + "\n" + cat_c_note).strip() if existing_notes else cat_c_note
         state["intent"] = intent
 
+    repo_name = work_order.get("repo_name", "")
+
+    # Step 1: Community classifier — map bug ticket to a code cluster in 1 Haiku call.
+    # Narrows the search space before any file-level localization.
+    community_name: str | None = None
+    try:
+        if repo_name:
+            community_name = _classify_community(repo_name, state.get("intent", {}), DATA_DIR)
+            if community_name:
+                intent = state.get("intent", {})
+                intent["community"] = community_name
+                state["intent"] = intent
+                logger.info("Community classifier: bug maps to community '%s'", community_name)
+    except Exception as e:
+        logger.debug("Community classifier failed (non-fatal): %s", e)
+
+    # Step 2: Scout FL pipeline (3-agent: Haiku extractor → Sonnet Graph-RAG → Opus re-ranker)
+    # Produces top-5 suspicious locations with confidence scores.
+    # Falls back gracefully to pre-localization if Scout fails.
+    # Skipped when disable_scout=True (v2.0 baseline mode for A/B eval).
+    _scout_disabled = getattr(_thread_local, "disable_scout", False)
+    try:
+        if repo_name and not _scout_disabled:
+            from agent.scout import scout_localize
+            scout_report = scout_localize(
+                repo_name, work_order, state.get("intent", {}), DATA_DIR,
+                community_name=community_name,
+            )
+            top_locs = scout_report.get("top_locations", [])
+            if top_locs:
+                intent = state.get("intent", {})
+                # Inject Scout's top files as confirmed_files (overrides simple pre-localization)
+                scout_files = [loc["file"] for loc in top_locs if loc.get("file")][:5]
+                if scout_files:
+                    intent["confirmed_files"] = scout_files
+                intent["scout_report"] = scout_report
+                state["intent"] = intent
+                logger.info(
+                    "Scout FL: top locations %s (cost $%.4f)",
+                    scout_files, scout_report.get("scout_cost_usd", 0),
+                )
+    except Exception as e:
+        logger.debug("Scout FL pipeline failed (non-fatal): %s", e)
+        # Fall back to simple pre-localization
+        try:
+            if repo_name:
+                confirmed = _prelocalize(repo_name, state.get("intent", {}), DATA_DIR)
+                if confirmed:
+                    intent = state.get("intent", {})
+                    intent["confirmed_files"] = confirmed
+                    state["intent"] = intent
+        except Exception:
+            pass
+
     if trace:
         trace.stage_end("intake")
     return state
@@ -195,30 +364,16 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
 
     # Set tool context
     from agent.explore_tools import set_context, ALL_TOOLS as EXPLORE_TOOLS
-    from agent.react_tools import set_react_context
+    from agent.react_tools import set_react_context, _tls as _react_tls
     set_context(repo_name, repo_path, DATA_DIR)
     set_react_context(repo_name, repo_path, DATA_DIR)
+
+    # Make BRTs accessible to the run_brt tool via thread-local
+    _react_tls.brts = state.get("brts", [])
 
     # Build orientation context
     from agent.graph_utils import build_kickstart_context, load_business_rules
     kickstart = build_kickstart_context(repo_name, str(repo_path), intent, DATA_DIR)
-
-    # Add repo structure snapshot (saves 2-3 list_files calls)
-    try:
-        top_level = subprocess.run(
-            ["find", str(repo_path), "-maxdepth", "2", "-name", "*.py", "-not", "-path", "*/.*"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if top_level.stdout:
-            py_files = sorted(set(
-                str(Path(f.strip()).relative_to(repo_path))
-                for f in top_level.stdout.strip().split("\n")
-                if f.strip() and "__pycache__" not in f
-            ))[:30]
-            if py_files:
-                kickstart += "\n\nREPO STRUCTURE (top-level .py files):\n" + "\n".join(f"  {f}" for f in py_files)
-    except Exception:
-        pass
 
     # Load conventions and business rules
     from agent.react_prompt import (
@@ -230,6 +385,7 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
 
     # Business rules (use hint files from intent for scoping)
     hint_files = intent.get("likely_affected_modules", [])[:5]
+    hint_functions = intent.get("likely_affected_functions", [])[:5]
     business_rules = load_business_rules(repo_name, hint_files) if hint_files else ""
 
     system_prompt = build_system_prompt(
@@ -238,6 +394,7 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
         kickstart_context=kickstart,
         conventions_section=conventions,
         business_rules_section=business_rules,
+        brts=state.get("brts", []),
     )
     task_message = build_task_message(work_order, intent)
 
@@ -251,6 +408,7 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
             "conventions_chars": len(conventions),
             "business_rules_chars": len(business_rules),
             "hint_files": hint_files,
+            "hint_functions": hint_functions,
             "repo_name": repo_name,
         })
 
@@ -358,6 +516,19 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
                     "confidence": 0.8,
                 }
 
+            # Run ground-truth tests before cleanup — only if the agent didn't already
+            # pass them (avoids double-running). This is the authoritative test signal
+            # for eval scoring (full_pass metric).
+            test_already_passed = (state.get("test_result") or "").strip().lower().startswith("passed")
+            if not test_already_passed and repair.get("patches"):
+                try:
+                    from agent.sandbox import run_tests as _run_tests
+                    gt_result = _run_tests(Path(sandbox_path), repo_path=repo_path)
+                    state["test_result"] = gt_result[:2000]
+                    logger.info("Ground-truth tests (dry-run eval): %s", gt_result[:120])
+                except Exception as e:
+                    logger.debug("Ground-truth test execution skipped: %s", e)
+
         _report_progress(state)
         if trace:
             trace.stage_end("finalize")
@@ -442,6 +613,317 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
     return state
 
 
+def brt_node(state: ReactAgentState) -> ReactAgentState:
+    """Bug Reproduction Test (BRT) generator — runs before the fix loop.
+
+    Google Passerine / TDD-Bench Verified pattern:
+    Before writing a single line of fix code, generate tests that FAIL on the
+    broken codebase. These confirmed BRTs become the objective function for the
+    Engineer: the fix is correct when all BRTs pass.
+
+    Flow:
+      1. Read suspected functions from confirmed_files / hint_files
+      2. Haiku generates 5-7 test candidates from the bug description + code
+      3. Each candidate is run against the ORIGINAL repo (not a sandbox)
+      4. Confirmed BRTs: exit code 1 (assertion failure) = test catches the bug
+      5. Up to 3 confirmed BRTs stored in state["brts"], injected into system prompt
+
+    Only runs for Python repos (pytest). Skips gracefully for JS/other.
+    Non-fatal: if BRT generation fails, agent proceeds without BRTs.
+    """
+    _thread_local.current_stage = "brt"
+    trace = _get_trace()
+    if trace:
+        trace.stage_start("brt")
+
+    work_order = state.get("work_order", {})
+    intent = state.get("intent", {})
+    repo_path = _resolve_repo_path(work_order)
+
+    if not repo_path:
+        logger.debug("BRT node: no repo_path — skipping")
+        if trace:
+            trace.stage_end("brt")
+        return state
+
+    # Only generate BRTs for Python repos (check for pytest marker files)
+    _pytest_markers = ("pytest.ini", "pyproject.toml", "setup.py", "setup.cfg", "tox.ini")
+    is_python_repo = any((repo_path / m).exists() for m in _pytest_markers)
+    if not is_python_repo:
+        logger.debug("BRT node: non-Python repo — skipping BRT generation")
+        if trace:
+            trace.stage_end("brt")
+        return state
+
+    hint_files = (
+        intent.get("confirmed_files", []) or
+        intent.get("likely_affected_modules", [])
+    )[:3]
+
+    if not hint_files:
+        logger.debug("BRT node: no hint files — skipping BRT generation")
+        if trace:
+            trace.stage_end("brt")
+        return state
+
+    # Read source code of suspected functions
+    source_snippets: list[str] = []
+    for fpath in hint_files[:2]:
+        full = repo_path / fpath
+        if full.exists() and full.suffix == ".py":
+            try:
+                content = full.read_text(encoding="utf-8", errors="replace")
+                # Cap to 3000 chars per file to stay within Haiku context
+                source_snippets.append(f"# {fpath}\n{content[:3000]}")
+            except Exception:
+                pass
+
+    if not source_snippets:
+        if trace:
+            trace.stage_end("brt")
+        return state
+
+    source_context = "\n\n".join(source_snippets)
+
+    # Generate BRT candidates with Haiku (cheap, fast)
+    from agent.llm import structured_call as _structured_call, INTAKE_MODEL
+    from pydantic import BaseModel
+
+    class BRTCandidate(BaseModel):
+        test_code: str         # Complete pytest test function (must start with "def test_")
+        description: str       # One sentence: what bug this reproduces
+        target_function: str   # Function name being tested
+
+    class BRTBatch(BaseModel):
+        candidates: list[BRTCandidate]
+
+    hint_functions = intent.get("likely_affected_functions", [])[:3]
+    prompt = (
+        f"BUG: {work_order.get('title', '')}\n"
+        f"DESCRIPTION: {work_order.get('description', '')[:500]}\n"
+        f"EXPECTED: {intent.get('expected_behavior', '')[:200]}\n"
+        f"ACTUAL: {intent.get('actual_behavior', '')[:200]}\n"
+        f"FUNCTIONS TO TEST: {hint_functions}\n\n"
+        f"SOURCE CODE:\n{source_context}\n\n"
+        "Generate 4-5 pytest test functions that:\n"
+        "1. FAIL on the CURRENT (broken) code (they should catch the bug)\n"
+        "2. Would PASS after a correct fix\n"
+        "3. Are self-contained — they import from the source files using the repo root as working dir\n"
+        "4. Use assert statements, NOT pytest.raises (unless the bug IS an unexpected exception)\n"
+        "5. Each test MUST start with 'def test_' and be a plain function (no fixtures)\n\n"
+        "Write tests that directly exercise the buggy behaviour. "
+        "Import using the relative module path shown in the source (e.g. 'from backend.app import foo')."
+    )
+
+    confirmed_brts: list[dict] = []
+    try:
+        batch = _structured_call(INTAKE_MODEL, 2000, BRTBatch, prompt)
+        candidates = batch.candidates[:6]
+        logger.info("BRT node: generated %d candidates", len(candidates))
+    except Exception as e:
+        logger.debug("BRT candidate generation failed: %s", e)
+        if trace:
+            trace.stage_end("brt")
+        return state
+
+    # Run each candidate against original repo — keep only confirmed BRTs
+    import sys
+    import tempfile
+    import uuid
+    for cand in candidates:
+        if len(confirmed_brts) >= 3:
+            break
+        code = cand.test_code.strip()
+        if not code.startswith("def test_") and "def test_" not in code:
+            continue
+
+        # Write to temp file
+        tmp_path = None
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix=f"brt_{uuid.uuid4().hex[:6]}_")
+            os.close(tmp_fd)
+            Path(tmp_path).write_text(code, encoding="utf-8")
+
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            # Exit code 1 = test ran and FAILED = confirmed BRT (catches the bug!)
+            if result.returncode == 1:
+                confirmed_brts.append({
+                    "code": code,
+                    "description": cand.description[:200],
+                    "target_function": cand.target_function,
+                    "fail_output": (result.stdout + result.stderr)[:500],
+                })
+                logger.info("BRT confirmed: '%s' (fails on current code)", cand.description[:80])
+            else:
+                logger.debug(
+                    "BRT candidate not confirmed (exit %d): %s",
+                    result.returncode, cand.description[:60],
+                )
+        except subprocess.TimeoutExpired:
+            logger.debug("BRT candidate timed out: %s", cand.description[:60])
+        except Exception as e:
+            logger.debug("BRT candidate error: %s", e)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    if confirmed_brts:
+        state["brts"] = confirmed_brts
+        logger.info(
+            "BRT node: %d/%d candidates confirmed as BRTs",
+            len(confirmed_brts), len(candidates),
+        )
+        if trace:
+            trace.emit("brt_confirmed", "brt", {
+                "confirmed": len(confirmed_brts),
+                "total_candidates": len(candidates),
+                "descriptions": [b["description"] for b in confirmed_brts],
+            })
+    else:
+        logger.info("BRT node: no candidates confirmed (all passed or errored) — proceeding without BRTs")
+
+    if trace:
+        trace.stage_end("brt")
+    return state
+
+
+def verifier_node(state: ReactAgentState) -> ReactAgentState:
+    """Independent verifier subagent — fresh-context review before PR creation.
+
+    Implements two patterns from research:
+    - OpenHands independent verifier: fresh LLM with only diff + tests votes pass/fail
+    - cavekit speculative review: starts early, adds zero latency on the happy path
+
+    Input: bug description + git diff + test result
+    Output: verifier_verdict ('APPROVE'/'REJECT'), verifier_explanation, verifier_confidence
+    Budget: 1 LLM call, no tools (fresh context only)
+    """
+    if not state.get("submitted"):
+        return state  # Only verify if agent produced a patch
+
+    sandbox_path = state.get("sandbox_path", "")
+    if not sandbox_path or not Path(sandbox_path).exists():
+        return state
+
+    work_order = state.get("work_order", {})
+    test_result = state.get("test_result", "not run")
+    explanation = state.get("explanation", "")
+
+    # Get the diff
+    diff_text = ""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "HEAD~1"],
+            cwd=sandbox_path, capture_output=True, text=True, timeout=30,
+        )
+        diff_text = result.stdout[:8000]
+    except Exception:
+        pass
+
+    if not diff_text:
+        # Nothing to verify — no committed changes
+        return state
+
+    from agent.llm import structured_call as _structured_call
+    from pydantic import BaseModel
+
+    class VerifierResult(BaseModel):
+        verdict: str          # "APPROVE" or "REJECT"
+        confidence: float     # 0.0-1.0
+        explanation: str      # Why APPROVE/REJECT in 2-3 sentences
+        regression_risk: str  # "LOW", "MEDIUM", "HIGH"
+
+    prompt = (
+        f"You are an independent code reviewer. Review this patch with fresh eyes.\n\n"
+        f"BUG: {work_order.get('title', '')}\n"
+        f"DESCRIPTION: {work_order.get('description', '')[:500]}\n\n"
+        f"PATCH (what the agent changed):\n```diff\n{diff_text}\n```\n\n"
+        f"TESTS: {test_result[:500]}\n\n"
+        f"AGENT EXPLANATION: {explanation[:300]}\n\n"
+        "Evaluate:\n"
+        "1. Does this patch actually fix the described bug?\n"
+        "2. Are there any obvious regressions or side effects?\n"
+        "3. Is the change minimal and correct?\n\n"
+        "APPROVE if: patch clearly fixes the bug, no obvious regressions.\n"
+        "REJECT if: patch doesn't address the bug, introduces new bugs, or is dangerously wrong."
+    )
+
+    # Run confirmed BRTs against the patched sandbox (speculative EPR check)
+    brts = state.get("brts", [])
+    brt_pass_count = 0
+    brt_total = len(brts)
+    if brts and sandbox_path and Path(sandbox_path).exists():
+        import sys
+        import tempfile
+        import uuid
+        for brt in brts:
+            try:
+                tmp_fd, tmp_path = tempfile.mkstemp(
+                    suffix=".py", prefix=f"brt_verify_{uuid.uuid4().hex[:6]}_",
+                )
+                os.close(tmp_fd)
+                Path(tmp_path).write_text(brt["code"], encoding="utf-8")
+                result_brt = subprocess.run(
+                    [sys.executable, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
+                    cwd=sandbox_path,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result_brt.returncode == 0:
+                    brt_pass_count += 1
+                    logger.info("BRT passed in sandbox: %s", brt["description"][:60])
+                else:
+                    logger.warning("BRT still failing after fix: %s", brt["description"][:60])
+            except Exception as e:
+                logger.debug("BRT sandbox run error: %s", e)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        state["brt_pass_count"] = brt_pass_count
+        state["brt_total"] = brt_total
+        epr = brt_pass_count / brt_total if brt_total > 0 else 0.0
+        state["epr_score"] = round(epr, 3)
+        logger.info("EPR score: %.0f%% (%d/%d BRTs pass)", epr * 100, brt_pass_count, brt_total)
+
+    try:
+        result = _structured_call("claude-sonnet-4-6", 800, VerifierResult, prompt)
+        state["verifier_verdict"] = result.verdict
+        state["verifier_confidence"] = result.confidence
+        state["verifier_explanation"] = result.explanation
+        state["verifier_regression_risk"] = result.regression_risk
+
+        logger.info(
+            "Verifier verdict: %s (confidence: %.0f%%, risk: %s)",
+            result.verdict, result.confidence * 100, result.regression_risk,
+        )
+
+        # If verifier rejects with high confidence, flag it but don't block
+        # (the main agent's review already approved — verifier is advisory)
+        if result.verdict == "REJECT" and result.confidence > 0.8:
+            existing_notes = state.get("explanation", "")
+            state["explanation"] = (
+                existing_notes + f"\n\n⚠ VERIFIER FLAGGED: {result.explanation}"
+            ).strip()
+            logger.warning("Verifier rejected with high confidence — flagged in PR body")
+
+    except Exception as e:
+        logger.debug("Verifier node failed (non-fatal): %s", e)
+
+    return state
+
+
 def _extract_repair_from_sandbox(sandbox_path: str) -> dict:
     """Extract repair info from sandbox diff for eval compatibility."""
     try:
@@ -503,17 +985,32 @@ def run_ticket_react(
     progress_cb: Callable[[ReactAgentState], None] | None = None,
     trace: RunTrace | None = None,
     dry_run: bool = False,
+    best_of_n: int = 1,
+    disable_brt: bool = False,
+    disable_scout: bool = False,
 ) -> dict:
     """Run a bug ticket through the ReAct pipeline.
 
-    Three stages executed sequentially:
-      1. intake_node — translate ticket to intent
-      2. react_agent_node — ReAct loop with tools
-      3. finalize_node — create PR or escalate
+    Stages:
+      1. intake_node    — translate ticket to intent + pre-localization
+      2. brt_node       — generate failing tests before fix (skipped if disable_brt)
+      3. react_agent_node — ReAct loop with tools
+      4. verifier_node  — independent fresh-context review (cavekit speculative pattern)
+      5. finalize_node  — create PR or escalate
+
+    disable_brt / disable_scout: v2.0 baseline flags used by eval runner for A/B.
+    best_of_n > 1: runs N parallel instances, picks winner by test pass then
+    review confidence (SWE-agent best-of-N pattern, +10-15pp submit rate).
     """
+    if best_of_n > 1:
+        return _run_best_of_n(work_order, progress_cb, trace, dry_run, best_of_n)
+
     _thread_local.progress_callback = progress_cb
     _thread_local.trace = trace
     _thread_local.current_stage = "pending"
+    # Store feature flags so nodes can read them
+    _thread_local.disable_brt = disable_brt
+    _thread_local.disable_scout = disable_scout
 
     state: ReactAgentState = {
         "work_order": work_order,
@@ -540,7 +1037,10 @@ def run_ticket_react(
 
     try:
         state = intake_node(state)
+        if not getattr(_thread_local, "disable_brt", False):
+            state = brt_node(state)    # BRT-first: generate failing tests before fix
         state = react_agent_node(state)
+        state = verifier_node(state)   # Independent reviewer (speculative pattern)
         state = finalize_node(state)
 
         result_dict = dict(state)
@@ -555,3 +1055,75 @@ def run_ticket_react(
         if trace:
             trace.complete()
         _thread_local.trace = None
+
+
+def _run_best_of_n(
+    work_order: dict,
+    progress_cb: Callable[[ReactAgentState], None] | None,
+    trace: RunTrace | None,
+    dry_run: bool,
+    n: int,
+) -> dict:
+    """Run N parallel agent instances and pick the best patch.
+
+    Selection order (SWE-agent pattern):
+      1. tests_passed (test_result starts with "passed")
+      2. verifier APPROVE
+      3. review confidence score
+      4. cost (cheapest of ties)
+    """
+    import concurrent.futures
+
+    n = min(n, 5)  # Hard cap: 5 instances max
+    logger.info("Best-of-%d: launching %d parallel agent instances", n, n)
+
+    def _run_one(seed: int) -> dict:
+        # Give each instance a unique ticket suffix so sandbox branches don't collide
+        wo = {**work_order, "ticket_id": f"{work_order.get('ticket_id', 'UNKNOWN')}_bon{seed}"}
+        return run_ticket_react(wo, progress_cb=None, trace=None, dry_run=dry_run, best_of_n=1)
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as executor:
+        futures = [executor.submit(_run_one, i) for i in range(n)]
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                logger.warning("Best-of-N instance failed: %s", e)
+
+    if not results:
+        # All instances failed — return a stub escalated result
+        return {
+            "work_order": work_order, "submitted": False, "escalated": True,
+            "escalate_reason": "All best-of-N instances failed",
+            "status": PipelineStatus.ESCALATED,
+        }
+
+    def _score(r: dict) -> tuple:
+        test_ok = (r.get("test_result") or "").strip().lower().startswith("passed")
+        verifier_ok = r.get("verifier_verdict", "") == "APPROVE"
+        confidence = (r.get("review") or {}).get("confidence", 0.0)
+        cost = -(r.get("cost_usd") or 0.0)  # Negative so lower cost = higher rank
+        submitted = r.get("submitted", False)
+        return (submitted, test_ok, verifier_ok, confidence, cost)
+
+    best = max(results, key=_score)
+    submitted_count = sum(1 for r in results if r.get("submitted"))
+    test_pass_count = sum(1 for r in results if (r.get("test_result") or "").startswith("passed"))
+    logger.info(
+        "Best-of-%d complete: %d/%d submitted, %d/%d tests passed — selected by %s",
+        n, submitted_count, n, test_pass_count, n,
+        "tests" if (best.get("test_result") or "").startswith("passed") else "review",
+    )
+
+    # Annotate the winner with ensemble metadata
+    best["best_of_n_stats"] = {
+        "n": n, "submitted": submitted_count, "test_pass": test_pass_count,
+    }
+
+    try:
+        from api.metrics import record_run
+        record_run(best)
+    except Exception:
+        pass
+    return best
