@@ -748,40 +748,44 @@ def brt_node(state: ReactAgentState) -> ReactAgentState:
         if not code.startswith("def test_") and "def test_" not in code:
             continue
 
+        tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
                 suffix=".py", prefix="brt_", dir=str(repo_path), mode="w",
-                encoding="utf-8", delete=True,
+                encoding="utf-8", delete=False,
             ) as tmp:
                 tmp.write(code)
-                tmp.flush()
+                tmp_path = tmp.name
+            # File is closed before subprocess reads it (avoids TOCTOU race)
+            result = subprocess.run(
+                [repo_python, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
 
-                result = subprocess.run(
-                    [repo_python, "-m", "pytest", tmp.name, "--tb=short", "-x", "-q", "--no-header"],
-                    cwd=str(repo_path),
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
+            # Exit code 1 = test ran and FAILED = confirmed BRT (catches the bug!)
+            if result.returncode == 1:
+                confirmed_brts.append({
+                    "code": code,
+                    "description": cand.description[:200],
+                    "target_function": cand.target_function,
+                    "fail_output": (result.stdout + result.stderr)[:500],
+                })
+                logger.info("BRT confirmed: '%s' (fails on current code)", cand.description[:80])
+            else:
+                logger.debug(
+                    "BRT candidate not confirmed (exit %d): %s",
+                    result.returncode, cand.description[:60],
                 )
-
-                # Exit code 1 = test ran and FAILED = confirmed BRT (catches the bug!)
-                if result.returncode == 1:
-                    confirmed_brts.append({
-                        "code": code,
-                        "description": cand.description[:200],
-                        "target_function": cand.target_function,
-                        "fail_output": (result.stdout + result.stderr)[:500],
-                    })
-                    logger.info("BRT confirmed: '%s' (fails on current code)", cand.description[:80])
-                else:
-                    logger.debug(
-                        "BRT candidate not confirmed (exit %d): %s",
-                        result.returncode, cand.description[:60],
-                    )
         except subprocess.TimeoutExpired:
             logger.debug("BRT candidate timed out: %s", cand.description[:60])
         except Exception as e:
             logger.debug("BRT candidate error: %s", e)
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
 
     if confirmed_brts:
         state["brts"] = confirmed_brts
@@ -872,25 +876,30 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
         import tempfile
         sandbox_python = _find_repo_python(Path(sandbox_path))
         for brt in brts:
+            tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(
                     suffix=".py", prefix="brt_verify_", dir=sandbox_path,
-                    mode="w", encoding="utf-8", delete=True,
+                    mode="w", encoding="utf-8", delete=False,
                 ) as tmp:
                     tmp.write(brt["code"])
-                    tmp.flush()
-                    result_brt = subprocess.run(
-                        [sandbox_python, "-m", "pytest", tmp.name, "--tb=short", "-x", "-q", "--no-header"],
-                        cwd=sandbox_path,
-                        capture_output=True, text=True, timeout=30,
-                    )
-                    if result_brt.returncode == 0:
-                        brt_pass_count += 1
-                        logger.info("BRT passed in sandbox: %s", brt["description"][:60])
-                    else:
-                        logger.warning("BRT still failing after fix: %s", brt["description"][:60])
+                    tmp_path = tmp.name
+                # File closed before subprocess reads it
+                result_brt = subprocess.run(
+                    [sandbox_python, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
+                    cwd=sandbox_path,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result_brt.returncode == 0:
+                    brt_pass_count += 1
+                    logger.info("BRT passed in sandbox: %s", brt["description"][:60])
+                else:
+                    logger.warning("BRT still failing after fix: %s", brt["description"][:60])
             except Exception as e:
                 logger.debug("BRT sandbox run error: %s", e)
+            finally:
+                if tmp_path:
+                    Path(tmp_path).unlink(missing_ok=True)
 
         state["brt_pass_count"] = brt_pass_count
         state["brt_total"] = brt_total
