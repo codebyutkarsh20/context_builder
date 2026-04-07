@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import logging
 import signal
+import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -554,9 +556,17 @@ def scout_localize(
 
     # -------------------------------------------------------------------
     # Aggregate timeout: abort the pipeline after _SCOUT_TIMEOUT_SECONDS
+    # signal.SIGALRM is Unix-only and must run in the main thread.
     # -------------------------------------------------------------------
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(_SCOUT_TIMEOUT_SECONDS)
+    _can_alarm = (
+        sys.platform != "win32"
+        and hasattr(signal, "SIGALRM")
+        and threading.current_thread() is threading.main_thread()
+    )
+    old_handler = None
+    if _can_alarm:
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(_SCOUT_TIMEOUT_SECONDS)
     try:
         # ---------------------------------------------------------------
         # Load graph data once (shared by all agents)
@@ -687,8 +697,9 @@ def scout_localize(
             _SCOUT_TIMEOUT_SECONDS,
         )
     finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+        if _can_alarm:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
     # -----------------------------------------------------------------------
     # Assemble final report (uses whatever partial results are available)
