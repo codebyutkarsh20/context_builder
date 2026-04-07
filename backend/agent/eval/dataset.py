@@ -18,14 +18,16 @@ logger = logging.getLogger(__name__)
 
 REQUIRED_FIELDS = {
     "ticket_id", "title", "description", "repo_url", "repo_sha",
-    "fix_sha", "expected_files", "expected_root_cause", "difficulty",
+    "expected_files", "expected_root_cause", "difficulty",
     "source", "priority",
 }
+
+OPTIONAL_FIELDS_CORE = {"fix_sha"}  # present in internal bugs, absent in SWE-bench
 
 OPTIONAL_FIELDS = {
     "expected_patch_files", "category", "language", "repo_name",
     "swe_bench_id", "setup_commands", "test_command", "tags", "comments",
-    "estimated_cost_usd", "local_repo_path",
+    "estimated_cost_usd", "local_repo_path", "fail_to_pass", "pass_to_pass",
 }
 
 VALID_DIFFICULTIES = {"single-file", "multi-file"}
@@ -287,13 +289,26 @@ def _swe_bench_to_eval_bug(entry: dict) -> EvalBug | None:
         # Derive category heuristically from problem statement
         category = _guess_category(problem)
 
+        # Build test_command from FAIL_TO_PASS test IDs (ground-truth verification)
+        fail_to_pass = entry.get("FAIL_TO_PASS", "[]")
+        if isinstance(fail_to_pass, str):
+            try:
+                fail_to_pass = json.loads(fail_to_pass)
+            except Exception:
+                fail_to_pass = []
+        test_command = None
+        if fail_to_pass:
+            # Cap at 5 tests to keep command short; -x stops on first failure
+            test_ids = " ".join(fail_to_pass[:5])
+            test_command = f"pytest {test_ids} -x --no-header -rN -q"
+
         return {
             "ticket_id": instance_id,
             "title": _extract_title(problem),
             "description": problem,
             "repo_url": f"https://github.com/{repo_slug}",
             "repo_sha": entry.get("base_commit", ""),
-            "fix_sha": entry.get("base_commit", ""),  # SWE-bench doesn't always give fix SHA
+            "fix_sha": "",  # SWE-bench fix is in the patch field, not a SHA
             "expected_files": patched_files,
             "expected_patch_files": patched_files,
             "expected_root_cause": _extract_keywords(problem),
@@ -305,7 +320,9 @@ def _swe_bench_to_eval_bug(entry: dict) -> EvalBug | None:
             "repo_name": repo_slug.split("/")[-1],
             "swe_bench_id": instance_id,
             "setup_commands": ["pip install -e ."],
-            "test_command": None,
+            "test_command": test_command,
+            "fail_to_pass": fail_to_pass,
+            "pass_to_pass": entry.get("PASS_TO_PASS", []),
             "tags": [],
             "comments": [],
             "estimated_cost_usd": None,
