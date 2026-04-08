@@ -536,6 +536,126 @@ def get_trace_report(job_id: str) -> dict:
     raise HTTPException(status_code=404, detail="Trace report not found")
 
 
+def _load_trace_report(job_id: str) -> dict:
+    """Load a trace report from memory or disk."""
+    with _agent_jobs_lock:
+        job = _agent_jobs.get(job_id)
+        if job:
+            trace = job.get("_trace")
+            if trace:
+                return trace.to_report()
+
+    report_path = DATA_DIR / "traces" / f"{job_id}.json"
+    if report_path.exists():
+        return json.loads(report_path.read_text())
+
+    raise HTTPException(status_code=404, detail=f"Trace report not found for job {job_id}")
+
+
+@router.get("/agent/trace/{job_id_a}/compare/{job_id_b}")
+def compare_traces(job_id_a: str, job_id_b: str) -> dict:
+    """Compare two trace reports side-by-side for prompt/tool iteration.
+
+    Returns structured diff: summary deltas, tool call sequences, phase
+    breakdown differences, cost comparison, and prompt diff metadata.
+    """
+    report_a = _load_trace_report(job_id_a)
+    report_b = _load_trace_report(job_id_b)
+
+    sum_a = report_a.get("summary", {})
+    sum_b = report_b.get("summary", {})
+
+    # Summary deltas
+    summary_diff = {}
+    for key in ["total_llm_calls", "total_tool_calls", "total_input_tokens",
+                "total_output_tokens", "total_cost_usd", "total_events"]:
+        val_a = sum_a.get(key, 0)
+        val_b = sum_b.get(key, 0)
+        summary_diff[key] = {"a": val_a, "b": val_b, "delta": round(val_b - val_a, 6)}
+
+    # Duration delta
+    dur_a = report_a.get("total_duration_ms", 0)
+    dur_b = report_b.get("total_duration_ms", 0)
+    summary_diff["total_duration_ms"] = {"a": dur_a, "b": dur_b, "delta": dur_b - dur_a}
+
+    # Phase breakdown comparison
+    phase_a = report_a.get("phase_breakdown", {})
+    phase_b = report_b.get("phase_breakdown", {})
+    all_phases = sorted(set(list(phase_a.keys()) + list(phase_b.keys())))
+    phase_diff = {}
+    for phase in all_phases:
+        pa = phase_a.get(phase, {})
+        pb = phase_b.get(phase, {})
+        phase_diff[phase] = {
+            "tool_calls": {"a": pa.get("tool_calls", 0), "b": pb.get("tool_calls", 0)},
+            "tools_used_a": pa.get("tools_used", []),
+            "tools_used_b": pb.get("tools_used", []),
+        }
+
+    # Tool call sequence comparison (just names + phases for alignment)
+    def extract_tool_sequence(events: list[dict]) -> list[dict]:
+        return [
+            {
+                "call_number": e["data"].get("call_number", 0),
+                "tool_name": e["data"].get("tool_name", ""),
+                "phase": e["data"].get("phase", ""),
+                "timestamp": e.get("timestamp", 0),
+            }
+            for e in events if e.get("event_type") == "tool_call"
+        ]
+
+    seq_a = extract_tool_sequence(report_a.get("events", []))
+    seq_b = extract_tool_sequence(report_b.get("events", []))
+
+    # Outcome comparison
+    outcome_a = report_a.get("run_outcome", {})
+    outcome_b = report_b.get("run_outcome", {})
+
+    # Prompt diff metadata — check if system prompts differ
+    prompt_a = None
+    prompt_b = None
+    prompt_changed = False
+    git_sha_a = ""
+    git_sha_b = ""
+    for e in report_a.get("events", []):
+        if e.get("event_type") == "prompt_build":
+            prompt_a = e["data"].get("system_prompt_text")
+            git_sha_a = e["data"].get("agent_git_sha", "")
+            break
+    for e in report_b.get("events", []):
+        if e.get("event_type") == "prompt_build":
+            prompt_b = e["data"].get("system_prompt_text")
+            git_sha_b = e["data"].get("agent_git_sha", "")
+            break
+
+    if prompt_a is not None and prompt_b is not None:
+        prompt_changed = prompt_a != prompt_b
+
+    # Wasted calls comparison
+    wasted_a = report_a.get("wasted_calls", {})
+    wasted_b = report_b.get("wasted_calls", {})
+
+    return {
+        "job_id_a": job_id_a,
+        "job_id_b": job_id_b,
+        "summary_diff": summary_diff,
+        "phase_diff": phase_diff,
+        "tool_sequence_a": seq_a,
+        "tool_sequence_b": seq_b,
+        "outcome_a": outcome_a,
+        "outcome_b": outcome_b,
+        "prompt_diff": {
+            "changed": prompt_changed,
+            "git_sha_a": git_sha_a,
+            "git_sha_b": git_sha_b,
+            "chars_a": len(prompt_a) if prompt_a else 0,
+            "chars_b": len(prompt_b) if prompt_b else 0,
+        },
+        "wasted_calls_a": wasted_a,
+        "wasted_calls_b": wasted_b,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pipeline runner
 # ---------------------------------------------------------------------------

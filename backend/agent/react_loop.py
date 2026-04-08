@@ -139,6 +139,19 @@ def react_loop(
         # Emit llm_request BEFORE calling LLM — captures what the model sees
         context_tokens = count_tokens_approx(messages)
         if trace:
+            # Capture full message contents for replay/debugging
+            messages_snapshot = []
+            for m in messages:
+                role = type(m).__name__
+                content = m.content
+                if isinstance(content, list):
+                    # SystemMessage with cache_control blocks — extract text
+                    text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                    content = "\n".join(text_parts) if text_parts else str(content)
+                elif not isinstance(content, str):
+                    content = str(content)
+                messages_snapshot.append({"role": role, "content": content})
+
             trace.emit("llm_request", "react_loop", {
                 "model": REACT_MODEL,
                 "message_count": len(messages),
@@ -147,6 +160,7 @@ def react_loop(
                 "tool_call_count": gs.tool_call_count,
                 "cost_usd_so_far": round(gs.cost_usd, 6),
                 "phase": current_phase,
+                "messages": messages_snapshot,
             })
 
         # Call the LLM
@@ -167,6 +181,23 @@ def react_loop(
         gs.cost_usd += call_cost
 
         if trace:
+            # Capture full response content for replay/debugging
+            response_text = ""
+            if isinstance(response.content, str):
+                response_text = response.content
+            elif isinstance(response.content, list):
+                text_blocks = [b.get("text", "") for b in response.content if isinstance(b, dict) and b.get("type") == "text"]
+                response_text = "\n".join(text_blocks)
+
+            response_tool_calls = []
+            if response.tool_calls:
+                for tc in response.tool_calls:
+                    response_tool_calls.append({
+                        "name": tc["name"],
+                        "args": tc["args"],
+                        "id": tc["id"],
+                    })
+
             trace.emit("llm_response", "react_loop", {
                 "model": REACT_MODEL,
                 "input_tokens": input_tokens,
@@ -178,6 +209,8 @@ def react_loop(
                 "tool_calls": len(response.tool_calls) if response.tool_calls else 0,
                 "tool_call_count": gs.tool_call_count,
                 "context_tokens": context_tokens,
+                "response_text": response_text,
+                "response_tool_calls": response_tool_calls,
             })
 
         # Log cache hit on first cached call
@@ -194,13 +227,13 @@ def react_loop(
                 state["explanation"] = response.content[:500]
             break
 
-        # Capture agent reasoning (text content before tool calls)
+        # Capture agent reasoning (text content before tool calls) — full text, no truncation
         agent_reasoning = ""
         if isinstance(response.content, str):
-            agent_reasoning = response.content[:1000]
+            agent_reasoning = response.content
         elif isinstance(response.content, list):
             text_blocks = [b.get("text", "") for b in response.content if isinstance(b, dict) and b.get("type") == "text"]
-            agent_reasoning = " ".join(text_blocks)[:1000]
+            agent_reasoning = " ".join(text_blocks)
 
         # Execute each tool call
         terminal = False
@@ -278,7 +311,7 @@ def react_loop(
                         trace.emit("tool_result", "react_loop", {
                             "tool_name": tool_name,
                             "duration_ms": tool_duration,
-                            "result_preview": str(result_str)[:500],
+                            "result_preview": str(result_str),
                             "phase": current_phase,
                         })
 
@@ -371,7 +404,7 @@ def react_loop(
     state["tool_call_count"] = gs.tool_call_count
     state["cost_usd"] = round(gs.cost_usd, 6)
     state["messages"] = [
-        {"role": type(m).__name__, "content": str(m.content)[:500]}
+        {"role": type(m).__name__, "content": str(m.content)}
         for m in messages[-20:]
     ]
 

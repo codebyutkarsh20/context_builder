@@ -442,11 +442,22 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     )
     task_message = build_task_message(work_order, intent)
 
-    # Emit prompt_build for observability
+    # Emit prompt_build for observability — include full prompt text for replay/iteration
     if trace:
+        import subprocess
+        git_sha = ""
+        try:
+            git_sha = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, stderr=subprocess.DEVNULL,
+            ).decode().strip()[:12]
+        except Exception:
+            pass
+
         trace.emit("prompt_build", "react_agent", {
             "system_prompt_chars": len(system_prompt),
             "system_prompt_tokens_approx": len(system_prompt) // 4,
+            "system_prompt_text": system_prompt,
+            "task_message_text": task_message,
             "task_message_chars": len(task_message),
             "kickstart_chars": len(kickstart),
             "conventions_chars": len(conventions),
@@ -454,6 +465,7 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
             "hint_files": hint_files,
             "hint_functions": hint_functions,
             "repo_name": repo_name,
+            "agent_git_sha": git_sha,
         })
 
     # Run the ReAct loop
