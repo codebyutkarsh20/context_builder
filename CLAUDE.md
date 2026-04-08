@@ -1,9 +1,9 @@
 # AI Deploy Agent — Primathon
 ## Mission
-We are building an AI agent that autonomously fixes production bugs and makes
-minor enhancements, targeting 100 reliable deploys/day within 3 months.
+We are building an AI agent that autonomously fixes production bugs, implements
+minor features, and performs refactors — targeting 100 reliable deploys/day within 3 months.
 ### Milestone 1 (Current Focus)
-Agent reads a Jira bug → localizes the fault → generates a fix → reviews it → raises a PR.
+Agent reads a Jira ticket (bug / feature / refactor) → localizes the target → generates a fix → reviews it → raises a PR.
 **Success: 80% of PRs are approved by humans without changes.**
 ### Problem Statement 1: Context Creation
 Pick any repo, create deep context on it. With that context alone (without code),
@@ -12,8 +12,9 @@ This is solved by building a dual-layer knowledge graph:
 - CODE LAYER: Files → Classes → Functions → Calls/Imports (via Tree-sitter + Neo4j)
 - BUSINESS LAYER: BusinessRules, DomainConcepts, FailureRecords, ExternalDependencies
   linked to code entities via ENFORCED_BY, REPRESENTED_BY, RESULTED_IN_CHANGE edges
-### Problem Statement 2: Autonomous Bug-Fixing Agent
+### Problem Statement 2: Autonomous Code Agent
 ReAct pipeline: single agent loop with 19 tools decides explore → localize → edit → test → review → submit.
+Supports three task types: bug_fix, enhancement, refactor — prompts + reviewer adapt per type.
 Evolved from fixed 8-node LangGraph to ReAct architecture (v0.2.0.0, April 2026).
 ## Tech Stack
 - Python 3.11 / FastAPI (agent API)
@@ -31,7 +32,7 @@ agent/
 ├── react_pipeline.py  # 3-node LangGraph: intake → react_agent → finalize (DEFAULT)
 ├── react_loop.py      # Core ReAct while-loop with 19 tools
 ├── react_tools.py     # Sandbox-aware edit/test/review/submit tools
-├── react_prompt.py    # System prompt builder with context assembly
+├── react_prompt.py    # Task-type-aware system prompt builder (bug/feature/refactor)
 ├── react_guardrails.py # Safety: sandbox gate, submit gate, anti-pattern detection
 ├── context_manager.py # Context window management (observation masking + Haiku summarization)
 ├── pipeline.py        # Legacy utility library (routing functions, helpers — runtime deprecated)
