@@ -35,6 +35,7 @@ def set_react_context(
     repo_name: str,
     repo_path: str | Path,
     data_dir: Path | None = None,
+    fix_type: str = "bug_fix",
 ) -> None:
     """Set per-run context for react tools (thread-local)."""
     _tls.repo_name = repo_name
@@ -42,6 +43,7 @@ def set_react_context(
     _tls.sandbox_path = None
     _tls.branch_name = ""
     _tls.base_branch = ""
+    _tls.fix_type = fix_type
     if data_dir:
         _tls.data_dir = data_dir
 
@@ -744,12 +746,18 @@ def request_review(explanation: str) -> str:
     except Exception:
         reviewer_context = "No business rules or blast radius data available."
 
-    # Build review prompt
+    # Build review prompt — adapt to task type
     from agent.types import ReviewResult
 
-    prompt = f"""Review this bug fix as an independent reviewer.
+    fix_type = getattr(_tls, "fix_type", "bug_fix")
+    is_bug = fix_type == "bug_fix"
+    is_feature = fix_type == "enhancement"
+    change_noun = "bug fix" if is_bug else "feature implementation" if is_feature else "code change"
 
-FIX EXPLANATION: {explanation}
+    prompt = f"""Review this {change_noun} as an independent reviewer.
+
+CHANGE TYPE: {fix_type}
+EXPLANATION: {explanation}
 
 DIFF:
 {diff_text}
@@ -759,15 +767,16 @@ FILES MODIFIED: {modified_files}
 INDEPENDENT CONTEXT (from knowledge graph):
 {reviewer_context}
 
-Produce 6 checks (ROOT_CAUSE, BUSINESS_RULES, PATTERNS, COMPLETENESS, BLAST_RADIUS, TESTS):
-- ROOT_CAUSE: Does the fix address WHY the bug happens?
+Produce 6 checks ({'ROOT_CAUSE' if is_bug else 'REQUIREMENTS'}, BUSINESS_RULES, PATTERNS, COMPLETENESS, BLAST_RADIUS, TESTS):
+- {'ROOT_CAUSE: Does the fix address WHY the bug happens?' if is_bug else 'REQUIREMENTS: Does the implementation match what was requested? New code for a new feature is expected.'}
 - BUSINESS_RULES: Any business rules violated?
 - PATTERNS: Code follows existing conventions?
-- COMPLETENESS: All buggy locations patched?
-- BLAST_RADIUS: Interface changes covered?
+- COMPLETENESS: {'All buggy locations patched?' if is_bug else 'All requested functionality implemented?'}
+- BLAST_RADIUS: Interface changes covered? Callers updated?
 - TESTS: Evidence of testing?
 
-verdict: APPROVE if all checks pass. CHANGES_REQUESTED if any fail. ESCALATE if too complex."""
+verdict: APPROVE if all checks pass. CHANGES_REQUESTED if any fail. ESCALATE if too complex.
+{'NOTE: This is a feature implementation — new code and new endpoints are expected. Do not reject just because the change adds new code.' if is_feature else ''}"""
 
     try:
         from agent.llm import structured_call as _structured_call

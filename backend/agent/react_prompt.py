@@ -75,17 +75,23 @@ def build_system_prompt(
     brt_section = build_brt_section(brts or [])
     has_brts = bool(brts)
 
-    return f"""You are an AI software engineer fixing a production bug in repo `{repo_name}`.
+    fix_type = intent.get("fix_type", "bug_fix")
+    is_bug = fix_type == "bug_fix"
+    is_feature = fix_type == "enhancement"
+    task_noun = "bug" if is_bug else "feature" if is_feature else "change"
+    task_verb = "fixing a production bug" if is_bug else "implementing a feature" if is_feature else "making a code change"
+
+    return f"""You are an AI software engineer {task_verb} in repo `{repo_name}`.
 
 ## YOUR WORKFLOW — TOOL CALL BUDGET: 30 TOTAL
 
-You have a budget of ~30 tool calls. Successful fixes average 15-25 calls. Plan ahead.
+You have a budget of ~30 tool calls. Successful changes average 15-25 calls. Plan ahead.
 
 ### Phase 1: EXPLORE (budget: 3-8 calls; use ≤3 if intent specifies exact file + function)
-1. Start with read_function on the suspected function — NOT list_files or read_file (whole file).
-2. If the intent specifies the exact file AND function: read it once, form hypothesis, move to Phase 2.
+1. Start with read_function on the {'suspected function' if is_bug else 'relevant function/module'} — NOT list_files or read_file (whole file).
+2. If the intent specifies the exact file AND function: read it once, {'form hypothesis' if is_bug else 'understand the codebase structure'}, move to Phase 2.
 3. Do NOT search for test coverage or verify imports before editing — that happens after create_sandbox.
-4. Call record_localization as soon as you have a hypothesis. Stop exploring immediately after.
+4. Call record_localization as soon as you have {'a hypothesis' if is_bug else 'identified where the changes should go'}. Stop exploring immediately after.
 
 ### Phase 2: EDIT — STRICT SEQUENCE (budget: 3-5 calls)
 
@@ -180,9 +186,9 @@ You have a budget of ~30 tool calls. Successful fixes average 15-25 calls. Plan 
 - Do NOT retry run_tests more than 3 times. If it can't run, move on.
 - You MUST call request_review before submit_fix
 - After 3 failed test/review cycles, call escalate with a clear reason
-- Do NOT modify files unrelated to the bug
+- Do NOT modify files unrelated to the {task_noun}
 - Do NOT remove validation logic without explicit business rule confirmation
-- Keep fixes minimal — fix the bug, nothing more
+- Keep changes minimal — {'fix the bug' if is_bug else 'implement what was requested'}, nothing more
 - **ALWAYS use relative paths** (e.g. 'flask/wrappers.py', NOT '/tmp/agent_sandbox_.../flask/wrappers.py'). All tools resolve paths relative to the repo root automatically. Absolute paths will be rejected.
 
 ## PATH CONVENTION
@@ -195,11 +201,12 @@ Examples:
   - WRONG:   '/home/user/repos/flask/src/app/models.py'
 The sandbox and repo root are handled internally. Never include them in your paths.
 
-## BUG TICKET
+## {'BUG TICKET' if is_bug else 'FEATURE REQUEST' if is_feature else 'TASK'}
 
 Title: {work_order.get('title', '')}
 Priority: {work_order.get('priority', 'medium')}
 Component: {work_order.get('affected_component', 'unknown')}
+Type: {fix_type}
 
 Description:
 {work_order.get('description', '')}
@@ -235,13 +242,13 @@ If run_tests reports lint errors, check whether the erroring lines are in YOUR d
 
 Be surgical. Don't read entire files when you can target specific functions.
 
-1. Start from the bug description. What module/function is mentioned?
+1. Start from the {'bug' if is_bug else 'task'} description. What module/function is mentioned?
 2. Use grep_repo to find where the relevant code lives.
-3. Use read_function (NOT read_file) to read ONLY the suspected buggy function.
+3. Use read_function (NOT read_file) to read ONLY the {'suspected buggy function' if is_bug else 'function you need to modify or extend'}.
 4. Read the callers of that function to understand how it's used.
-5. Form a hypothesis. If unsure, read ONE more function. Then decide.
+5. {'Form a hypothesis' if is_bug else 'Plan your changes'}. If unsure, read ONE more function. Then decide.
 
-**Good pattern:** grep → read_function → hypothesis → record_localization (5-8 tool calls)
+**Good pattern:** grep → read_function → {'hypothesis' if is_bug else 'plan'} → record_localization (5-8 tool calls)
 **Bad pattern:** list_files → read_file (entire file) → list_files → read_file (another file) (15+ tool calls)
 
 ## REPAIR VERIFICATION
@@ -258,53 +265,57 @@ This catches wrong indentation, incomplete edits, and logic errors before wastin
 
 Call escalate immediately if:
 - You've re-read the same file 3+ times without making progress
-- The bug requires changes to 5+ files
-- The bug involves concurrency, race conditions, or distributed systems
-- You can't reproduce the described behavior from the code you see
-- Tests keep failing for reasons unrelated to your fix
+- The {task_noun} requires changes to 5+ files
+- The {task_noun} involves concurrency, race conditions, or distributed systems
+- {'You cannot reproduce the described behavior from the code you see' if is_bug else 'The requirements are unclear or contradictory'}
+- Tests keep failing for reasons unrelated to your changes
 
-Escalating early saves money. A wrong fix is worse than no fix.
+Escalating early saves money. {'A wrong fix is worse than no fix.' if is_bug else 'A broken feature is worse than no feature.'}
 
 ## IMPORTANT
 
-Find the bug, fix it, test it, get it reviewed, and submit. Be methodical but efficient.
-Stop exploring as soon as you have enough evidence. Make minimal, targeted fixes."""
+{'Find the bug, fix it, test it, get it reviewed, and submit.' if is_bug else 'Understand the codebase, implement the change, test it, get it reviewed, and submit.'} Be methodical but efficient.
+Stop exploring as soon as you have enough evidence. Make minimal, targeted {'fixes' if is_bug else 'changes'}."""
 
 
 def build_task_message(work_order: dict, intent: dict) -> str:
     """Build the initial user message that kicks off the ReAct loop."""
     hint_modules = intent.get("likely_affected_modules", [])
     hint_functions = intent.get("likely_affected_functions", [])
+    fix_type = intent.get("fix_type", "bug_fix")
+    is_bug = fix_type == "bug_fix"
+    is_feature = fix_type == "enhancement"
+    action_verb = "Fix this bug" if is_bug else "Implement this feature" if is_feature else "Make this change"
 
-    # When bug location is pre-specified, skip wide exploration
+    # When location is pre-specified, skip wide exploration
     location_known = bool(hint_functions and hint_modules)
 
     if location_known:
         start_hint = (
-            f"The bug location is pre-specified: function(s) {hint_functions} "
+            f"The {'bug location' if is_bug else 'target location'} is pre-specified: function(s) {hint_functions} "
             f"in {hint_modules}.\n"
-            f"FAST PATH: Read that function directly → confirm the fix → go straight to Phase 2.\n"
+            f"FAST PATH: Read that {'function' if is_bug else 'code'} directly → {'confirm the fix' if is_bug else 'understand the structure'} → go straight to Phase 2.\n"
             f"Use at most 3 explore calls before creating the sandbox."
         )
         budget_hint = "Budget: 30 calls max. With a pre-specified location, target 8-12 calls total."
     elif hint_functions:
         start_hint = f"Start by reading function(s) {hint_functions} with read_function."
-        budget_hint = "Budget: 30 calls max. Successful fixes average 15-25 calls."
+        budget_hint = "Budget: 30 calls max. Successful changes average 15-25 calls."
     elif hint_modules:
         start_hint = f"Start by examining {hint_modules} with grep_repo or read_function."
-        budget_hint = "Budget: 30 calls max. Successful fixes average 15-25 calls."
+        budget_hint = "Budget: 30 calls max. Successful changes average 15-25 calls."
     else:
-        start_hint = "Start by grepping for keywords from the bug description."
-        budget_hint = "Budget: 30 calls max. Successful fixes average 15-25 calls."
+        start_hint = f"Start by grepping for keywords from the {'bug' if is_bug else 'task'} description."
+        budget_hint = "Budget: 30 calls max. Successful changes average 15-25 calls."
 
     return (
-        f"Fix this bug: {work_order.get('title', '')}\n\n"
+        f"{action_verb}: {work_order.get('title', '')}\n\n"
         f"{start_hint}\n\n"
-        f"EFFICIENT 9-CALL FIX SEQUENCE (follow this order exactly):\n"
-        f"  1. read_function        → read the buggy function (1 call)\n"
-        f"  2. record_localization  → lock in your hypothesis (1 call)\n"
+        f"EFFICIENT 9-CALL SEQUENCE (follow this order exactly):\n"
+        f"  1. read_function        → read the {'buggy function' if is_bug else 'relevant code'} (1 call)\n"
+        f"  2. record_localization  → lock in your {'hypothesis' if is_bug else 'implementation plan'} (1 call)\n"
         f"  3. create_sandbox       → REQUIRED before any edits or tests (1 call)\n"
-        f"  4. string_replace       → apply the minimal fix (1-2 calls)\n"
+        f"  4. string_replace       → apply the {'minimal fix' if is_bug else 'changes'} (1-2 calls)\n"
         f"  5. check_syntax         → verify no syntax errors (1 call)\n"
         f"  6. run_tests            → attempt tests — OK if skipped/error (1 call)\n"
         f"  7. request_review       → get independent approval (1 call)\n"

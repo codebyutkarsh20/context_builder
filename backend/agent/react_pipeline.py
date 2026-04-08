@@ -410,7 +410,8 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     from agent.explore_tools import set_context, ALL_TOOLS as EXPLORE_TOOLS
     from agent.react_tools import set_react_context, _tls as _react_tls
     set_context(repo_name, repo_path, DATA_DIR)
-    set_react_context(repo_name, repo_path, DATA_DIR)
+    fix_type = intent.get("fix_type", "bug_fix") if intent else "bug_fix"
+    set_react_context(repo_name, repo_path, DATA_DIR, fix_type=fix_type)
 
     # Make BRTs accessible to the run_brt tool via thread-local
     _react_tls.brts = state.get("brts", [])
