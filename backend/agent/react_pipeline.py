@@ -329,6 +329,15 @@ def intake_node(state: ReactAgentState) -> ReactAgentState:
     if trace:
         trace.stage_start("intake")
     logger.info("=== REACT INTAKE: Translating bug ticket ===")
+
+    # Clean up stale sandboxes from previous runs (best-effort, non-blocking)
+    repo_path = _resolve_repo_path(state.get("work_order", {}))
+    if repo_path:
+        from agent.sandbox import cleanup_stale_worktrees
+        try:
+            cleanup_stale_worktrees(repo_path)
+        except Exception as e:
+            logger.debug("Stale worktree cleanup failed (non-fatal): %s", e)
     state["status"] = PipelineStatus.INTAKE
     _report_progress(state)
 

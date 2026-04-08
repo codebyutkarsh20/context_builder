@@ -552,6 +552,34 @@ def eval_ab(
     console.print(format_comparison_table(comparison))
 
 
+@eval_app.command("baseline")
+def eval_baseline(
+    bug: str = typer.Option(None, "--bug", "-b", help="Run only this ticket_id"),
+    dataset: str = typer.Option("eval/bugs.json", "--dataset", "-d", help="Path to bugs JSON"),
+):
+    """
+    Run the dumb-loop baseline diagnostic.
+
+    Single-shot Claude API call per bug. No ReAct loop, no tools, no retries,
+    no graph context. Measures the fix-rate floor to quantify infrastructure value.
+
+    Examples:
+        python cli.py eval baseline                    # All bugs
+        python cli.py eval baseline --bug CB-001       # Single bug
+    """
+    from agent.eval.baseline import run_baseline
+
+    console.print(Panel(
+        f"[bold cyan]Dataset:[/bold cyan]   {dataset}\n"
+        f"[bold cyan]Model:[/bold cyan]     claude-sonnet-4-6 (temp=0, single-shot)\n"
+        f"[bold cyan]Mode:[/bold cyan]      [yellow]Dumb loop — no tools, no retries, no graph[/yellow]",
+        title="[bold]Baseline Diagnostic[/bold]",
+        border_style="yellow",
+    ))
+
+    run_baseline(dataset_path=Path(dataset), bug_filter=bug)
+
+
 @app.command()
 def build(
     repo_path: str = typer.Argument(..., help="Path to any local Git repository"),

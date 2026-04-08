@@ -258,11 +258,21 @@ class RepoManager:
         venv_pytest = venv_dir / "bin" / "pytest"
         stamp = venv_dir / ".install_ok"
 
-        # Cache hit — skip if venv exists and stamp is present
+        # Cache hit — skip if venv exists, stamp is present, and imports work
         if stamp.exists() and venv_python.exists():
-            logger.info("Venv cache hit: %s", venv_dir)
-            self._write_agent_config(repo_dir, venv_pytest, bug)
-            return venv_dir
+            # Verify the package still imports (catches stale werkzeug etc.)
+            pkg_name = repo_dir.name.split("_")[0]
+            import_ok = subprocess.run(
+                [str(venv_python), "-c", f"import {pkg_name}"],
+                capture_output=True, text=True, timeout=15,
+            ).returncode == 0
+            if import_ok:
+                logger.info("Venv cache hit: %s", venv_dir)
+                self._write_agent_config(repo_dir, venv_pytest, bug)
+                return venv_dir
+            # Import broken — remove stamp and rebuild
+            logger.warning("Venv cache stale (import %s failed) — rebuilding", pkg_name)
+            stamp.unlink(missing_ok=True)
 
         logger.info("Creating venv for %s at %s", repo_dir.name, venv_dir)
 
@@ -314,10 +324,10 @@ class RepoManager:
             capture_output=True, text=True, timeout=15,
         )
         if import_check.returncode != 0 and "werkzeug" in import_check.stderr:
-            # Old package uses werkzeug API removed in 2.1+/3.0+ — pin to last compatible
-            logger.info("werkzeug incompatibility in %s — pinning to 2.0.3", pkg_name)
+            # Old package uses werkzeug API removed in 3.0+ — pin to 2.x
+            logger.info("werkzeug incompatibility in %s — pinning to <3.0", pkg_name)
             subprocess.run(
-                [pip, "install", "--quiet", "werkzeug==2.0.3"],
+                [pip, "install", "--quiet", "werkzeug>=2.2.2,<3.0"],
                 capture_output=True, timeout=60,
             )
 
