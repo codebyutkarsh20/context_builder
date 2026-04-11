@@ -28,6 +28,7 @@ OPTIONAL_FIELDS = {
     "expected_patch_files", "category", "language", "repo_name",
     "swe_bench_id", "setup_commands", "test_command", "tags", "comments",
     "estimated_cost_usd", "local_repo_path", "fail_to_pass", "pass_to_pass",
+    "nl_description",  # Business-language variant for natural-language eval
 }
 
 VALID_DIFFICULTIES = {"single-file", "multi-file"}
@@ -65,6 +66,7 @@ class EvalBug(TypedDict, total=False):
     comments: list[str]
     estimated_cost_usd: float | None
     local_repo_path: str | None  # Absolute path to local repo (skips GitHub clone)
+    nl_description: str | None   # Business-language description (no code terms) for NL eval
 
 
 # ---------------------------------------------------------------------------

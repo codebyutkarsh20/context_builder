@@ -96,6 +96,7 @@ class EvalRunner:
         results_dir: Path | str = RESULTS_DIR,
         repo_cache_dir: Path | None = None,
         build_graph: bool = False,
+        natural_lang: bool = False,
     ):
         self.dataset_path = Path(dataset_path)
         self.pipelines = pipelines or ["react"]
@@ -104,6 +105,7 @@ class EvalRunner:
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.build_graph = build_graph
+        self.natural_lang = natural_lang  # Use nl_description instead of description
         from agent.eval.repo_manager import RepoManager
         self.repo_manager = RepoManager(cache_dir=repo_cache_dir)
 
@@ -233,7 +235,7 @@ class EvalRunner:
         The child writes its result + trace to a temp file. If the process
         exceeds the timeout, it is killed (SIGKILL) and the case is marked failed.
         """
-        work_order = _bug_to_work_order(bug, repo_path)
+        work_order = _bug_to_work_order(bug, repo_path, natural_lang=self.natural_lang)
         case_start = time.time()
 
         # Temp files for IPC — child writes result + trace, parent reads
@@ -487,21 +489,35 @@ def _run_case_in_child(pipeline: str, work_order: dict, result_path: str) -> Non
         pass  # Parent will detect missing/corrupt file
 
 
-def _bug_to_work_order(bug: dict, repo_path: Path) -> dict:
-    """Convert eval bug dict to pipeline work_order."""
+def _bug_to_work_order(bug: dict, repo_path: Path, natural_lang: bool = False) -> dict:
+    """Convert eval bug dict to pipeline work_order.
+
+    Args:
+        natural_lang: If True and nl_description is present, use the business-language
+                      description instead of the technical one. This lets us A/B test
+                      how well the agent handles real Jira-style tickets vs developer
+                      descriptions with code terms.
+    """
     repo_name = (
         bug.get("repo_name")
         or bug.get("repo")
         or bug["ticket_id"].lower()
     )
+    # Pick description: natural language if requested and available
+    if natural_lang and bug.get("nl_description"):
+        description = bug["nl_description"]
+    else:
+        description = bug.get("description", "")
+
     wo = {
         "ticket_id": bug["ticket_id"],
         "title": bug.get("title", bug["ticket_id"]),
-        "description": bug.get("description", ""),
+        "description": description,
         "repo_name": repo_name,
         "repo_path": str(repo_path),
         "priority": bug.get("priority", "medium"),
         "comments": bug.get("comments", []),
+        "_natural_lang": natural_lang,  # Signal to intake that description is NL
     }
     # Pass test configuration from eval dataset so finalize_node can run
     # ground-truth tests with the correct command (instead of auto-detection).

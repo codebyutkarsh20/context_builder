@@ -256,6 +256,12 @@ Use the CODE MAP → read targeted sections → understand → edit.
 **Good pattern:** code map → read_file(specific section) → understand → sandbox → edit (8-15 calls)
 **Bad pattern:** grep → grep → grep → read random window → grep → grep (20+ calls, no understanding)
 
+**Natural-language ticket?** When the ticket uses business terms ("requisition", "approval", "discounts"):
+- DO NOT grep for ticket keywords — they won't exist as function names
+- START with get_file_structure on the feature area directory
+- READ functions that implement the described behavior
+- TRACE the symptom: what does the user see? what code path produces that output?
+
 ## REPAIR VERIFICATION
 
 After editing, ALWAYS re-read the function you edited to verify the fix looks correct:
@@ -292,18 +298,29 @@ def build_task_message(work_order: dict, intent: dict) -> str:
     is_feature = fix_type == "enhancement"
     action_verb = "Fix this bug" if is_bug else "Implement this feature" if is_feature else "Make this change"
 
-    # When location is pre-specified, skip wide exploration
-    location_known = bool(hint_functions and hint_modules)
+    # Natural-language mode: description has no code terms, so no function names to grep.
+    # Guide the agent to start from structure, not symbol search.
+    nl_mode = work_order.get("_natural_lang", False)
 
     # The code map for localized files is in the system prompt.
-    if hint_modules:
+    if hint_modules and not nl_mode:
         start_hint = (
             f"A CODE MAP for {hint_modules} is in your context above — it shows all function "
             f"signatures with line numbers. Use it to find the right function, then call "
             f"read_file(file, start_line, end_line) to read that specific section."
         )
+    elif nl_mode:
+        # Symptom-first: no code map hints. Agent must discover structure.
+        start_hint = (
+            "This ticket is written in business language — there are no specific function names to search. "
+            "Start with the SYMPTOM and work backwards:\n"
+            "  1. get_file_structure on the most likely feature area (e.g. auth/, api/routes.py)\n"
+            "  2. Read the function that implements the reported behavior\n"
+            "  3. Trace the data flow to find where the symptom originates\n"
+            "DO NOT grep for business terms from the ticket — they won't match code identifiers."
+        )
     else:
-        start_hint = f"Start by calling get_file_structure on the most likely file to see what functions exist."
+        start_hint = "Start by calling get_file_structure on the most likely file to see what functions exist."
 
     budget_hint = "Budget: 30 calls max. With the code map, target 10-20 calls total."
 

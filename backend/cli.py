@@ -39,6 +39,8 @@ def eval_run(
     output: str = typer.Option("eval/results", "--output", "-o", help="Results output directory"),
     build_graph: bool = typer.Option(False, "--build-graph", "-g",
                                      help="Build knowledge graph before running agent (full system test)"),
+    natural_lang: bool = typer.Option(False, "--natural-lang", "--nl",
+                                      help="Use nl_description (business-language) instead of technical description"),
 ):
     """
     Run the evaluation suite on the ReAct pipeline.
@@ -49,6 +51,8 @@ def eval_run(
         python cli.py eval run --pipeline react,react_v2           # A/B: v3 vs v2 baseline
         python cli.py eval run --build-graph                       # Full system (with knowledge graph)
         python cli.py eval run --sentinel                          # Fast 3-bug regression check
+        python cli.py eval run --natural-lang                      # Use business-language descriptions
+        python cli.py eval run --nl --pipeline react,react_v2      # A/B: technical vs natural-language
         python cli.py eval run --timeout 300                       # 5min timeout per case
     """
     from agent.eval.runner import EvalRunner
@@ -56,10 +60,12 @@ def eval_run(
     # Support comma-separated pipelines for A/B comparison
     pipelines = [p.strip() for p in pipeline.split(",")]
 
+    nl_label = "[yellow]Business-language (nl_description)[/yellow]" if natural_lang else "[green]Technical (description)[/green]"
     console.print(Panel(
         f"[bold cyan]Dataset:[/bold cyan]   {dataset}\n"
         f"[bold cyan]Pipelines:[/bold cyan] {', '.join(pipelines)}\n"
         f"[bold cyan]Mode:[/bold cyan]      {'[green]With knowledge graph[/green]' if build_graph else '[yellow]Graph-less (exploration tools only)[/yellow]'}\n"
+        f"[bold cyan]Descriptions:[/bold cyan] {nl_label}\n"
         f"[bold cyan]Sentinel:[/bold cyan]  {sentinel}\n"
         f"[bold cyan]Dry run:[/bold cyan]   {not create_prs}\n"
         f"[bold cyan]Timeout:[/bold cyan]   {timeout}s per case",
@@ -74,6 +80,7 @@ def eval_run(
         create_prs=create_prs,
         results_dir=Path(output),
         build_graph=build_graph,
+        natural_lang=natural_lang,
     )
 
     def _progress(tid: str, current: int, total: int) -> None:

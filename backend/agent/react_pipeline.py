@@ -217,6 +217,20 @@ def _translate_intent(work_order: dict) -> dict:
     from agent.llm import structured_call as _structured_call, INTAKE_MODEL
     from agent.types import IntentAnalysis
 
+    # Natural-language mode: description uses business/symptom language with no code terms.
+    # Guide the LLM to focus on the observable symptom and broad module areas, not specific
+    # function names it can't know from the description alone.
+    nl_mode = work_order.get("_natural_lang", False)
+    nl_guidance = ""
+    if nl_mode:
+        nl_guidance = (
+            "\n\nNOTE: This ticket is written in business/user language with no code terms. "
+            "For likely_affected_modules: list broad module paths (e.g. 'auth/', 'api/routes.py') based on the "
+            "feature area described — do NOT guess specific function names. "
+            "For likely_affected_functions: leave EMPTY unless you can infer a highly likely function from the symptom. "
+            "The agent will use get_file_structure to find the actual function names at runtime."
+        )
+
     prompt = f"""Translate this bug ticket into a technical specification.
 
 Ticket: {work_order.get('title', '')}
@@ -227,7 +241,7 @@ Comments: {'; '.join(work_order.get('comments', []))}
 
 Include acceptance_criteria: 2-4 testable assertions derived from the bug description
 that prove the fix works. These must come from the SPEC (what the user reported),
-not from guessing the implementation."""
+not from guessing the implementation.{nl_guidance}"""
 
     try:
         result = _structured_call(INTAKE_MODEL, 1000, IntentAnalysis, prompt)
