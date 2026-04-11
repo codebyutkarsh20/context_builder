@@ -20,6 +20,7 @@ from agent.tool_metadata import is_concurrent_safe as _is_concurrent_safe
 from agent.trace import _PHASE_MAP
 from agent.react_guardrails import (
     GuardrailState,
+    budget_for_difficulty,
     check_limits,
     check_tool_call,
     update_from_tool_result,
@@ -149,50 +150,72 @@ def react_loop(
         HumanMessage(content=task_message),
     ]
 
-    gs = GuardrailState()
+    # Adaptive tool call budget: single-file bugs get 30 calls, multi-file get 45.
+    # The difficulty is set by the eval runner (from the bug dataset) or can be
+    # derived from intent.likely_affected_modules count for live runs.
+    work_order = state.get("work_order", {})
+    intent_for_budget = state.get("intent", {})
+    difficulty = work_order.get("difficulty", "")
+    if not difficulty:
+        # Infer from intent: 1 module → single-file, 3+ → multi-file
+        n_modules = len(intent_for_budget.get("likely_affected_modules", []))
+        if n_modules >= 3:
+            difficulty = "multi-file"
+        elif n_modules <= 1:
+            difficulty = "single-file"
+    call_budget = budget_for_difficulty(difficulty)
+    gs = GuardrailState(max_tool_calls=call_budget)
     current_phase = "explore"  # Track phase transitions
 
     if trace:
         trace.stage_start("react_loop")
 
-    logger.info("=== REACT LOOP: Starting agent with %d tools (160K context) ===", len(all_tools))
+    logger.info(
+        "=== REACT LOOP: Starting agent with %d tools (160K context) | budget=%d calls (difficulty=%s) ===",
+        len(all_tools), call_budget, difficulty or "unknown",
+    )
 
-    while gs.tool_call_count < MAX_TOOL_CALLS:
+    while gs.tool_call_count < gs.max_tool_calls:
         # Budget checkpoint every 10 calls
         if gs.tool_call_count > 0 and gs.tool_call_count % 10 == 0:
             logger.info(
                 "BUDGET CHECK [%d/%d calls, $%.2f, %ds]: greps=%d reads=%d edits=%d sandbox=%s phase=%s",
-                gs.tool_call_count, MAX_TOOL_CALLS, gs.cost_usd, int(gs.elapsed),
+                gs.tool_call_count, gs.max_tool_calls, gs.cost_usd, int(gs.elapsed),
                 gs.grep_count, gs.read_file_count, gs.string_replace_count,
                 gs.sandbox_created, current_phase,
             )
 
-        # PHASE NUDGE: if we're past halfway with sandbox but 0 edits, inject
-        # a system message forcing the agent to commit to a fix attempt.
-        # Research: Moatless state machine prevents phase regression.
-        if (gs.tool_call_count == 20
+        # PHASE NUDGE: if past halfway with sandbox but 0 edits, force a fix attempt.
+        # Threshold scales with the budget: half of max_tool_calls, min 15.
+        _nudge_at = max(15, gs.max_tool_calls // 2)
+        if (gs.tool_call_count == _nudge_at
                 and gs.sandbox_created
                 and gs.string_replace_count == 0):
+            _remaining = gs.max_tool_calls - _nudge_at
             nudge = (
-                "SYSTEM: You are halfway through your budget (20/40 calls) with a sandbox "
-                "but ZERO edits. The function names in the bug description may not match the code. "
+                f"SYSTEM: You are halfway through your budget ({_nudge_at}/{gs.max_tool_calls} calls) "
+                "with a sandbox but ZERO edits. The function names in the bug description may not match the code. "
                 "STOP GREPPING. Based on what you've read so far:\n"
                 "1. Pick the most likely function to fix\n"
                 "2. Call string_replace with your best fix attempt\n"
                 "3. Even an imperfect fix you can iterate on beats more searching\n"
-                "You have 20 calls left — use them for editing, testing, and submitting."
+                f"You have {_remaining} calls left — use them for editing, testing, and submitting."
             )
             messages.append(HumanMessage(content=nudge))
-            logger.info("PHASE NUDGE injected at call 20: forcing edit phase")
+            logger.info("PHASE NUDGE injected at call %d: forcing edit phase", _nudge_at)
 
-        # FORCE ESCALATION: 30 calls, sandbox exists, still 0 edits = agent is stuck
-        if (gs.tool_call_count >= 30
+        # FORCE ESCALATION: 75% of budget, sandbox exists, still 0 edits = stuck
+        _escalate_at = max(20, int(gs.max_tool_calls * 0.75))
+        if (gs.tool_call_count >= _escalate_at
                 and gs.sandbox_created
                 and gs.string_replace_count == 0):
-            logger.warning("Force escalation: 30 calls with sandbox but 0 edits — agent is stuck")
+            logger.warning(
+                "Force escalation: %d calls with sandbox but 0 edits — agent is stuck",
+                gs.tool_call_count,
+            )
             state["escalated"] = True
             state["escalate_reason"] = (
-                "Agent explored for 30 calls with a sandbox but never attempted an edit. "
+                f"Agent explored for {gs.tool_call_count} calls with a sandbox but never attempted an edit. "
                 "The bug description may not match the code's naming conventions. "
                 "Human review needed to identify the correct fix location."
             )

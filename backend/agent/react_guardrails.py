@@ -13,10 +13,25 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Limits
-MAX_TOOL_CALLS = 40
-MAX_WALL_TIME = 900  # 15 minutes
+MAX_TOOL_CALLS = 40          # Legacy default — use budget_for_difficulty() for new code
+MAX_WALL_TIME = 900          # 15 minutes
 MAX_COST_USD = 5.00
 MAX_TEST_FAILURES = 3
+
+# Adaptive tool call budget based on task complexity.
+# Research: most bugs resolve in 15-25 calls; calls 30-40 are usually stuck loops.
+# Giving a tighter budget to simple bugs saves cost and forces better focus.
+_CALL_BUDGET = {
+    "single-file": 30,  # one file, one function — agent should finish in 15-25
+    "multi-file":  45,  # cross-module changes — callers, tests, imports need updating
+    "complex":     55,  # architecture changes, 5+ files, new abstractions
+}
+_DEFAULT_BUDGET = 40   # unknown complexity — safe middle ground
+
+
+def budget_for_difficulty(difficulty: str) -> int:
+    """Return the adaptive tool call budget for a given task difficulty."""
+    return _CALL_BUDGET.get(difficulty, _DEFAULT_BUDGET)
 
 # Tools that require a sandbox to exist
 SANDBOX_REQUIRED_TOOLS = frozenset({
@@ -31,7 +46,8 @@ TERMINAL_TOOLS = frozenset({"submit_fix", "escalate"})
 class GuardrailState:
     """Tracks guardrail-relevant state during a ReAct loop run."""
 
-    def __init__(self):
+    def __init__(self, max_tool_calls: int = MAX_TOOL_CALLS):
+        self.max_tool_calls: int = max_tool_calls
         self.sandbox_created: bool = False
         self.sandbox_path: str = ""
         self.tests_passed: bool = False
@@ -69,9 +85,9 @@ class GuardrailState:
 
 def check_limits(gs: GuardrailState) -> str | None:
     """Check global limits. Returns error string if exceeded, None if OK."""
-    if gs.tool_call_count >= MAX_TOOL_CALLS:
+    if gs.tool_call_count >= gs.max_tool_calls:
         return (
-            f"ERROR: Tool call limit reached ({MAX_TOOL_CALLS}). "
+            f"ERROR: Tool call limit reached ({gs.max_tool_calls}). "
             "You must call escalate with a reason, or submit_fix if ready."
         )
     if gs.elapsed >= MAX_WALL_TIME:

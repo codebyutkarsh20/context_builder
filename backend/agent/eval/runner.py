@@ -516,6 +516,7 @@ def _bug_to_work_order(bug: dict, repo_path: Path, natural_lang: bool = False) -
         "repo_name": repo_name,
         "repo_path": str(repo_path),
         "priority": bug.get("priority", "medium"),
+        "difficulty": bug.get("difficulty", ""),   # drives adaptive call budget
         "comments": bug.get("comments", []),
         "_natural_lang": natural_lang,  # Signal to intake that description is NL
     }
