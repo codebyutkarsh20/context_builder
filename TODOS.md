@@ -3,8 +3,6 @@
 ## Active
 
 ### P1 — Expand eval dataset with multi-file bugs
-
-### P1 — Expand eval dataset with multi-file bugs
 **What:** Add 8-10 multi-file bugs from SWE-bench. Current 25 bugs are all single-file.
 **Why:** Real production bugs are ~50% multi-file. We have get_callers/get_blast_radius tools but no eval data to test them.
 
