@@ -1,8 +1,8 @@
 """
 retriever.py — Multi-strategy retriever for Graph RAG.
 
-Combines vector search (ChromaDB), graph traversal (graph.json edges),
-and keyword matching to find the most relevant subgraph for a question.
+Combines graph traversal (graph.json edges) and keyword matching
+to find the most relevant subgraph for a question.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class ScoredNode:
     id: str
     score: float
-    source: str  # "vector" | "graph" | "keyword"
+    source: str  # "graph" | "keyword"
     metadata: dict = field(default_factory=dict)
 
 
@@ -39,7 +39,7 @@ class RetrievalResult:
 
 
 class GraphRAGRetriever:
-    """Multi-strategy retriever combining vector search + graph traversal + keywords."""
+    """Multi-strategy retriever combining graph traversal + keywords."""
 
     def __init__(self, repo_name: str, data_dir: Path) -> None:
         self.repo_name = repo_name
@@ -52,21 +52,17 @@ class GraphRAGRetriever:
         """
         Run the full retrieval pipeline:
         1. Analyze query intent
-        2. Vector search (ChromaDB)
-        3. Keyword fallback
-        4. Graph expansion (1-2 hops)
-        5. Merge and rank
+        2. Keyword search
+        3. Graph expansion (1-2 hops)
+        4. Merge and rank
         """
         intent = analyze_query(question)
 
-        # Strategy 1: Vector search
-        vector_results = self._vector_search(question, intent, n=20)
-
-        # Strategy 2: Keyword search
+        # Strategy 1: Keyword search
         keyword_results = self._keyword_search(question, intent, n=15)
 
-        # Merge and rank
-        merged = self._merge_and_rank(vector_results, keyword_results)
+        # Rank
+        merged = self._merge_and_rank([], keyword_results)
 
         # Take top seeds for graph expansion
         seed_ids = [s.id for s in merged[:10]]
@@ -94,29 +90,6 @@ class GraphRAGRetriever:
             intent=intent,
             scores=scores,
         )
-
-    # ------------------------------------------------------------------
-    # Vector search
-    # ------------------------------------------------------------------
-
-    def _vector_search(self, question: str, intent: QueryIntent, n: int) -> list[ScoredNode]:
-        try:
-            from embeddings.embedder import NodeEmbedder
-            embedder = NodeEmbedder(self.repo_name, self.data_dir)
-            node_types = intent.entity_types if intent.scope == "specific" else None
-            results = embedder.query(question, n_results=n, node_types=node_types)
-            return [
-                ScoredNode(
-                    id=r["id"],
-                    score=r.get("score", 0.5),
-                    source="vector",
-                    metadata=r.get("metadata", {}),
-                )
-                for r in results
-            ]
-        except Exception as e:
-            logger.debug("Vector search unavailable: %s", e)
-            return []
 
     # ------------------------------------------------------------------
     # Keyword search
