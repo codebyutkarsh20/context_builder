@@ -665,6 +665,21 @@ def build(
         _graph_out.mkdir(parents=True, exist_ok=True)
         import json as _json2; (_graph_out / "graph.json").write_text(_json2.dumps(graph_data, default=str))
 
+        # Execution flow detection — entry points, BFS flow tracing, dead code
+        progress.update(task, description="[cyan]Detecting execution flows...", completed=48)
+        try:
+            from analyzer.flows import build_flows
+            flow_result = build_flows(graph_data, communities=communities)
+            import json as _json_f
+            (_graph_out / "flows.json").write_text(_json_f.dumps(flow_result, default=str))
+            console.print(
+                f"  [green]✓[/green] Flows: {flow_result['flow_count']} execution flows, "
+                f"{flow_result['entry_point_count']} entry points, "
+                f"{flow_result['dead_code_count']} dead-code nodes"
+            )
+        except Exception as e:
+            console.print(f"  [dim]  Flow detection skipped: {e}[/dim]")
+
         progress.update(task, description="[cyan]Analyzing git history...", completed=50)
         git_analyzer = GitAnalyzer(path)
         git_data = git_analyzer.analyze()
@@ -775,23 +790,15 @@ def build(
         else:
             console.print(f"  [dim]  ℹ Failure records: 0 (set ENABLE_FAILURE_RECORDS=true to enable)[/dim]")
 
-        # Save enriched nodes + build embeddings
-        progress.update(task, description="[cyan]Building enriched node cache...", completed=85)
-        from embeddings.embedder import build_enriched_nodes, NodeEmbedder
+        # Save enriched nodes cache
+        progress.update(task, description="[cyan]Building enriched node cache...", completed=88)
+        from embeddings.embedder import build_enriched_nodes
         enriched = build_enriched_nodes(parsed, graph_data, decision_points, domain_concepts, rules if no_neo4j else [])
         import json as _json
         enriched_path = Path(f"/tmp/context_builder/{repo_name}/enriched_nodes.json")
         enriched_path.parent.mkdir(parents=True, exist_ok=True)
         enriched_path.write_text(_json.dumps(enriched, default=str))
         console.print(f"  [green]✓[/green] Enriched node cache: {len(enriched)} nodes")
-
-        progress.update(task, description="[cyan]Building vector embeddings (ChromaDB)...", completed=88)
-        try:
-            embedder = NodeEmbedder(repo_name, Path("/tmp/context_builder"))
-            embed_count = embedder.build_embeddings(enriched)
-            console.print(f"  [green]✓[/green] Embedded {embed_count} nodes into ChromaDB")
-        except Exception as e:
-            console.print(f"  [yellow]⚠[/yellow]  ChromaDB embedding failed: {e}")
 
         progress.update(task, description="[cyan]Compiling context document...", completed=92)
         if no_neo4j:
@@ -1240,6 +1247,7 @@ def fix(
     repo_path: str = typer.Option("", "--repo", "-r", help="Path to local repo"),
     repo_name: str = typer.Option("", "--name", "-n", help="Repo name (for graph lookup)"),
     dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="Skip PR creation"),
+    best_of_n: int = typer.Option(1, "--best-of-n", "-N", help="Run N parallel instances, pick best (1=off, 3=recommended)"),
 ):
     """
     Run the AI agent to fix a bug.
@@ -1264,13 +1272,14 @@ def fix(
     console.print(Panel(
         f"[bold cyan]Ticket:[/bold cyan]    {ticket_id}\n"
         f"[bold cyan]Dry run:[/bold cyan]   {dry_run}\n"
+        f"[bold cyan]Best-of-N:[/bold cyan] {best_of_n}\n"
         f"[bold cyan]Repo:[/bold cyan]      {repo_path or '(auto-detect)'}",
         title="[bold]AI Deploy Agent[/bold]",
         border_style="cyan",
     ))
 
     from agent.react_pipeline import run_ticket_react
-    result = run_ticket_react(work_order, trace=trace, dry_run=dry_run)
+    result = run_ticket_react(work_order, trace=trace, dry_run=dry_run, best_of_n=best_of_n)
 
     status = result.get("status", "unknown")
     pr_url = result.get("pr_url", "")
@@ -1283,6 +1292,14 @@ def fix(
         console.print(f"\n[bold yellow]ESCALATED[/bold yellow] — {reason}")
     else:
         console.print(f"\n[bold red]FAILED[/bold red] — {error or status}")
+
+    # Print best-of-N stats if applicable
+    bon_stats = result.get("best_of_n_stats")
+    if bon_stats:
+        console.print(
+            f"[dim]Best-of-{bon_stats['n']}: {bon_stats['submitted']}/{bon_stats['n']} submitted, "
+            f"{bon_stats['test_pass']}/{bon_stats['n']} tests passed[/dim]"
+        )
 
     # Print trace summary
     report = trace.to_report()
@@ -1471,16 +1488,6 @@ def update(
         f"{len(merged_graph['nodes'])} nodes | {len(merged_graph['edges'])} edges"
     )
 
-    # Re-embed changed nodes
-    try:
-        from embeddings.embedder import NodeEmbedder, build_enriched_nodes
-        new_enriched = build_enriched_nodes(reparsed, new_graph_data, [], [], [])
-        embedder = NodeEmbedder(repo_name, Path("/tmp/context_builder"))
-        embed_count = embedder.update_embeddings(new_enriched)
-        if embed_count:
-            console.print(f"[green]✓[/green] Updated {embed_count} embeddings in ChromaDB")
-    except Exception as e:
-        console.print(f"[dim]Embeddings update skipped: {e}[/dim]")
 
 
 if __name__ == "__main__":

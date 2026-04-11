@@ -246,6 +246,9 @@ class GraphBuilder:
                 "    c.file      = $file, "
                 "    c.bases     = $bases, "
                 "    c.docstring = $docstring, "
+                "    c.line_start = $line_start, "
+                "    c.line_end   = $line_end, "
+                "    c.is_test    = $is_test, "
                 "    c.last_seen = datetime() "
                 "WITH c "
                 "MATCH (f:File {id: $file_id}) "
@@ -257,6 +260,9 @@ class GraphBuilder:
                 "file": file_id,
                 "bases": cls_dict.get("bases", []),
                 "docstring": cls_dict.get("docstring", ""),
+                "line_start": cls_dict.get("line_start", 0),
+                "line_end": cls_dict.get("line_end", 0),
+                "is_test": cls_dict.get("is_test", False),
                 "file_id": file_id,
             }
             neo4j_client.run(query, params)
@@ -286,6 +292,9 @@ class GraphBuilder:
                 "    fn.return_type = $return_type, "
                 "    fn.docstring   = $docstring, "
                 "    fn.decorators  = $decorators, "
+                "    fn.line_start  = $line_start, "
+                "    fn.line_end    = $line_end, "
+                "    fn.is_test     = $is_test, "
                 "    fn.last_seen   = datetime() "
                 "WITH fn "
                 "MATCH (f:File {id: $file_id}) "
@@ -299,6 +308,9 @@ class GraphBuilder:
                 "return_type": fn_dict.get("return_type", ""),
                 "docstring": fn_dict.get("docstring", ""),
                 "decorators": fn_dict.get("decorators", []),
+                "line_start": fn_dict.get("line_start", 0),
+                "line_end": fn_dict.get("line_end", 0),
+                "is_test": fn_dict.get("is_test", False),
                 "file_id": file_id,
             }
             neo4j_client.run(query, params)
@@ -323,6 +335,9 @@ class GraphBuilder:
             "    fn.return_type = $return_type, "
             "    fn.docstring   = $docstring, "
             "    fn.decorators  = $decorators, "
+            "    fn.line_start  = $line_start, "
+            "    fn.line_end    = $line_end, "
+            "    fn.is_test     = $is_test, "
             "    fn.last_seen   = datetime() "
             "WITH fn "
             "MATCH (c:Class {id: $class_id}) "
@@ -336,6 +351,9 @@ class GraphBuilder:
             "return_type": fn_dict.get("return_type", ""),
             "docstring": fn_dict.get("docstring", ""),
             "decorators": fn_dict.get("decorators", []),
+            "line_start": fn_dict.get("line_start", 0),
+            "line_end": fn_dict.get("line_end", 0),
+            "is_test": fn_dict.get("is_test", False),
             "class_id": class_id,
         }
         neo4j_client.run(query, params)
@@ -344,7 +362,7 @@ class GraphBuilder:
     # --- Edges ---------------------------------------------------------
 
     def _upsert_edges(self, graph_data: dict[str, Any]) -> None:
-        """Create IMPORTS, CALLS, and INHERITS edges from graph_data.
+        """Create IMPORTS, CALLS, INHERITS, and TESTED_BY edges from graph_data.
 
         CONTAINS edges are intentionally excluded here — they are created
         as part of the node upsert methods (_upsert_file, _upsert_classes,
@@ -364,6 +382,10 @@ class GraphBuilder:
             "MATCH (a {id: $source}), (b {id: $target}) "
             "MERGE (a)-[:INHERITS]->(b)"
         )
+        tested_by_query = (
+            "MATCH (a {id: $source}), (b {id: $target}) "
+            "MERGE (a)-[:TESTED_BY]->(b)"
+        )
 
         for edge in edges:
             edge_type = (edge.get("type") or "").upper()
@@ -382,6 +404,8 @@ class GraphBuilder:
                 neo4j_client.run(call_query, edge_params)
             elif edge_type == "INHERITS":
                 neo4j_client.run(inherits_query, edge_params)
+            elif edge_type == "TESTED_BY":
+                neo4j_client.run(tested_by_query, edge_params)
             elif edge_type == "CONTAINS":
                 pass  # Handled during node upsert; skip to avoid duplicates.
             else:

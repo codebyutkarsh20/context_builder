@@ -1,7 +1,7 @@
 """
 react_prompt.py — System prompt builder for the ReAct agent loop.
 
-Assembles orientation context (graph, embeddings, business rules, conventions)
+Assembles orientation context (graph, business rules, conventions)
 into a structured system prompt that guides the agent through explore → edit → test → submit.
 """
 
@@ -56,7 +56,7 @@ def build_system_prompt(
     Args:
         work_order: Bug ticket work order.
         intent: IntentAnalysis dict from intake.
-        kickstart_context: Orientation context from graph/embeddings/failure signals.
+        kickstart_context: Orientation context from graph/failure signals.
         conventions_section: Project conventions (linters, formatters).
         business_rules_section: Business rules from knowledge graph.
     """
@@ -83,15 +83,20 @@ def build_system_prompt(
 
     return f"""You are an AI software engineer {task_verb} in repo `{repo_name}`.
 
-## YOUR WORKFLOW — TOOL CALL BUDGET: 30 TOTAL
+## YOUR WORKFLOW — TOOL CALL BUDGET: ~30 CALLS (hard limit: 40)
 
-You have a budget of ~30 tool calls. Successful changes average 15-25 calls. Plan ahead.
+You have a budget of ~30 tool calls. Successful changes average 15-25 calls. Hard limit is 40 — you'll be stopped there. Plan ahead.
 
-### Phase 1: EXPLORE (budget: 3-8 calls; use ≤3 if intent specifies exact file + function)
-1. Start with read_function on the {'suspected function' if is_bug else 'relevant function/module'} — NOT list_files or read_file (whole file).
-2. If the intent specifies the exact file AND function: read it once, {'form hypothesis' if is_bug else 'understand the codebase structure'}, move to Phase 2.
-3. Do NOT search for test coverage or verify imports before editing — that happens after create_sandbox.
-4. Call record_localization as soon as you have {'a hypothesis' if is_bug else 'identified where the changes should go'}. Stop exploring immediately after.
+**IMPORTANT: You can call MULTIPLE tools in a single turn.** When you need several pieces of information (e.g., reading 3 functions, or grepping 2 patterns), request them all at once — they run in parallel and save you turns.
+
+### Phase 1: EXPLORE — use the code map, then read targeted sections
+1. **Check the CODE MAP in your context** — it shows function signatures + line numbers for localized files. Find the relevant function there.
+2. **Read the specific section** with read_file(file, start_line, end_line). The viewer shows 100 lines at a time. Use the line numbers from the code map.
+3. If you need more context, scroll: read_file(file, start_line=201) shows the next 100 lines.
+4. grep_repo is ONLY for finding which file contains a pattern. Once you have the file, use the code map + read_file with line numbers.
+5. **If grep returns zero matches**: the bug description uses different names than the code. Look at the CODE MAP to find the actual function names.
+6. {'Form a clear hypothesis about the root cause.' if is_bug else 'Understand the codebase structure.'}
+7. Call record_localization when ready.
 
 ### Phase 2: EDIT — STRICT SEQUENCE (budget: 3-5 calls)
 
@@ -136,19 +141,19 @@ You have a budget of ~30 tool calls. Successful changes average 15-25 calls. Pla
 - **Premature escalation**: Do NOT escalate after a single blocked tool call. Read the error, follow the recovery action above, and retry.
 
 ## TOOLS AVAILABLE
+{"**Focus for this bug fix:** Check CODE MAP → read_file(target section) → string_replace → run_tests → submit_fix." if is_bug else "**Focus for this feature:** CODE MAP → read_file → create_file → string_replace → run_tests." if is_feature else "**Focus for this refactor:** CODE MAP → read_file → get_callers → string_replace."}
 
 ### Exploration (read-only — USE THESE IN THIS ORDER OF PREFERENCE):
-1. **read_function(file_path, function_name)** — BEST: extracts exactly one function. Use when you know the function name.
-2. **grep_repo(pattern, file_glob, max_results)** — Find WHERE code lives. Keep max_results=5-10.
-3. **get_file_structure(file_path)** — See all functions/classes in a file without reading the code.
-4. **read_file(file_path, start_line, end_line)** — LAST RESORT: reads a 50-line window. Only use for imports or when read_function can't find the function.
-5. search_code(query, limit) — Semantic search (when grep patterns don't work)
-6. get_function_info(function_id) — Function metadata (params, return type)
-7. get_file_summary(file_path) — File purpose
-8. list_files(directory, extension) — Directory listing (rarely needed)
+1. **read_file(file_path, start_line, end_line)** — 100-line viewer with scroll. Use the CODE MAP line numbers to jump to the right section. Call again with different start_line to scroll.
+2. **read_function(file_path, function_name)** — Extracts one complete function. Best when you know the exact function name from the code map.
+3. **grep_repo(pattern, file_glob, max_results)** — Find WHERE code lives. Shows 2 lines of context around each match. Only for finding files — then use read_file to read the code.
+4. **get_file_structure(file_path)** — Function signatures + line numbers. Use when the code map doesn't cover a file.
+5. **get_function_info(function_id)** — Function metadata: params, return type, callers, callees.
+6. **list_files(directory, extension)** — Directory listing.
+7. **get_blast_radius(file_path)** — How many files depend on this file? Returns risk level + caller list.
 
-### Editing (requires sandbox):
-- string_replace(file_path, old_string, new_string) — Replace exact string in a file
+### Editing (requires sandbox — you must read_file/read_function BEFORE editing):
+- string_replace(file_path, old_string, new_string) — Replace exact string in a file. ruff --fix runs automatically after each edit.
 - check_syntax(file_path) — Verify Python file has no syntax errors
 - create_file(file_path, content) — Create a new file (e.g., test files)
 
@@ -240,16 +245,16 @@ If run_tests reports lint errors, check whether the erroring lines are in YOUR d
 
 ## EXPLORATION STRATEGY
 
-Be surgical. Don't read entire files when you can target specific functions.
+Use the CODE MAP → read targeted sections → understand → edit.
 
-1. Start from the {'bug' if is_bug else 'task'} description. What module/function is mentioned?
-2. Use grep_repo to find where the relevant code lives.
-3. Use read_function (NOT read_file) to read ONLY the {'suspected buggy function' if is_bug else 'function you need to modify or extend'}.
-4. Read the callers of that function to understand how it's used.
-5. {'Form a hypothesis' if is_bug else 'Plan your changes'}. If unsure, read ONE more function. Then decide.
+1. **Check the CODE MAP** in your context for function signatures and line numbers.
+2. **Read the relevant function** with read_file(file, start_line, end_line) using line numbers from the code map. Each call shows 100 lines.
+3. If you need the function above or below, scroll: read_file(file, start_line=next_line).
+4. grep_repo is for finding WHICH FILE. Once you know the file, use the code map + read_file with line numbers.
+5. **If grep returns zero matches**: look at the CODE MAP — the function names there are the REAL names in the code.
 
-**Good pattern:** grep → read_function → {'hypothesis' if is_bug else 'plan'} → record_localization (5-8 tool calls)
-**Bad pattern:** list_files → read_file (entire file) → list_files → read_file (another file) (15+ tool calls)
+**Good pattern:** code map → read_file(specific section) → understand → sandbox → edit (8-15 calls)
+**Bad pattern:** grep → grep → grep → read random window → grep → grep (20+ calls, no understanding)
 
 ## REPAIR VERIFICATION
 
@@ -290,39 +295,32 @@ def build_task_message(work_order: dict, intent: dict) -> str:
     # When location is pre-specified, skip wide exploration
     location_known = bool(hint_functions and hint_modules)
 
-    if location_known:
+    # The code map for localized files is in the system prompt.
+    if hint_modules:
         start_hint = (
-            f"The {'bug location' if is_bug else 'target location'} is pre-specified: function(s) {hint_functions} "
-            f"in {hint_modules}.\n"
-            f"FAST PATH: Read that {'function' if is_bug else 'code'} directly → {'confirm the fix' if is_bug else 'understand the structure'} → go straight to Phase 2.\n"
-            f"Use at most 3 explore calls before creating the sandbox."
+            f"A CODE MAP for {hint_modules} is in your context above — it shows all function "
+            f"signatures with line numbers. Use it to find the right function, then call "
+            f"read_file(file, start_line, end_line) to read that specific section."
         )
-        budget_hint = "Budget: 30 calls max. With a pre-specified location, target 8-12 calls total."
-    elif hint_functions:
-        start_hint = f"Start by reading function(s) {hint_functions} with read_function."
-        budget_hint = "Budget: 30 calls max. Successful changes average 15-25 calls."
-    elif hint_modules:
-        start_hint = f"Start by examining {hint_modules} with grep_repo or read_function."
-        budget_hint = "Budget: 30 calls max. Successful changes average 15-25 calls."
     else:
-        start_hint = f"Start by grepping for keywords from the {'bug' if is_bug else 'task'} description."
-        budget_hint = "Budget: 30 calls max. Successful changes average 15-25 calls."
+        start_hint = f"Start by calling get_file_structure on the most likely file to see what functions exist."
+
+    budget_hint = "Budget: 30 calls max. With the code map, target 10-20 calls total."
 
     return (
         f"{action_verb}: {work_order.get('title', '')}\n\n"
         f"{start_hint}\n\n"
-        f"EFFICIENT 9-CALL SEQUENCE (follow this order exactly):\n"
-        f"  1. read_function        → read the {'buggy function' if is_bug else 'relevant code'} (1 call)\n"
-        f"  2. record_localization  → lock in your {'hypothesis' if is_bug else 'implementation plan'} (1 call)\n"
-        f"  3. create_sandbox       → REQUIRED before any edits or tests (1 call)\n"
-        f"  4. string_replace       → apply the {'minimal fix' if is_bug else 'changes'} (1-2 calls)\n"
+        f"SEQUENCE:\n"
+        f"  1. Study the pre-read code in your context (0 calls — it's already there)\n"
+        f"  2. record_localization  → lock in your {'hypothesis' if is_bug else 'plan'} (1 call)\n"
+        f"  3. create_sandbox       → REQUIRED before any edits (1 call)\n"
+        f"  4. string_replace       → apply the {'fix' if is_bug else 'changes'} (1-3 calls)\n"
         f"  5. check_syntax         → verify no syntax errors (1 call)\n"
         f"  6. run_tests            → attempt tests — OK if skipped/error (1 call)\n"
-        f"  7. request_review       → get independent approval (1 call)\n"
+        f"  7. request_review       → get review (1 call)\n"
         f"  8. submit_fix           → done (1 call)\n\n"
-        f"CRITICAL: create_sandbox (step 3) must come before string_replace and run_tests.\n"
-        f"If you see 'No sandbox exists', call create_sandbox immediately — do not escalate.\n"
-        f"If create_sandbox returns 'uncommitted changes', escalate with that exact reason.\n\n"
+        f"CRITICAL: create_sandbox must come before string_replace and run_tests.\n"
+        f"If tests return 'error' (missing pytest), that's fine — proceed to review and submit.\n\n"
         f"{budget_hint}"
     )
 

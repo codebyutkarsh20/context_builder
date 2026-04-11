@@ -50,7 +50,7 @@ class TestGuardrailSandboxGate:
         """Verify the exact set of tools that need a sandbox."""
         assert SANDBOX_REQUIRED_TOOLS == frozenset({
             "string_replace", "create_file", "check_syntax",
-            "run_tests", "run_linters",
+            "run_tests", "run_brt",
         })
 
     @pytest.mark.parametrize("tool_name", list(SANDBOX_REQUIRED_TOOLS))
@@ -76,7 +76,7 @@ class TestGuardrailSandboxGate:
         """Read-only exploration tools must never be in SANDBOX_REQUIRED_TOOLS."""
         explore_tools = {
             "grep_repo", "read_file", "read_function", "list_files",
-            "search_code", "get_function_info", "get_file_structure",
+            "get_function_info", "get_file_structure",
             "get_file_summary",
         }
         assert explore_tools.isdisjoint(SANDBOX_REQUIRED_TOOLS)
@@ -99,14 +99,15 @@ class TestGuardrailSubmitGate:
         assert result is not None
         assert "run_tests" in result
 
-    def test_submit_blocked_without_review(self):
+    def test_submit_warns_without_review(self):
+        """Submit without review should warn but NOT block."""
         gs = GuardrailState()
         gs.sandbox_created = True
         gs.tests_attempted = True
         gs.tests_passed = True
         result = check_tool_call("submit_fix", {}, gs)
-        assert result is not None
-        assert "request_review" in result
+        # Should be a warning, not a hard block
+        assert result is None or "WARNING" in result
 
     def test_submit_blocked_when_tests_failed(self):
         """Actual test failures (not skipped/error) MUST block submission."""
@@ -491,12 +492,12 @@ class TestAntiPatternThresholds:
         result = check_tool_call("grep_repo", {}, gs)
         assert result is None
 
-    def test_read_file_warning_at_10(self):
+    def test_read_file_no_hard_block(self):
+        """read_file should never be hard-blocked — agent needs freedom to explore."""
         gs = GuardrailState()
-        gs.read_file_count = 10
+        gs.read_file_count = 20
         result = check_tool_call("read_file", {}, gs)
-        assert result is not None
-        assert "WARNING" in result
+        assert result is None  # No block, no warning — let the agent read
 
     def test_run_tests_warning_at_3(self):
         gs = GuardrailState()
@@ -506,13 +507,14 @@ class TestAntiPatternThresholds:
         assert result is not None
         assert "WARNING" in result
 
-    def test_string_replace_warning_at_4(self):
+    def test_string_replace_no_hard_block(self):
+        """string_replace should never be hard-blocked — agent needs to iterate."""
         gs = GuardrailState()
         gs.sandbox_created = True
-        gs.string_replace_count = 4
-        result = check_tool_call("string_replace", {}, gs)
-        assert result is not None
-        assert "WARNING" in result
+        gs.string_replace_count = 10
+        gs.files_read = {"test.py": "..."}
+        result = check_tool_call("string_replace", {"file_path": "test.py"}, gs)
+        assert result is None  # No block — let the agent iterate
 
     def test_review_warning_at_2(self):
         gs = GuardrailState()

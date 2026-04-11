@@ -20,7 +20,6 @@ Evolved from fixed 8-node LangGraph to ReAct architecture (v0.2.0.0, April 2026)
 - Python 3.11 / FastAPI (agent API)
 - LangGraph (agent orchestration)
 - Neo4j (code + business knowledge graph)
-- ChromaDB (vector embeddings for semantic fallback)
 - Claude API (LLM reasoning, repair, review)
 - Tree-sitter (AST parsing for graph construction)
 - GitHub Actions (CI/CD + PR creation)
@@ -46,7 +45,7 @@ agent/
 │   ├── builder.py     # Tree-sitter → Neo4j pipeline
 │   ├── business/      # Business knowledge extraction + ingestion
 │   └── queries.py     # Cypher query templates
-└── embeddings/        # ChromaDB pipeline
+└── embeddings/        # Enriched node cache builder
 ## Build & Test
 ```bash
 pip install -r backend/requirements.txt
@@ -71,7 +70,7 @@ cd backend && python cli.py eval gate results/latest.json  # CI regression gate
 ## Current State (April 2026)
 - [x] Knowledge graph construction pipeline (Tree-sitter → Neo4j)
 - [x] Business knowledge extraction from git history
-- [x] Context assembly with graph + embeddings + failure signals
+- [x] Context assembly with graph + failure signals
 - [x] ReAct agent with 19 tools (explore, edit, test, review, submit)
 - [x] Multi-file coordination tools (get_callers, get_blast_radius)
 - [x] Prompt caching (Anthropic server-side, ~87% savings on prefix)

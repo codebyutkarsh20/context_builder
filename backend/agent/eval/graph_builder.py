@@ -178,8 +178,7 @@ def build_eval_graph(
         (out_dir / "business_rules.json").write_text("[]")
 
     # ── Step 6: Enriched node cache ───────────────────────────────────────────
-    logger.info("[6/7] Building enriched node cache...")
-    enriched: list = []
+    logger.info("[6/6] Building enriched node cache...")
     try:
         from embeddings.embedder import build_enriched_nodes
         enriched = build_enriched_nodes(parsed, graph_data, decision_points, domain_concepts, rules)
@@ -187,16 +186,6 @@ def build_eval_graph(
         logger.info("  %d enriched nodes", len(enriched))
     except Exception as e:
         logger.warning("Enriched node build skipped: %s", e)
-
-    # ── Step 7: ChromaDB vector embeddings ────────────────────────────────────
-    logger.info("[7/7] Building vector embeddings (ChromaDB)...")
-    try:
-        from embeddings.embedder import NodeEmbedder
-        embedder = NodeEmbedder(repo_name, base)
-        embed_count = embedder.build_embeddings(enriched)
-        logger.info("  Embedded %d nodes", embed_count)
-    except Exception as e:
-        logger.warning("ChromaDB embedding skipped: %s", e)
 
     # Write SHA stamp so next run can detect if the repo changed
     if current_sha:

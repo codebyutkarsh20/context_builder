@@ -33,11 +33,11 @@ class TestLoggingConfig:
         assert basic_pos < router_pos, "basicConfig should be before router imports"
 
     def test_noisy_libraries_quieted(self):
-        """httpcore, chromadb, etc. are set to WARNING."""
+        """httpcore, httpx, etc. are set to WARNING."""
         src = Path(__file__).resolve().parent.parent / "main.py"
         content = src.read_text()
 
-        for lib in ["httpcore", "httpx", "chromadb", "urllib3"]:
+        for lib in ["httpcore", "httpx", "urllib3"]:
             assert lib in content, f"{lib} should be quieted"
 
     def test_log_format_has_timestamp(self):
@@ -55,11 +55,11 @@ class TestLoggingConfig:
         content = src.read_text()
         assert "level=logging.INFO" in content
 
-    def test_pipeline_has_logger(self):
-        """agent/pipeline.py uses module-level logger."""
-        import agent.pipeline as pipeline
-        assert hasattr(pipeline, 'logger')
-        assert pipeline.logger.name == "agent.pipeline"
+    def test_react_loop_has_logger(self):
+        """agent/react_loop.py uses module-level logger."""
+        import agent.react_loop as react_loop
+        assert hasattr(react_loop, 'logger')
+        assert react_loop.logger.name == "agent.react_loop"
 
     def test_backend_log_output(self):
         """Backend log file should contain structured output."""

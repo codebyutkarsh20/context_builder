@@ -309,3 +309,137 @@ def search_nodes(repo: str, query: str, limit: int) -> tuple[str, dict]:
         "LIMIT $limit"
     )
     return cypher, {"repo": repo, "q": query, "limit": limit}
+
+
+# ---------------------------------------------------------------------------
+# Test coverage (TESTED_BY edges)
+# ---------------------------------------------------------------------------
+
+
+def get_tests_for(node_id: str, repo: str) -> tuple[str, dict]:
+    """Return (cypher, params) for test files covering a given source node.
+
+    Traverses incoming TESTED_BY edges to find test files that import or
+    exercise the target function or file.
+
+    Parameters
+    ----------
+    node_id:
+        The ``id`` property of the source node to find tests for.
+    repo:
+        Repository name used to scope results.
+    """
+    cypher = (
+        "MATCH (r:Repo {name: $repo})-[:CONTAINS*1..]->(test) "
+        "-[:TESTED_BY]->(n {id: $node_id}) "
+        "RETURN test.id AS id, test.name AS name, test.path AS path, "
+        "       labels(test) AS labels "
+        "ORDER BY test.name"
+    )
+    return cypher, {"node_id": node_id, "repo": repo}
+
+
+# ---------------------------------------------------------------------------
+# Execution flows (entry points with variable-length CALLS paths)
+# ---------------------------------------------------------------------------
+
+
+def get_execution_flows(repo: str, limit: int = 20) -> tuple[str, dict]:
+    """Return (cypher, params) for entry-point functions and their call depth.
+
+    Entry points are functions with framework decorators or no incoming CALLS.
+    Each result includes the function, its decorators, and the length of the
+    longest outgoing CALLS chain (depth).
+
+    Parameters
+    ----------
+    repo:
+        Repository name.
+    limit:
+        Maximum number of flows to return.
+    """
+    cypher = (
+        "MATCH (r:Repo {name: $repo})-[:CONTAINS*1..]->(ep:Function) "
+        "WHERE NOT ()-[:CALLS]->(ep) OR size(ep.decorators) > 0 "
+        "OPTIONAL MATCH path = (ep)-[:CALLS*1..10]->(callee) "
+        "WITH ep, max(length(path)) AS depth, "
+        "     count(DISTINCT callee) AS node_count, "
+        "     collect(DISTINCT callee.path) AS touched_files "
+        "RETURN ep.id AS id, ep.name AS name, ep.path AS path, "
+        "       ep.decorators AS decorators, ep.is_test AS is_test, "
+        "       coalesce(depth, 0) AS depth, "
+        "       coalesce(node_count, 0) AS node_count, "
+        "       size(touched_files) AS file_count "
+        "ORDER BY node_count DESC, depth DESC "
+        "LIMIT $limit"
+    )
+    return cypher, {"repo": repo, "limit": limit}
+
+
+# ---------------------------------------------------------------------------
+# Dead code (uncalled, untested functions)
+# ---------------------------------------------------------------------------
+
+
+def get_dead_code(repo: str, limit: int = 50) -> tuple[str, dict]:
+    """Return (cypher, params) for functions with no callers and no tests.
+
+    Excludes dunder methods, test functions, and entry points with decorators.
+
+    Parameters
+    ----------
+    repo:
+        Repository name.
+    limit:
+        Maximum number of dead-code nodes to return.
+    """
+    cypher = (
+        "MATCH (r:Repo {name: $repo})-[:CONTAINS*1..]->(fn:Function) "
+        "WHERE NOT ()-[:CALLS]->(fn) "
+        "  AND NOT ()-[:TESTED_BY]->(fn) "
+        "  AND NOT fn.name STARTS WITH '__' "
+        "  AND coalesce(fn.is_test, false) = false "
+        "  AND size(coalesce(fn.decorators, [])) = 0 "
+        "RETURN fn.id AS id, fn.name AS name, fn.path AS path, "
+        "       labels(fn) AS labels, fn.line_start AS line_start "
+        "ORDER BY fn.path, fn.line_start "
+        "LIMIT $limit"
+    )
+    return cypher, {"repo": repo, "limit": limit}
+
+
+# ---------------------------------------------------------------------------
+# Change impact (affected nodes for given changed files)
+# ---------------------------------------------------------------------------
+
+
+def get_change_impact(
+    repo: str, changed_files: list[str], limit: int = 30,
+) -> tuple[str, dict]:
+    """Return (cypher, params) for nodes in changed files with caller/test counts.
+
+    Parameters
+    ----------
+    repo:
+        Repository name.
+    changed_files:
+        List of file paths that were changed.
+    limit:
+        Maximum number of affected nodes to return.
+    """
+    cypher = (
+        "MATCH (r:Repo {name: $repo})-[:CONTAINS*1..]->(n) "
+        "WHERE n.path IN $files AND (n:Function OR n:Class) "
+        "OPTIONAL MATCH (caller)-[:CALLS]->(n) "
+        "OPTIONAL MATCH (test)-[:TESTED_BY]->(n) "
+        "WITH n, count(DISTINCT caller) AS caller_count, "
+        "     count(DISTINCT test) AS test_count "
+        "RETURN n.id AS id, n.name AS name, n.path AS path, "
+        "       labels(n) AS labels, "
+        "       n.line_start AS line_start, n.line_end AS line_end, "
+        "       caller_count, test_count, "
+        "       CASE WHEN test_count = 0 THEN true ELSE false END AS untested "
+        "ORDER BY caller_count DESC "
+        "LIMIT $limit"
+    )
+    return cypher, {"repo": repo, "files": changed_files, "limit": limit}

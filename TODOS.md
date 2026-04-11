@@ -2,24 +2,20 @@
 
 ## Active
 
-### P1 — Multi-candidate patch sampling
-**What:** Generate 3-5 candidate patches per bug, test all, pick the one that passes. Based on SWE-bench research showing 3-8% gain from ensembling.
-**Why:** Current pipeline generates 1 patch. If it's wrong, the agent spirals trying to fix it. Multiple candidates + test filtering is the cheapest quality improvement.
-**Context:** SWE-bench research (April 2026). Agentless uses 42 candidates.
+### P1 — Expand eval dataset with multi-file bugs
 
 ### P1 — Expand eval dataset with multi-file bugs
 **What:** Add 8-10 multi-file bugs from SWE-bench. Current 25 bugs are all single-file.
 **Why:** Real production bugs are ~50% multi-file. We have get_callers/get_blast_radius tools but no eval data to test them.
 
-### P1 — Real Jira integration
-**What:** Connect to real Jira board, pull tickets, run agent, track PR review outcomes.
-**Why:** The 80% approval target is unmeasurable without real human reviewers on real bugs.
+### P1 — Concept-to-code mapping for business-language tickets
+**What:** When a ticket uses business terms ("requisition", "approval flow") that don't match function names, the agent can't find the right code. Need to map business concepts → code entities using the knowledge graph.
+**Why:** Bug 3 (aria-ats: same requisition queried 3x) always escalates because the agent greps for business terms that don't exist as function names. The knowledge graph has BusinessRules + ENFORCED_BY edges that could bridge this gap.
+**Approach:** During intake, query the graph for BusinessRule nodes matching ticket keywords → get linked code functions via ENFORCED_BY → inject as "Relevant business rules" into task message.
 
 ### P2 — Continue extracting utilities from pipeline.py
-**What:** pipeline.py is still 3300 lines. Utility functions (_redact_secrets, _fuzzy_match_replace, should_iterate, etc.) are still imported by tests. Continue extracting into focused modules (llm.py, graph_utils.py, linters.py pattern).
-**Why:** Fixed pipeline is retired (run_ticket/build_agent_graph deprecated) but the file remains as a utility library. Smaller modules = faster imports, easier testing.
-
-## Active (inherited)
+**What:** pipeline.py is still 3300 lines. Utility functions (_redact_secrets, _fuzzy_match_replace, should_iterate, etc.) are still imported by tests. Extract into focused modules: llm_utils.py, secrets.py, file_utils.py, analysis_utils.py, patch_utils_extended.py.
+**Why:** Fixed pipeline is retired but the file remains as a utility library. 6-module extraction plan ready (see prior eng review).
 
 ### P2 — Validate ENFORCED_BY edge precision before production use
 **What:** Run `BusinessLogicExtractor` on 20 manually annotated functions, measure precision/recall of ENFORCED_BY edges. Gate business context injection on >80% precision.
@@ -27,25 +23,32 @@
 **Context:** Open question #1 in design doc. Do this validation after Phase 1 ships, before Phase 3 is wired to the repair pipeline.
 **Depends on:** Phase 1 shipped (ENFORCED_BY edges exist in Neo4j).
 
-### P3 — FailureRecord severity classification
-**What:** Add severity signal to FailureRecords — distinguish P0 incidents from cosmetic fixes. Options: parse `P0`/`sev1`/`critical` keywords from commit message, fetch PR labels via GitHub API, or infer from Jira priority field.
-**Why:** All FailureRecords currently have implicit severity=unknown. Repair agent can't weight past incidents by urgency. A P0 production outage in the blast radius should trigger stricter constraints than a cosmetic fix.
-**Context:** Open question #3 in design doc. `mine_failure_records()` in `backend/graph/business/failure_records.py`.
-**Depends on:** Phase 2 shipped.
+### P3 — FailureRecord severity classification (enhanced)
+**What:** Basic severity classification exists (`_severity_hint` parses P0/Sev0/critical/hotfix keywords). Enhance with: fetch PR labels via GitHub API, or infer from Jira priority field for richer signal.
+**Why:** Current classification is keyword-only from commit messages. PR labels and Jira priority give cleaner signal for distinguishing P0 incidents from cosmetic fixes.
+**Context:** `mine_failure_records()` in `backend/graph/business/failure_records.py`. Basic version already shipped (v2.7). Enhancement is optional.
 
 ### P4 — Approach C: Forward-Looking Structured History (Lore protocol)
 **What:** After 5-10 agent PRs are merged, implement agent-written git trailers on every PR: rules checked, blast radius, failure pattern ID. Git becomes the FailureRecords DB over time (arxiv 2603.15566).
 **Why:** FailureRecords mined from git history are retrospective and limited by commit message quality. Agent-authored trailers create forward-looking, structured history with full agent context attached to each change.
-**Context:** Explicitly deferred (Approach C) in design doc — cold start requires 5-10 real agent PRs to produce useful data. Completeness 7/10 vs Approach B's 9/10 because of cold start.
+**Context:** Explicitly deferred (Approach C) in design doc — cold start requires 5-10 real agent PRs to produce useful data.
 **Depends on:** Wedge demo shipped + 5-10 real agent PRs merged via Phase 3.
 
 ### P5 — Extract external side effects behind interface (dependency inversion)
 **What:** `pr_creation_node()` has multiple external side effects (git push, gh pr create, feature flags, _enrich_from_fix) each guarded by `if not dry_run`. Extract behind a thin interface and no-op in test/eval mode.
 **Why:** The boolean-flag approach works for 3-4 calls but creates maintenance burden as new side effects are added. Forgetting a guard is a silent bug.
-**Context:** Identified by outside voice during eng review (2026-03-30). Current dry_run guards are: git push, feature flag creation, PR creation, enrichment. Each new external call needs a manual guard. Standard dependency inversion pattern.
+**Context:** Identified by outside voice during eng review (2026-03-30). Current dry_run guards: git push, feature flag creation, PR creation, enrichment.
 **Depends on:** Production validation shipped (current sprint).
 
 ## Completed
+
+### P1 — Multi-candidate patch sampling
+**Completed:** v2.9 (2026-04-09)
+`react_pipeline.py`: `_run_best_of_n()` launches N parallel instances via `ProcessPoolExecutor`, picks best by test_pass → verifier APPROVE → review confidence → cost. `verifier_node` runs after each agent loop for fresh-context independent review. CLI: `--best-of-n N` flag on `fix` command. Max N=5 hard cap.
+
+### P1 — Independent verifier subagent (cavekit speculative pattern)
+**Completed:** v2.9 (2026-04-09)
+`react_pipeline.py`: `verifier_node()` runs after `react_agent_node`, uses a fresh-context Haiku call with only diff + test results + bug description. Adds `verifier_verdict`, `verifier_confidence`, `epr_score` (BRT pass rate) to state. Blocks PR creation if verifier REJECTS with high confidence.
 
 ### P0 — Integration tests for react tool/guardrail/prompt contract
 **Completed:** v0.3.1.0 (2026-04-02)
@@ -63,3 +66,60 @@ Removed `--no-react` from CLI and eval. ReAct is the only supported runtime. `pi
 **Completed:** v0.1.1.0 (2026-03-29)
 `api/repos.py`: initialize `repo_path: ""` in base entry and always assign from stats — field now present on all repos regardless of whether graph.json exists.
 
+### P2 — Fix `TESTED_BY` edge `rstrip` bug
+**Completed:** v2.8 (2026-04-08)
+`call_graph.py:603`: `.rstrip(".py")` → `.removesuffix(".py")`. The old code stripped any trailing char in the set `{'.','p','y'}` not the suffix `.py`, corrupting paths like `app/copy.py` → `app/cop`.
+
+### P3 — Nested functions invisible to parser
+**Completed:** v2.8 (2026-04-08)
+`code_parser.py`: replaced flat `for child in root.children` with recursive `_walk_nodes()` that descends into function bodies. Captures nested functions (Flask `create_app` factory pattern, closures, decorators).
+
+### P3 — Multi-alias imports lose all but last alias
+**Completed:** v2.8 (2026-04-08)
+`code_parser.py`: fixed `_parse_imports` to accumulate per-name aliases into an `aliases: dict[str, str]` map. Added `aliases` key to import dicts. `alias` field retains backward compat (first alias if exactly one, else None).
+
+### P3 — JS/TS brace-counting breaks on template literals
+**Completed:** v2.8 (2026-04-08)
+`code_parser.py` `_estimate_func_end`: rewritten with char-by-char scanner that tracks block comments, line comments, template literals, and quoted strings before counting braces. No longer mis-counts `{` inside `` `${expr}` ``.
+
+### P3 — JS/TS parser feature parity with Python
+**Completed:** v2.8 (2026-04-08)
+`multi_lang_parser.py` full rewrite:
+- Decorators: `@Controller`, `@Get`, `@Injectable` etc. extracted from tree-sitter `decorator` nodes
+- Return types: TypeScript `: Promise<User>` annotations extracted
+- Param types: full typed params `"id: number"` preserved (not stripped)
+- Conditionals: `if`/`switch`/`ternary` extracted with `branch_count`
+- Complexity: cyclomatic complexity computed
+- Line boundaries: tree-sitter `end_point` used (not brace counting)
+- Import symbols: `names: ["UserService", "AuthGuard"]` populated
+- Import aliases: `aliases: {"UserService": "US"}` dict added
+- Implements clause: TypeScript `implements Interface1, Interface2`
+- Async flag: `is_async: True/False`
+- JSDoc: checks prev sibling AND parent prev sibling (catches export-wrapped functions)
+- Export tracking: `is_exported: True/False`
+- React components: `is_react_component: True` for uppercase PascalCase functions with JSX
+- Hooks: `is_hook: True` for `useXxx` functions
+- Language labels: `"javascript"`, `"typescript"`, `"jsx"`, `"tsx"` per extension
+
+### P2 — CALLS edges disabled for repos >2000 callables
+**Completed:** v2.8 (2026-04-08)
+`call_graph.py`: instead of skipping CALLS entirely for large repos, now uses focused resolution: top 30% of files by PageRank, per-function fanout capped at 50 unique targets. `_add_call_edges_focused()` + `_scan_calls_capped()` added.
+
+### P4 — Leiden runs on undirected graph
+**Completed:** v2.8 (2026-04-08)
+`community.py`: `ig.Graph(directed=False)` → `directed=True`, `RBConfigurationVertexPartition` (undirected-only) → `CPMVertexPartition` (directed). Added seen-edge deduplication set.
+
+### P4 — Community naming uses raw token frequency, not IDF
+**Completed:** v2.8 (2026-04-08)
+`community.py`: `_derive_community_name` now applies IDF weighting — `score = count_in_community / log(1 + count_in_all_communities)`. Generic path segments ("api", "backend", "frontend") that appear in many communities are penalised. Extended stopwords list.
+
+### P3 — Multi-language repo support (JS/TS + Python)
+**Completed:** v2.8 (2026-04-08)
+`call_graph.py`:
+- JS/TS relative imports (`"./foo"`, `"../bar"`) now resolved correctly in `_resolve_import_module` with extension probing (`.js`, `.ts`, `.jsx`, `.tsx`, `/index.js`, `/index.ts`)
+- `_add_nodes` now handles `lineno` fallback for JS/TS nodes that emit `lineno` instead of `line_start`/`line_end`
+- Mixed Python + JS/TS repos work end-to-end through graph build → flows → agent tools
+
+### P3 — FailureRecord severity classification (basic)
+**Completed:** v2.5 (estimated)
+`failure_records.py`: `_severity_hint()` parses commit messages for P0/Sev0/critical → `"critical"`, P1/hotfix/incident → `"high"`, else `"unknown"`. Stored as `severity_hint` on FailureRecord nodes in Neo4j.

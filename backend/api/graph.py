@@ -275,23 +275,12 @@ def get_rag_status(repo: str = Query(...)):
         "repo": repo,
         "enriched_nodes": enriched_path.exists(),
         "enriched_count": 0,
-        "chromadb_available": False,
-        "chromadb_count": 0,
     }
 
     if enriched_path.exists():
         import json
         enriched = json.loads(enriched_path.read_text())
         result["enriched_count"] = len(enriched)
-
-    try:
-        from embeddings.embedder import NodeEmbedder
-        embedder = NodeEmbedder(repo, data_dir)
-        info = embedder.collection_info()
-        result["chromadb_available"] = info.get("count", 0) > 0
-        result["chromadb_count"] = info.get("count", 0)
-    except Exception:
-        pass
 
     return result
 

@@ -385,10 +385,55 @@ def _build_call_subgraph(
     return "CALL SUBGRAPH (2-hop around hint area):\n" + "\n".join(parts[:25])
 
 
+def _build_flow_context(
+    repo_name: str, hint_files: list[str], data_dir: Path,
+) -> str:
+    """Build execution flow context for hint files from flows.json."""
+    flows_path = data_dir / repo_name / "flows.json"
+    if not flows_path.exists():
+        return ""
+    try:
+        flows_data = json.loads(flows_path.read_text())
+    except Exception:
+        return ""
+
+    flows = flows_data.get("flows", [])
+    if not flows or not hint_files:
+        return ""
+
+    # Find flows that touch any hint file.
+    hint_set = set(hint_files)
+    relevant: list[dict] = []
+    for flow in flows:
+        flow_files = set(flow.get("files", []))
+        if flow_files & hint_set:
+            relevant.append(flow)
+
+    if not relevant:
+        return ""
+
+    # Sort by criticality, take top 5.
+    relevant.sort(key=lambda f: f.get("criticality", 0), reverse=True)
+    relevant = relevant[:5]
+
+    parts = ["EXECUTION FLOWS touching hint area:"]
+    for flow in relevant:
+        path_preview = flow.get("path", [])[:6]
+        labels = [p.rsplit("::", 1)[-1] if "::" in p else p for p in path_preview]
+        trail = " → ".join(labels)
+        if len(flow.get("path", [])) > 6:
+            trail += " → ..."
+        parts.append(
+            f"  [{flow.get('criticality', 0):.2f}] {flow['name']}: {trail}"
+        )
+
+    return "\n".join(parts)
+
+
 def build_kickstart_context(
     repo_name: str, repo_path: str | None, intent: dict, data_dir: Path,
 ) -> str:
-    """Build orientation context for exploration from graph + vector + failure signals."""
+    """Build orientation context for exploration from graph + failure signals."""
     from graph.neo4j_client import neo4j_client
 
     sections: list[str] = []
@@ -405,7 +450,8 @@ def build_kickstart_context(
         repo_map = _build_repo_map(graph_data_for_map)
         func_locator = _build_function_locator(graph_data_for_map, hint_functions, hint_files)
         call_subgraph = _build_call_subgraph(graph_data_for_map, hint_files, hint_functions)
-        orientation_parts = [p for p in [repo_map, func_locator, call_subgraph] if p]
+        flow_context = _build_flow_context(repo_name, hint_files, data_dir)
+        orientation_parts = [p for p in [repo_map, func_locator, call_subgraph, flow_context] if p]
         if orientation_parts:
             sections.append(
                 "REPO ORIENTATION (pre-built from stored graph — use this before calling list_files or grep):\n\n"
@@ -414,26 +460,7 @@ def build_kickstart_context(
     except Exception as e:
         logger.debug("Repo orientation build failed (non-fatal): %s", e)
 
-    # 1. Vector search
-    try:
-        from embeddings.embedder import NodeEmbedder
-        embedder = NodeEmbedder(repo_name, data_dir)
-        results = embedder.query(bug_query, n_results=5)
-        if results:
-            lines = []
-            for r in results:
-                meta = r.get("metadata", {})
-                name = meta.get("name") or r.get("id", "?")
-                file_ = meta.get("file", "")
-                doc = (meta.get("docstring") or "")[:80]
-                lines.append(f"  - {file_}::{name}" + (f" — {doc}" if doc else ""))
-            sections.append(
-                "SEMANTICALLY SIMILAR CODE (vector search on bug description):\n" + "\n".join(lines)
-            )
-    except Exception:
-        pass
-
-    # 2. Graph neighbors
+    # 1. Graph neighbors
     try:
         neighbors: list[str] = []
         queried_via_neo4j = False
@@ -467,7 +494,7 @@ def build_kickstart_context(
     except Exception:
         pass
 
-    # 3. Past failures
+    # 2. Past failures
     try:
         if neo4j_client.is_connected() and hint_files:
             failure_lines: list[str] = []
@@ -490,7 +517,7 @@ def build_kickstart_context(
     except Exception:
         pass
 
-    # 4. Business rules
+    # 3. Business rules
     try:
         rules_path = data_dir / repo_name / "business_rules.json"
         if rules_path.exists():
@@ -514,7 +541,7 @@ def build_kickstart_context(
     except Exception:
         pass
 
-    # 5. PageRank hotspots
+    # 4. PageRank hotspots
     try:
         graph_data, _ = load_graph_data(repo_name)
         hotspots = sorted(

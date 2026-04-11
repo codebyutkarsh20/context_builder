@@ -303,13 +303,22 @@ class TestPathTokenExtraction:
         assert _extract_path_tokens("") == []
 
     def test_derive_community_name(self):
+        from collections import Counter
         from graph.community import _derive_community_name
-        name = _derive_community_name(["auth/login.py", "auth/session.py", "auth/tokens.py"])
+        # "auth" appears only in this one community → low IDF penalty, ranks highest
+        all_tokens: Counter = Counter({"auth": 1, "login": 1, "session": 1, "tokens": 1})
+        name = _derive_community_name(
+            ["auth/login.py", "auth/session.py", "auth/tokens.py"],
+            all_communities_tokens=all_tokens,
+        )
         assert "auth" in name
 
     def test_derive_community_name_fallback(self):
+        from collections import Counter
         from graph.community import _derive_community_name
         # All stopwords → fallback to "misc"
-        name = _derive_community_name(["tests/test_utils.py"])
-        # 'tests', 'test', 'utils' are all stopwords → should return 'misc'
+        name = _derive_community_name(
+            ["tests/test_utils.py"],
+            all_communities_tokens=Counter(),
+        )
         assert name == "misc"

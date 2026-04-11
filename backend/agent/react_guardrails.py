@@ -21,7 +21,7 @@ MAX_TEST_FAILURES = 3
 # Tools that require a sandbox to exist
 SANDBOX_REQUIRED_TOOLS = frozenset({
     "string_replace", "create_file", "check_syntax",
-    "run_tests", "run_linters",
+    "run_tests", "run_brt",
 })
 
 # Tools that are terminal (end the loop)
@@ -50,6 +50,13 @@ class GuardrailState:
         self.read_file_count: int = 0
         self.run_tests_count: int = 0
         self.string_replace_count: int = 0
+        # File state cache — tracks files read for read-before-edit enforcement
+        # {relative_path: content_snippet} — snippet is first 200 chars for identity
+        self.files_read: dict[str, str] = {}
+        # Cross-phase file cache — preserves key file contents across observation masking
+        # {relative_path: full_content} — top N files injected into EDIT phase
+        self.file_cache: dict[str, str] = {}
+        self.FILE_CACHE_MAX = 5
 
     @property
     def elapsed(self) -> float:
@@ -102,56 +109,76 @@ def check_tool_call(
             "This is a required setup step, NOT a reason to escalate."
         )
 
-    # Submit gate
-    if tool_name == "submit_fix":
-        missing = []
-        if not gs.sandbox_created:
-            missing.append("create_sandbox (no sandbox exists)")
-        if not gs.tests_attempted:
-            missing.append("run_tests (must attempt tests at least once)")
-        elif not gs.tests_passed and not gs.tests_skipped:
-            # Tests ran and FAILED (actual assertion failures) — block
-            missing.append("run_tests (tests failed — fix the failures first)")
-        if not gs.review_approved:
-            missing.append("request_review (review must approve)")
-        if missing:
+    # Read-before-edit gate — you must read a file before editing it
+    if tool_name == "string_replace":
+        edit_path = tool_args.get("file_path", "")
+        if edit_path and edit_path not in gs.files_read:
             return (
-                "ERROR: Cannot submit yet. Missing prerequisites:\n"
-                + "\n".join(f"  - {m}" for m in missing)
+                f"WARNING: You haven't read '{edit_path}' yet. "
+                "Call read_file or read_function first to see the current content, "
+                "then retry string_replace with the exact old_string from the file."
             )
 
-    # Anti-pattern detection (advisory warnings that guide the agent)
+    # Submit gate — require sandbox + at least attempted tests.
+    # Review is recommended but NOT required — the reviewer can be wrong.
+    if tool_name == "submit_fix":
+        hard_missing = []
+        if not gs.sandbox_created:
+            hard_missing.append("create_sandbox (no sandbox exists)")
+        if not gs.tests_attempted:
+            hard_missing.append("run_tests (must attempt tests at least once)")
+        if hard_missing:
+            return (
+                "ERROR: Cannot submit yet. Missing prerequisites:\n"
+                + "\n".join(f"  - {m}" for m in hard_missing)
+            )
+        # Soft warnings — inform but don't block
+        warnings = []
+        if not gs.tests_passed and not gs.tests_skipped:
+            warnings.append("Tests failed — double-check your fix is correct.")
+        if not gs.review_approved:
+            warnings.append("Review not yet approved — submitting without review approval.")
+        if warnings:
+            return "WARNING: " + " ".join(warnings) + " Proceeding with submit."
+
+    # ── Soft guidance (warnings only — never block exploration) ─────────
+    # The agent needs freedom to explore. These are nudges, not walls.
+
+    explore_tools = {"grep_repo", "read_file", "read_function", "list_files",
+                     "get_file_structure", "get_function_info", "get_blast_radius"}
+
+    # Nudge: prefer read_function over grep after several greps
     if tool_name == "grep_repo" and gs.grep_count >= 8:
         return (
-            f"WARNING: You've called grep_repo {gs.grep_count} times. "
-            "You're likely searching blindly. Try read_function on a specific "
-            "file instead, or escalate if you can't find the bug."
+            f"WARNING: grep_repo called {gs.grep_count} times. "
+            "Consider using read_function(file, function_name) instead — "
+            "it gives you the complete function with full context. "
+            "grep finds WHERE things are; read_function shows you WHAT they do."
         )
 
-    if tool_name == "read_file" and gs.read_file_count >= 10:
+    # Nudge: tests on unmodified code
+    if tool_name in ("run_tests", "run_brt") and gs.sandbox_created and gs.string_replace_count == 0:
         return (
-            f"WARNING: You've called read_file {gs.read_file_count} times. "
-            "You have enough context. Make a decision: edit a fix or escalate."
+            "WARNING: You're running tests but haven't made any edits yet. "
+            "Tests will show the existing behavior, not your fix. "
+            "Call string_replace() first to apply your fix, THEN run tests."
         )
 
+    # Nudge: test infra issues — don't keep retrying
     if tool_name == "run_tests" and gs.run_tests_count >= 3:
         return (
-            f"WARNING: You've called run_tests {gs.run_tests_count} times. "
-            "If tests can't run (missing deps, no test config), proceed to "
-            "request_review and submit_fix. Do NOT keep retrying."
+            f"WARNING: run_tests called {gs.run_tests_count} times. "
+            "If tests can't run (missing deps/pytest), that's an environment issue, "
+            "not your code. Proceed to request_review and submit_fix."
         )
 
-    if tool_name == "string_replace" and gs.string_replace_count >= 4:
-        return (
-            f"WARNING: You've called string_replace {gs.string_replace_count} times. "
-            "If edits keep failing, re-read the target function with read_function "
-            "to get the exact current content, then make ONE more attempt."
-        )
-
+    # Nudge: review loop — if reviewer keeps rejecting, submit anyway
+    # A correct fix shouldn't be blocked by a disagreeing reviewer
     if tool_name == "request_review" and gs.review_count >= 2:
         return (
-            f"WARNING: You've requested review {gs.review_count} times. "
-            "Submit your fix or escalate. Do not keep asking for review."
+            f"WARNING: review requested {gs.review_count} times. "
+            "If the reviewer keeps requesting changes but your fix is correct, "
+            "call submit_fix directly — the reviewer may be wrong."
         )
 
     return None
@@ -167,6 +194,15 @@ def update_from_tool_result(
     gs.tool_call_count += 1
     gs.tool_history.append(tool_name)
 
+    # Track files read for read-before-edit enforcement + cross-phase cache
+    if tool_name in ("read_file", "read_function") and not result.startswith("ERROR"):
+        file_path = tool_args.get("file_path", "")
+        if file_path:
+            gs.files_read[file_path] = result[:200]
+            # Cache full content for top N files (avoids re-reading after masking)
+            if len(gs.file_cache) < gs.FILE_CACHE_MAX:
+                gs.file_cache[file_path] = result[:8000]
+
     # Track per-tool counts for anti-pattern detection
     if tool_name == "grep_repo":
         gs.grep_count += 1
@@ -176,11 +212,14 @@ def update_from_tool_result(
         gs.run_tests_count += 1
     elif tool_name == "string_replace":
         gs.string_replace_count += 1
+        if not result.startswith("ERROR"):
+            gs._last_edit_call = gs.tool_call_count  # Track for post-edit explore cap
     elif tool_name == "request_review":
         gs.review_count += 1
 
     if tool_name == "create_sandbox" and "OK:" in result:
         gs.sandbox_created = True
+        gs._sandbox_call_number = gs.tool_call_count  # Track when sandbox was created
         # Extract sandbox path from result
         for line in result.split("\n"):
             if "sandbox_path=" in line:

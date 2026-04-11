@@ -34,14 +34,12 @@ services:
       DATA_DIR: /data
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
       ANONYMIZED_TELEMETRY: "False"
-      CHROMA_TELEMETRY: "false"
       GH_TOKEN: ${GH_TOKEN}
       GITHUB_TOKEN: ${GH_TOKEN}
     volumes:
       - ./backend:/app
       - repo_mounts:/repos
       - context_data:/data
-      - chroma_cache:/root/.cache/chroma
       - /Users/utkarshpatidar:/Users/utkarshpatidar:rw
     depends_on:
       neo4j:
@@ -74,4 +72,3 @@ volumes:
   neo4j_data:
   repo_mounts:
   context_data:
-  chroma_cache:

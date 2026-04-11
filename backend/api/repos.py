@@ -218,15 +218,15 @@ def run_analysis(job_id: str, req: AnalyzeRequest):
         except Exception as fr_err:
             logger.warning("FailureRecord mining failed (non-fatal): %s", fr_err)
 
-        # Save enriched nodes + build embeddings
+        # Save enriched nodes cache
         try:
             rules_for_enrichment = []
             if not use_neo4j:
                 rules_for_enrichment = rules  # Already extracted above
-            from embeddings.embedder import build_enriched_nodes, NodeEmbedder
+            from embeddings.embedder import build_enriched_nodes
             enriched = build_enriched_nodes(parsed, graph_data, decision_points, domain_concepts, rules_for_enrichment)
 
-            # Merge LLM summaries from Neo4j into enriched nodes for better embeddings
+            # Merge LLM summaries from Neo4j into enriched nodes
             if use_neo4j:
                 try:
                     summaries = neo4j_client.run(
@@ -247,10 +247,8 @@ def run_analysis(job_id: str, req: AnalyzeRequest):
                     logger.debug("Could not merge Neo4j summaries: %s", neo_err)
 
             (out / "enriched_nodes.json").write_text(json.dumps(enriched, default=str))
-            embedder = NodeEmbedder(repo_name, _DATA_DIR)
-            embedder.build_embeddings(enriched)
-        except Exception as emb_err:
-            logger.warning("Embedding generation failed (non-fatal): %s", emb_err)
+        except Exception as enr_err:
+            logger.warning("Enriched node cache generation failed (non-fatal): %s", enr_err)
 
         # Generate default lint rules based on detected tech stack (Step 16)
         try:
@@ -355,7 +353,7 @@ def list_repos():
 
 @router.delete("/repos/{repo_name}")
 def delete_repo(repo_name: str):
-    """Delete all data for a repository (disk + Neo4j + ChromaDB)."""
+    """Delete all data for a repository (disk + Neo4j)."""
     import shutil
 
     if not _SAFE_REPO_NAME.match(repo_name):
@@ -405,7 +403,7 @@ def get_repo_detail(repo_name: str):
         "name": repo_name,
         "has_context": (repo_dir / "context.md").exists(),
         "has_summary": (repo_dir / "summary.md").exists(),
-        "has_embeddings": (repo_dir / "chromadb").exists(),
+        "has_embeddings": False,
         "has_enriched": (repo_dir / "enriched_nodes.json").exists(),
     }
 

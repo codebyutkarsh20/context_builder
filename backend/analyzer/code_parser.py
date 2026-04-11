@@ -134,7 +134,9 @@ def _parse_imports(tree_root: Node, source: bytes) -> list[dict]:
             # from foo import bar, baz
             module = ""
             names: list[str] = []
-            alias: Optional[str] = None
+            # aliases: maps original name → alias string (for aliased imports)
+            # e.g. `from x import A as a, B as b` → {"A": "a", "B": "b"}
+            aliases: dict[str, str] = {}
             past_import_keyword = False
 
             children = node.children
@@ -153,19 +155,30 @@ def _parse_imports(tree_root: Node, source: bytes) -> list[dict]:
                 elif c.type == "wildcard_import":
                     names.append("*")
                 elif c.type == "aliased_import":
+                    # aliased_import: dotted_name/identifier "as" identifier
+                    # Each aliased_import is a separate node — collect per-name
                     parts = [ch for ch in c.children if ch.type in ("dotted_name", "identifier")]
                     if len(parts) >= 2:
-                        names.append(_text(parts[0], source))
-                        alias = _text(parts[-1], source)
+                        orig = _text(parts[0], source)
+                        alias_name = _text(parts[-1], source)
+                        names.append(orig)
+                        aliases[orig] = alias_name
                     elif parts:
                         names.append(_text(parts[0], source))
                 idx += 1
+
+            # alias field: for single-alias imports keep backward compat (first alias),
+            # for multi-alias keep all via the aliases dict stored in names structure.
+            # Simple approach: alias = first alias value if exactly one aliased import,
+            # otherwise None (callers should use the names list).
+            alias: Optional[str] = next(iter(aliases.values())) if len(aliases) == 1 else None
 
             imports.append(
                 {
                     "module": module,
                     "names": names,
                     "alias": alias,
+                    "aliases": aliases,  # new: per-name alias mapping
                     "is_from": True,
                 }
             )
@@ -606,18 +619,75 @@ class CodeParser:
             return None
 
         def _estimate_func_end(start_line: int) -> int:
-            """Estimate function end by counting braces from the start line."""
+            """Estimate function end by counting braces from the start line.
+
+            Skips braces inside:
+              - single-quoted strings ('...')
+              - double-quoted strings ("...")
+              - template literals (`...`)
+              - line comments (// ...)
+              - block comments (/* ... */)
+            """
             brace_depth = 0
             started = False
+            in_block_comment = False
+            in_template = False   # simple single-level template literal tracking
             for i in range(start_line - 1, len(lines)):
                 line = lines[i]
-                for ch in line:
+                j = 0
+                while j < len(line):
+                    ch = line[j]
+
+                    # Block comment end
+                    if in_block_comment:
+                        if ch == "*" and j + 1 < len(line) and line[j + 1] == "/":
+                            in_block_comment = False
+                            j += 2
+                            continue
+                        j += 1
+                        continue
+
+                    # Block comment start
+                    if ch == "/" and j + 1 < len(line) and line[j + 1] == "*":
+                        in_block_comment = True
+                        j += 2
+                        continue
+
+                    # Line comment — skip rest of line
+                    if ch == "/" and j + 1 < len(line) and line[j + 1] == "/":
+                        break
+
+                    # Template literal toggle (simple: ignores nested ${})
+                    if ch == "`":
+                        in_template = not in_template
+                        j += 1
+                        continue
+                    if in_template:
+                        j += 1
+                        continue
+
+                    # Single-quoted string — skip to closing quote
+                    if ch in ("'", '"'):
+                        quote = ch
+                        j += 1
+                        while j < len(line):
+                            if line[j] == "\\" :
+                                j += 2  # skip escape
+                                continue
+                            if line[j] == quote:
+                                break
+                            j += 1
+                        j += 1
+                        continue
+
                     if ch == "{":
                         brace_depth += 1
                         started = True
                     elif ch == "}":
                         brace_depth -= 1
-                if started and brace_depth <= 0:
+                    j += 1
+
+                if started and brace_depth <= 0 and not in_block_comment:
                     return i + 1  # 1-indexed
             return min(start_line + 50, len(lines))  # fallback
 
@@ -747,53 +817,67 @@ class CodeParser:
         # --- imports ---
         imports = _parse_imports(root, source_bytes)
 
-        # --- top-level classes and functions ---
+        # --- classes and functions (recursive — captures nested/factory patterns) ---
         classes: list[dict] = []
         functions: list[dict] = []
 
-        for child in root.children:
-            actual = child
-            if child.type == "decorated_definition":
-                for sub in child.children:
-                    if sub.type in ("function_definition", "class_definition"):
-                        actual = sub
-                        break
+        def _walk_nodes(nodes, inside_class: bool = False) -> None:
+            """Recursively collect classes and top-level-ish functions.
 
-            if actual.type == "class_definition":
-                cls_info = _parse_class(actual, source_bytes)
-                # fallback docstring
-                if cls_info["docstring"] is None:
-                    cls_info["docstring"] = _ast_fallback_docstring(
-                        source_str, "class", cls_info["name"]
-                    )
-                # fallback decorators
-                if not cls_info["decorators"]:
-                    cls_info["decorators"] = _ast_fallback_decorators(
-                        source_str, "class", cls_info["name"]
-                    )
-                # fallback for method docstrings / decorators
-                for method in cls_info["methods"]:
-                    if method["docstring"] is None:
-                        method["docstring"] = _ast_fallback_docstring(
-                            source_str, "function", method["name"]
-                        )
-                    if not method["decorators"]:
-                        method["decorators"] = _ast_fallback_decorators(
-                            source_str, "function", method["name"]
-                        )
-                classes.append(cls_info)
+            We descend into function bodies to find nested functions (e.g. Flask
+            create_app factory, closures) but we do NOT recurse into class bodies
+            here — _parse_class already handles methods internally.
+            """
+            for child in nodes:
+                actual = child
+                if child.type == "decorated_definition":
+                    for sub in child.children:
+                        if sub.type in ("function_definition", "class_definition"):
+                            actual = sub
+                            break
 
-            elif actual.type == "function_definition":
-                fn_info = _parse_function(actual, source_bytes)
-                if fn_info["docstring"] is None:
-                    fn_info["docstring"] = _ast_fallback_docstring(
-                        source_str, "function", fn_info["name"]
+                if actual.type == "class_definition":
+                    cls_info = _parse_class(actual, source_bytes)
+                    if cls_info["docstring"] is None:
+                        cls_info["docstring"] = _ast_fallback_docstring(
+                            source_str, "class", cls_info["name"]
+                        )
+                    if not cls_info["decorators"]:
+                        cls_info["decorators"] = _ast_fallback_decorators(
+                            source_str, "class", cls_info["name"]
+                        )
+                    for method in cls_info["methods"]:
+                        if method["docstring"] is None:
+                            method["docstring"] = _ast_fallback_docstring(
+                                source_str, "function", method["name"]
+                            )
+                        if not method["decorators"]:
+                            method["decorators"] = _ast_fallback_decorators(
+                                source_str, "function", method["name"]
+                            )
+                    classes.append(cls_info)
+                    # Do not recurse into class body — _parse_class owns methods
+
+                elif actual.type in ("function_definition", "async_function_definition"):
+                    fn_info = _parse_function(actual, source_bytes)
+                    if fn_info["docstring"] is None:
+                        fn_info["docstring"] = _ast_fallback_docstring(
+                            source_str, "function", fn_info["name"]
+                        )
+                    if not fn_info["decorators"]:
+                        fn_info["decorators"] = _ast_fallback_decorators(
+                            source_str, "function", fn_info["name"]
+                        )
+                    functions.append(fn_info)
+                    # Recurse into function body to capture nested functions
+                    body = next(
+                        (c for c in actual.children if c.type == "block"),
+                        None,
                     )
-                if not fn_info["decorators"]:
-                    fn_info["decorators"] = _ast_fallback_decorators(
-                        source_str, "function", fn_info["name"]
-                    )
-                functions.append(fn_info)
+                    if body is not None:
+                        _walk_nodes(body.children, inside_class=False)
+
+        _walk_nodes(root.children)
 
         loc = len(source_str.splitlines())
 

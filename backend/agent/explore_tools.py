@@ -110,9 +110,12 @@ def _redact_content(text: str) -> str:
 
 
 def _cap(text: str) -> str:
-    if len(text) <= _MAX_OUTPUT:
+    """Internal safety cap. The real per-tool cap is applied by cap_tool_output() in react_loop.py
+    using the tool_metadata registry. This is just a backstop for very large outputs."""
+    MAX = 40_000  # 40K chars backstop — individual tool caps are lower
+    if len(text) <= MAX:
         return text
-    return text[:_MAX_OUTPUT] + f"\n... [truncated — {len(text) - _MAX_OUTPUT} more chars]"
+    return text[:MAX] + f"\n... [truncated — {len(text) - MAX} more chars]"
 
 
 def _safe_relpath(p: Path) -> str:
@@ -329,16 +332,16 @@ def _extract_function_brace_counting(
 # ---------------------------------------------------------------------------
 
 @tool
-def grep_repo(pattern: str, file_glob: str = "", max_results: int = 10) -> str:
+def grep_repo(pattern: str, file_glob: str = "", max_results: int = 20, context_lines: int = 2) -> str:
     """
-    Search for a regex pattern across source files. Returns file:line matches.
-    Use this to FIND where code lives, then read_function to read it.
-    Keep max_results low (5-10) — you rarely need 25 matches.
+    Search for a regex pattern across source files. Returns matches with
+    surrounding context lines so you can understand the code around each match.
 
     Args:
         pattern: Regex or literal string to search for
         file_glob: Optional glob filter e.g. '*.py' to narrow search
-        max_results: Max matches to return (default 10 — keep it small)
+        max_results: Max matches to return (default 20)
+        context_lines: Lines of context before/after each match (default 2)
     """
     repo_path = getattr(_tls, 'repo_path', None)
     if not repo_path or not repo_path.exists():
@@ -346,19 +349,35 @@ def grep_repo(pattern: str, file_glob: str = "", max_results: int = 10) -> str:
 
     try:
         cmd = _build_search_cmd(pattern, repo_path, file_glob, max_results)
+        # Add context lines for better understanding
+        if context_lines > 0 and _HAS_RIPGREP:
+            # Insert -C flag before the pattern
+            idx = cmd.index("--")
+            cmd.insert(idx, f"-C{context_lines}")
+        elif context_lines > 0:
+            # GNU grep
+            cmd.insert(1, f"-C{context_lines}")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         output = result.stdout.strip()
         if not output:
             return f"No matches found for pattern: {pattern}"
 
-        # Make paths relative
+        # Make paths relative and cap line length
         lines = []
-        for line in output.split("\n")[:max_results]:
-            if repo_path:
-                line = line.replace(str(repo_path) + "/", "")
+        repo_str = str(repo_path) + "/"
+        for line in output.split("\n"):
+            line = line.replace(repo_str, "")
+            # Cap individual lines at 500 chars (prevents base64/minified noise)
+            if len(line) > 500:
+                line = line[:500] + "..."
             lines.append(line)
 
-        return _cap(f"Found {len(lines)} matches:\n" + "\n".join(lines))
+        # Apply head limit
+        if len(lines) > max_results * (1 + 2 * context_lines):
+            lines = lines[:max_results * (1 + 2 * context_lines)]
+            lines.append(f"... (truncated to {max_results} matches)")
+
+        return _cap(f"Found matches for '{pattern}':\n" + "\n".join(lines))
     except subprocess.TimeoutExpired:
         return "ERROR: grep timed out"
     except Exception as e:
@@ -370,20 +389,16 @@ def grep_repo(pattern: str, file_glob: str = "", max_results: int = 10) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def read_file(file_path: str, start_line: int = 1, end_line: int = 80) -> str:
+def read_file(file_path: str, start_line: int = 1, end_line: int = 0) -> str:
     """
-    Read a window of a file. PREFER read_function when you know the function name
-    — it extracts exactly one function with line numbers.
-
-    Use read_file when you need:
-    - File header/imports (start_line=1, end_line=30)
-    - A specific line range from grep results
-    - Code that isn't inside a function (class-level, module-level)
+    Read a file with a 100-line viewer window. Shows line numbers for navigation.
+    Use the code map in your context to find the right line numbers, then read
+    the section you need. Call again with different start_line to scroll.
 
     Args:
         file_path: Relative path from repo root e.g. 'app/services/payment.py'
         start_line: First line to read (1-indexed, default 1)
-        end_line: Last line to read (default 80)
+        end_line: Last line to read (0 = start_line + 100). Set explicitly for larger sections.
     """
     repo_path = getattr(_tls, 'repo_path', None)
     if not repo_path:
@@ -410,15 +425,19 @@ def read_file(file_path: str, start_line: int = 1, end_line: int = 80) -> str:
         lines = content.split("\n")
         total = len(lines)
 
+        # Default: 100-line window from start_line (SWE-agent proven design)
         s = max(0, start_line - 1)
-        e = min(total, end_line)
+        e = min(total, end_line) if end_line > 0 else min(total, s + 100)
         selected = lines[s:e]
 
         header = f"=== {file_path} (lines {s+1}-{e} of {total}) ===\n"
         numbered = "\n".join(f"{s+1+i:4d} | {ln}" for i, ln in enumerate(selected))
         footer = ""
         if e < total:
-            footer = f"\n... [{total - e} more lines — call read_file with start_line={e+1}]"
+            footer = f"\n... [{total - e} more lines — read_file('{file_path}', start_line={e+1}) to scroll down]"
+        if s > 0:
+            prev_start = max(1, s - 99)
+            footer = f"\n[scroll up: read_file('{file_path}', start_line={prev_start})]" + footer
 
         # Issue #13: redact secrets before returning content to the LLM
         return _redact_content(_cap(header + numbered + footer))
@@ -631,49 +650,7 @@ def list_files(directory: str = "", extension: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 5 — search_code
-# ---------------------------------------------------------------------------
-
-@tool
-def search_code(query: str, limit: int = 10) -> str:
-    """
-    Semantic search across the codebase using natural language.
-    Finds functions, classes and files by meaning — not just keyword matching.
-    Use this when you don't know the exact name but know what you're looking for.
-
-    Args:
-        query: Natural language description e.g. 'payment validation logic'
-        limit: Number of results (default 10, max 20)
-    """
-    repo_name = getattr(_tls, 'repo_name', None)
-    data_dir = getattr(_tls, 'data_dir', None)
-    try:
-        from embeddings.embedder import NodeEmbedder
-        embedder = NodeEmbedder(repo_name, data_dir)
-        info = embedder.collection_info()
-        if info.get("count", 0) == 0:
-            return "Semantic search not available — embeddings not built for this repo. Use grep_repo instead."
-
-        results = embedder.query(text=query, n_results=min(limit, 20))
-        if not results:
-            return f"No results for: {query}"
-
-        lines = [f"Semantic search results for: '{query}'\n"]
-        for r in results:
-            nid = r.get("id", "")
-            meta = r.get("metadata", {})
-            score = r.get("score", 0)
-            lines.append(
-                f"  [{score:.3f}] {meta.get('type','?')} — {nid}\n"
-                f"          File: {meta.get('file', '')}"
-            )
-        return _cap("\n".join(lines))
-    except Exception as e:
-        return f"Semantic search unavailable: {e}. Use grep_repo instead."
-
-
-# ---------------------------------------------------------------------------
-# Tool 6 — get_function_info
+# Tool 5 — get_function_info
 # ---------------------------------------------------------------------------
 
 @tool
@@ -1433,6 +1410,165 @@ def search_subagent(query: str, context: str = "") -> str:
     return f"Search results for '{query}':\n{final_answer.strip()}"
 
 
+# ---------------------------------------------------------------------------
+# Execution flow & change-impact tools
+# ---------------------------------------------------------------------------
+
+
+def _load_flows_data(repo_name: str) -> dict:
+    """Load flows.json for a repo, returning empty dict on failure."""
+    data_dir = getattr(_tls, "data_dir", Path(os.environ.get("DATA_DIR", "/tmp/context_builder")))
+    flows_path = data_dir / repo_name / "flows.json"
+    if flows_path.exists():
+        return _load_json_cached(flows_path) or {}
+    return {}
+
+
+@tool
+def get_execution_flows(filter_file: str = "", top_n: int = 5) -> str:
+    """
+    Get the most critical execution flows in the codebase. Shows how code is
+    reached at runtime — API routes, CLI commands, background tasks, etc.
+    Use this to understand which entry points touch the area you're investigating.
+
+    Args:
+        filter_file: Optional file path substring to filter flows (e.g. "auth" or "api/routes")
+        top_n: Number of top flows to return (default: 5)
+    """
+    repo_name = getattr(_tls, "repo_name", "")
+    if not repo_name:
+        return "ERROR: repo context not set"
+
+    flows_data = _load_flows_data(repo_name)
+    flows = flows_data.get("flows", [])
+    if not flows:
+        return "No execution flows found. Run `cli.py build` to generate flows.json."
+
+    if filter_file:
+        fl = filter_file.lower()
+        flows = [f for f in flows if any(fl in fp.lower() for fp in f.get("files", []))]
+
+    flows = flows[:top_n]
+
+    if not flows:
+        return f"No flows matching '{filter_file}'."
+
+    lines = [f"Top {len(flows)} execution flows (by criticality):"]
+    for i, flow in enumerate(flows, 1):
+        lines.append(
+            f"\n{i}. {flow['name']}  (criticality: {flow['criticality']:.2f})"
+        )
+        lines.append(f"   Entry: {flow['entry_point']}")
+        lines.append(f"   Depth: {flow['depth']}, Nodes: {flow['node_count']}, Files: {flow['file_count']}")
+        files = flow.get("files", [])[:5]
+        if files:
+            lines.append(f"   Files: {', '.join(files)}")
+            if len(flow.get("files", [])) > 5:
+                lines.append(f"   ... +{len(flow['files']) - 5} more files")
+        path_preview = flow.get("path", [])[:6]
+        if path_preview:
+            labels = [p.rsplit("::", 1)[-1] if "::" in p else p for p in path_preview]
+            trail = " → ".join(labels)
+            if len(flow.get("path", [])) > 6:
+                trail += " → ..."
+            lines.append(f"   Path: {trail}")
+
+    lines.append(f"\nTotal: {flows_data.get('flow_count', '?')} flows, "
+                 f"{flows_data.get('entry_point_count', '?')} entry points")
+    return _cap("\n".join(lines))
+
+
+@tool
+def get_change_impact(base_ref: str = "HEAD~1") -> str:
+    """
+    Analyze current git changes and show which functions are affected, their
+    risk scores, and which execution flows are impacted. Use after editing
+    code to understand the blast radius of your changes.
+
+    Args:
+        base_ref: Git ref to diff against (default: HEAD~1)
+    """
+    repo_name = getattr(_tls, "repo_name", "")
+    repo_path = getattr(_tls, "repo_path", None)
+    if not repo_name or not repo_path:
+        return "ERROR: repo context not set"
+
+    from agent.graph_utils import load_graph_data
+    from analyzer.changes import detect_changes
+
+    graph_data, _ = load_graph_data(repo_name)
+    if not graph_data:
+        return "ERROR: graph.json not found. Run `cli.py build` first."
+
+    flows_data = _load_flows_data(repo_name)
+
+    result = detect_changes(
+        repo_path=repo_path,
+        graph_data=graph_data,
+        flows_data=flows_data,
+        base_ref=base_ref,
+    )
+
+    lines = [result["risk_summary"]["summary"]]
+
+    scored = result.get("changed_nodes", [])
+    if scored:
+        lines.append("\nChanged functions (by risk):")
+        for n in sorted(scored, key=lambda x: x["risk_score"], reverse=True)[:10]:
+            lines.append(f"  {n['label']} ({n['file']}) — risk: {n['risk_score']:.2f}")
+
+    affected = result.get("affected_flows", [])
+    if affected:
+        lines.append(f"\nAffected flows ({len(affected)}):")
+        for f in affected[:5]:
+            lines.append(f"  - {f['name']} (criticality: {f.get('criticality', 0):.2f})")
+
+    gaps = result.get("test_gaps", [])
+    if gaps:
+        lines.append(f"\nTest gaps ({len(gaps)}):")
+        for g in gaps[:5]:
+            lines.append(f"  - {g['label']} ({g['file']})")
+
+    return _cap("\n".join(lines))
+
+
+@tool
+def get_dead_code(file_path: str = "") -> str:
+    """
+    Find unreachable code — functions with no callers, no tests, and not entry
+    points. Use during refactors to identify safe deletion candidates.
+
+    Args:
+        file_path: Optional file path substring to filter results (e.g. "utils" or "api/")
+    """
+    repo_name = getattr(_tls, "repo_name", "")
+    if not repo_name:
+        return "ERROR: repo context not set"
+
+    flows_data = _load_flows_data(repo_name)
+    dead_code = flows_data.get("dead_code", [])
+
+    if not dead_code:
+        if not flows_data:
+            return "No flows.json found. Run `cli.py build` to generate it."
+        return "No dead code detected — all functions are either called, tested, or entry points."
+
+    if file_path:
+        fp = file_path.lower()
+        dead_code = [d for d in dead_code if fp in d.get("file", "").lower()]
+
+    if not dead_code:
+        return f"No dead code matching '{file_path}'."
+
+    lines = [f"Dead code: {len(dead_code)} unreachable function(s)"]
+    for d in dead_code[:20]:
+        lines.append(f"  - {d['label']} ({d['file']}) [{d['type']}]")
+    if len(dead_code) > 20:
+        lines.append(f"  ... +{len(dead_code) - 20} more")
+    lines.append("\nThese functions have no callers, no tests, and are not entry points.")
+    return _cap("\n".join(lines))
+
+
 # Exploration tools — READ-ONLY. The agent uses these to understand the codebase.
 # string_replace and check_syntax are intentionally excluded: direct edits during
 # exploration leave the main repo dirty, which blocks git worktree creation in the
@@ -1442,16 +1578,9 @@ ALL_TOOLS = [
     read_file,
     read_function,
     list_files,
-    search_code,
     get_function_info,
-    get_file_summary,
     get_file_structure,
-    get_call_chain,
-    get_business_rules_for,
-    get_failure_history,
     get_blast_radius,
-    screen_files,
-    search_subagent,
 ]
 
 

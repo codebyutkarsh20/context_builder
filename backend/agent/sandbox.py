@@ -215,7 +215,34 @@ def _format_test_output(returncode: int, raw_output: str, timeout: int) -> str:
             + raw_output[-500:]
         )
 
-    # Exit code 1 = actual test assertion failures. This IS the agent's problem.
+    # Exit code 1 — could be real test failures OR infra problems.
+    # Detect infra-level issues that aren't the agent's fault:
+    #   - pytest not installed ("No module named pytest")
+    #   - missing test dependencies ("ModuleNotFoundError", "ImportError" at top level)
+    #   - no test runner found
+    output_lower = raw_output.lower()
+    infra_markers = [
+        "no module named pytest",
+        "no module named _pytest",
+        "command not found",
+        "no such file or directory",
+        "modulenotfounderror: no module named",
+    ]
+    # Only treat as infra error if these appear in the FIRST few lines (top-level import failure)
+    # not in test assertion output (which might mention ModuleNotFoundError as expected behavior)
+    first_lines = "\n".join(raw_output.splitlines()[:15]).lower()
+    is_infra_failure = any(marker in first_lines for marker in infra_markers)
+
+    if is_infra_failure:
+        logger.warning("Test infra failure (exit code %d) — not an assertion failure", returncode)
+        return (
+            "error: test infrastructure failure (exit code 1). "
+            "The test runner or dependencies are not installed in the sandbox. "
+            "This is NOT a problem with your code fix — the test environment is broken.\n"
+            + raw_output[:500]
+        )
+
+    # Real test assertion failures — this IS the agent's problem.
     logger.warning("Tests failed (exit code %d)", returncode)
     error_lines = []
     for line in raw_output.splitlines():

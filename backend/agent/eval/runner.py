@@ -494,7 +494,7 @@ def _bug_to_work_order(bug: dict, repo_path: Path) -> dict:
         or bug.get("repo")
         or bug["ticket_id"].lower()
     )
-    return {
+    wo = {
         "ticket_id": bug["ticket_id"],
         "title": bug.get("title", bug["ticket_id"]),
         "description": bug.get("description", ""),
@@ -503,6 +503,15 @@ def _bug_to_work_order(bug: dict, repo_path: Path) -> dict:
         "priority": bug.get("priority", "medium"),
         "comments": bug.get("comments", []),
     }
+    # Pass test configuration from eval dataset so finalize_node can run
+    # ground-truth tests with the correct command (instead of auto-detection).
+    if bug.get("test_command"):
+        wo["test_command"] = bug["test_command"]
+    if bug.get("setup_commands"):
+        wo["setup_commands"] = bug["setup_commands"]
+    if bug.get("test_timeout"):
+        wo["test_timeout"] = bug["test_timeout"]
+    return wo
 
 
 def _pick_winner(r1: EvalCaseResult, r2: EvalCaseResult, p1: str, p2: str) -> str:

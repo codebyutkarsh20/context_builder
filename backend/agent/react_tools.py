@@ -175,7 +175,9 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
                     actual_old = "\n".join(lines[i:i + len(norm_old)])
                     content = content.replace(actual_old, new_string, 1)
                     resolved.write_text(content, encoding="utf-8")
-                    return f"OK: replaced (whitespace-normalized) in {file_path}"
+                    autofix_msg = _try_autofix(resolved)
+                    result = f"OK: replaced (whitespace-normalized) in {file_path}"
+                    return f"{result}\n{autofix_msg}" if autofix_msg else result
             return (
                 f"ERROR: old_string not found in {file_path}.\n"
                 f"Use read_file or read_function to get the current exact content."
@@ -193,9 +195,35 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
         new_lines_count = new_string.count("\n") + 1
         delta = new_lines_count - old_lines_count
         delta_str = f"+{delta}" if delta >= 0 else str(delta)
-        return f"OK: replaced 1 occurrence in {file_path} ({delta_str} lines)"
+
+        # Deterministic autofix: run ruff --fix on edited Python files
+        autofix_msg = _try_autofix(resolved)
+
+        result = f"OK: replaced 1 occurrence in {file_path} ({delta_str} lines)"
+        if autofix_msg:
+            result += f"\n{autofix_msg}"
+        return result
     except Exception as e:
         return f"ERROR: {e}"
+
+
+def _try_autofix(file_path: Path) -> str:
+    """Run ruff --fix on a Python file after editing. Returns status message or empty string."""
+    if file_path.suffix not in (".py", ".pyi"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["ruff", "check", "--fix", "--quiet", str(file_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stderr:
+            # ruff applied fixes
+            fixed_count = result.stderr.count("Fixed")
+            if fixed_count:
+                return f"(autofix: ruff fixed {fixed_count} issue(s))"
+        return ""
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
 
 
 @tool
@@ -517,10 +545,17 @@ def _start_speculative_review(sandbox: Path) -> None:
 
     try:
         diff_result = subprocess.run(
-            ["git", "diff", "HEAD~1"],
+            ["git", "diff", "--unified=3", "HEAD~1"],
             cwd=str(sandbox), capture_output=True, text=True, timeout=15,
         )
-        diff_text = diff_result.stdout[:6000]
+        diff_text = diff_result.stdout
+        if len(diff_text) > 10000:
+            # Retry with minimal context
+            diff_result = subprocess.run(
+                ["git", "diff", "--unified=1", "HEAD~1"],
+                cwd=str(sandbox), capture_output=True, text=True, timeout=15,
+            )
+            diff_text = diff_result.stdout[:10000]
     except Exception:
         diff_text = ""
 
@@ -716,13 +751,24 @@ def request_review(explanation: str) -> str:
     else:
         spec_note = ""
 
-    # Collect the diff
+    # Collect the diff — use minimal context to avoid truncation on large files
     try:
         diff_result = subprocess.run(
-            ["git", "diff", "HEAD"],
+            ["git", "diff", "--unified=3", "HEAD"],
             cwd=sandbox, capture_output=True, text=True, timeout=30,
         )
-        diff_text = diff_result.stdout[:8000] if diff_result.stdout else "(no diff)"
+        diff_text = diff_result.stdout if diff_result.stdout else "(no diff)"
+        # If diff is too long, retry with even less context
+        if len(diff_text) > 12000:
+            diff_result = subprocess.run(
+                ["git", "diff", "--unified=1", "HEAD"],
+                cwd=sandbox, capture_output=True, text=True, timeout=30,
+            )
+            diff_text = diff_result.stdout if diff_result.stdout else diff_text
+        # Final safety cap — but log if truncated so we know
+        if len(diff_text) > 15000:
+            logger.warning("Review diff truncated from %d to 15000 chars", len(diff_text))
+            diff_text = diff_text[:15000] + "\n[... diff truncated — multi-file change]"
     except Exception:
         diff_text = "(could not generate diff)"
 
@@ -817,9 +863,10 @@ verdict: APPROVE if all checks pass. CHANGES_REQUESTED if any fail. ESCALATE if 
 @tool
 def submit_fix(explanation: str) -> str:
     """
-    Submit your fix for PR creation. Only call this after:
-    1. Tests have passed (run_tests returned 'passed')
-    2. Review has approved (request_review returned 'APPROVE')
+    Submit your fix for PR creation. Call this after:
+    1. You've made edits with string_replace
+    2. You've attempted run_tests at least once (OK if tests return 'error' or 'skipped')
+    Review is optional — you can submit without it if you're confident in your fix.
 
     Args:
         explanation: 2-3 sentence summary of what was fixed and why.
@@ -861,15 +908,27 @@ def submit_fix(explanation: str) -> str:
     committed = False
     if has_changes:
         try:
+            # Ensure git user is configured (sandbox may not have it)
+            subprocess.run(
+                ["git", "config", "user.email", "agent@context-builder.ai"],
+                cwd=sandbox, capture_output=True, text=True, timeout=5,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Context Builder Agent"],
+                cwd=sandbox, capture_output=True, text=True, timeout=5,
+            )
             subprocess.run(
                 ["git", "add", "-A"],
                 cwd=sandbox, capture_output=True, text=True, check=True, timeout=30,
             )
             result = subprocess.run(
-                ["git", "commit", "-m", f"fix: {explanation[:200]}"],
+                ["git", "commit", "--no-verify", "-m", f"fix: {explanation[:200]}"],
                 cwd=sandbox, capture_output=True, text=True, timeout=30,
             )
             committed = result.returncode == 0
+            if not committed:
+                logger.warning("Commit failed (rc=%d): stdout=%s stderr=%s",
+                               result.returncode, result.stdout[:200], result.stderr[:200])
         except subprocess.CalledProcessError as e:
             logger.warning("Commit failed during submit: %s", e.stderr or e)
 

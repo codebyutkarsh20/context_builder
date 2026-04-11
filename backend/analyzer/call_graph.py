@@ -54,13 +54,37 @@ def _resolve_import_module(
     Try to map an import module string to a relative file path present in known_paths.
 
     Handles:
-    - Absolute imports: "a.b.c" → "a/b/c.py" or "a/b/c/__init__.py"
-    - Relative imports: ".sibling" or "..parent.sibling"
+    - Python absolute imports: "a.b.c" → "a/b/c.py" or "a/b/c/__init__.py"
+    - Python relative imports: ".sibling" or "..parent.sibling"
+    - JS/TS relative imports: "./sibling", "../parent/sibling"
+      (tries .js, .ts, .jsx, .tsx, /index.js, /index.ts extensions)
     """
     if not module:
         return None
 
-    # --- relative import (starts with one or more dots) ---
+    # --- JS/TS relative import (starts with "./" or "../") ---
+    if module.startswith("./") or module.startswith("../"):
+        importer_dir = PurePosixPath(importer_path).parent
+        candidate_base = importer_dir / module
+        # Normalise (resolve ".." segments) as a string path
+        # PurePosixPath resolves ".." segments automatically
+        candidate_base_str = str(candidate_base)
+        # Strip leading "./" if any (can happen when importer is at root)
+        if candidate_base_str.startswith("./"):
+            candidate_base_str = candidate_base_str[2:]
+
+        js_suffixes = (".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs",
+                       "/index.js", "/index.ts", "/index.jsx", "/index.tsx")
+        for suffix in js_suffixes:
+            candidate = candidate_base_str + suffix
+            # Strip any remaining leading "./"
+            while candidate.startswith("./"):
+                candidate = candidate[2:]
+            if candidate in known_paths:
+                return candidate
+        return None
+
+    # --- Python relative import (starts with one or more dots) ---
     if module.startswith("."):
         dots = len(module) - len(module.lstrip("."))
         remainder = module.lstrip(".")
@@ -83,7 +107,7 @@ def _resolve_import_module(
                 return candidate
         return None
 
-    # --- absolute import ---
+    # --- Python absolute import ---
     module_as_path = module.replace(".", "/")
     for suffix in (".py", "/__init__.py"):
         candidate = module_as_path + suffix
@@ -218,6 +242,35 @@ def _scan_body_for_calls(
     return targets
 
 
+def _scan_calls_capped(
+    body_text: str,
+    func_name_to_ids: dict[str, list[str]],
+    caller_file: str,
+    file_imports: dict[str, str] | None,
+    caller_id: str,
+    fanout_cap: int,
+) -> list[str]:
+    """
+    Like _scan_body_for_calls but caps the number of resolved call targets.
+
+    At most *fanout_cap* unique target IDs are returned per call site.
+    Used by the focused CALLS resolution path for large repos.
+    """
+    raw = _scan_body_for_calls(body_text, func_name_to_ids, caller_file, file_imports)
+    seen_refs: set[str] = set()
+    result: list[str] = []
+    for target_id in raw:
+        if target_id == caller_id:
+            continue
+        if target_id in seen_refs:
+            continue
+        seen_refs.add(target_id)
+        if len(seen_refs) > fanout_cap:
+            break
+        result.append(target_id)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # CallGraphBuilder
 # ---------------------------------------------------------------------------
@@ -263,7 +316,9 @@ class CallGraphBuilder:
         # Phase 4: inheritance edges
         self._add_inherits_edges(G)
 
-        # Phase 5: call edges (best-effort, name-based, skipped for large repos)
+        # Phase 5: call edges (best-effort, name-based)
+        # For large repos (>2000 callables), use focused resolution scoped to
+        # high-PageRank files (top 30%) with per-function fanout capped at 50.
         total_funcs = sum(
             len(pf.get("functions", [])) + sum(len(c.get("methods", [])) for c in pf.get("classes", []))
             for pf in self._parsed
@@ -271,7 +326,11 @@ class CallGraphBuilder:
         if total_funcs <= 2000:
             self._add_call_edges(G)
         else:
-            logger.info("Skipping CALLS phase (>2000 callables) for performance")
+            logger.info(
+                "large repo: using focused CALLS resolution (%d callables, top-30%% files only, 50-call fanout cap)",
+                total_funcs,
+            )
+            self._add_call_edges_focused(G)
 
         # Phase 6: external call detection
         self._detect_external_calls(G)
@@ -322,20 +381,29 @@ class CallGraphBuilder:
             # Class nodes
             for cls in pf.get("classes", []):
                 cid = _class_id(rel, cls["name"])
+                # JS/TS parsers emit "lineno" instead of "line_start"; accept both
+                cls_start = cls.get("line_start") or cls.get("lineno", 0)
+                cls_end = cls.get("line_end") or cls_start
                 G.add_node(cid, label=cls["name"], type="class", file=rel,
-                           line_start=cls.get("line_start", 0), line_end=cls.get("line_end", 0))
+                           line_start=cls_start, line_end=cls_end)
 
                 # Method nodes
                 for method in cls.get("methods", []):
                     mid = _method_id(rel, cls["name"], method["name"])
+                    # JS/TS parsers emit "lineno" instead of "line_start"; accept both
+                    m_start = method.get("line_start") or method.get("lineno", 0)
+                    m_end = method.get("line_end") or m_start
                     G.add_node(mid, label=method["name"], type="function", file=rel,
-                               line_start=method.get("line_start", 0), line_end=method.get("line_end", 0))
+                               line_start=m_start, line_end=m_end)
 
             # Top-level function nodes
             for fn in pf.get("functions", []):
                 fid = _func_id(rel, fn["name"])
+                # JS/TS parsers emit "lineno" instead of "line_start"; accept both
+                fn_start = fn.get("line_start") or fn.get("lineno", 0)
+                fn_end = fn.get("line_end") or fn_start
                 G.add_node(fid, label=fn["name"], type="function", file=rel,
-                           line_start=fn.get("line_start", 0), line_end=fn.get("line_end", 0))
+                           line_start=fn_start, line_end=fn_end)
 
     # ------------------------------------------------------------------
     # Phase 2: CONTAINS edges
@@ -477,10 +545,13 @@ class CallGraphBuilder:
 
             # Top-level functions
             for fn in pf.get("functions", []):
-                if "line_start" not in fn or "line_end" not in fn:
+                # Accept line_start or lineno (JS/TS parsers emit lineno)
+                line_start = fn.get("line_start") or fn.get("lineno")
+                line_end = fn.get("line_end")
+                if not line_start or not line_end:
                     continue
                 caller_id = _func_id(rel, fn["name"])
-                body_text = _slice_lines(lines, fn["line_start"], fn["line_end"])
+                body_text = _slice_lines(lines, line_start, line_end)
                 for target_id in _scan_body_for_calls(body_text, func_name_to_ids, rel, file_imports):
                     if target_id != caller_id and not G.has_edge(caller_id, target_id):
                         G.add_edge(caller_id, target_id, type="CALLS", weight=call_w)
@@ -488,12 +559,133 @@ class CallGraphBuilder:
             # Methods
             for cls in pf.get("classes", []):
                 for method in cls.get("methods", []):
-                    if "line_start" not in method or "line_end" not in method:
+                    # Accept line_start or lineno (JS/TS parsers emit lineno)
+                    line_start = method.get("line_start") or method.get("lineno")
+                    line_end = method.get("line_end")
+                    if not line_start or not line_end:
                         continue
                     caller_id = _method_id(rel, cls["name"], method["name"])
-                    body_text = _slice_lines(lines, method["line_start"], method["line_end"])
+                    body_text = _slice_lines(lines, line_start, line_end)
                     for target_id in _scan_body_for_calls(body_text, func_name_to_ids, rel, file_imports):
                         if target_id != caller_id and not G.has_edge(caller_id, target_id):
+                            G.add_edge(caller_id, target_id, type="CALLS", weight=call_w)
+
+    # ------------------------------------------------------------------
+    # Phase 5b: Focused CALLS resolution for large repos
+    # ------------------------------------------------------------------
+
+    _LARGE_REPO_FANOUT_CAP = 50  # max call refs to resolve per function
+
+    def _add_call_edges_focused(self, G: nx.DiGraph) -> None:
+        """
+        Focused CALLS resolution for repos with >2000 callables.
+
+        Strategy:
+        1. Identify the top 30% of files by PageRank (computed over the
+           structural CONTAINS/IMPORTS/INHERITS edges already in G).
+        2. Build the callable index restricted to those files.
+        3. For each function/method in those files, scan its body and resolve
+           at most _LARGE_REPO_FANOUT_CAP unique call references.
+
+        This keeps the CALLS phase O(hot_files * avg_body_size) rather than
+        O(all_files * avg_body_size), while still capturing the most impactful
+        cross-file call edges for PageRank hotspot scoring.
+        """
+        # --- Step 1: identify high-pagerank files (top 30%) ---
+        file_pr: dict[str, float] = {}
+        for node_id, attrs in G.nodes(data=True):
+            if attrs.get("type") == "file":
+                file_pr[attrs.get("file", node_id)] = G.nodes[node_id].get("pagerank", 0.0)
+
+        if file_pr:
+            all_scores = sorted(file_pr.values(), reverse=True)
+            cutoff_idx = max(1, int(len(all_scores) * 0.30))
+            pr_threshold = all_scores[cutoff_idx - 1]
+            hot_files: set[str] = {
+                rel for rel, score in file_pr.items() if score >= pr_threshold
+            }
+        else:
+            # Fallback: include all files (shouldn't happen post-PageRank)
+            hot_files = self._known_paths
+
+        logger.debug("focused CALLS: %d hot files out of %d total", len(hot_files), len(self._known_paths))
+
+        # --- Step 2: build callable index restricted to hot files ---
+        func_name_to_ids: dict[str, list[str]] = {}
+        for pf in self._parsed:
+            rel = pf["path"]
+            if rel not in hot_files:
+                continue
+            for fn in pf.get("functions", []):
+                fid = _func_id(rel, fn["name"])
+                func_name_to_ids.setdefault(fn["name"], []).append(fid)
+            for cls in pf.get("classes", []):
+                for method in cls.get("methods", []):
+                    mid = _method_id(rel, cls["name"], method["name"])
+                    func_name_to_ids.setdefault(method["name"], []).append(mid)
+
+        call_w = self._EDGE_WEIGHTS["CALLS"]
+
+        # --- Step 3: scan functions in hot files, cap fanout at 50 ---
+        for pf in self._parsed:
+            rel = pf["path"]
+            if rel not in hot_files:
+                continue
+
+            abs_path = pf.get("abs_path", "")
+            try:
+                lines = _read_lines(abs_path)
+            except OSError:
+                continue
+
+            # Build per-file import alias map
+            file_imports: dict[str, str] = {}
+            for imp in pf.get("imports", []):
+                mod = imp.get("module", "")
+                resolved = _resolve_import_module(mod, imp.get("is_from", False), rel, self._known_paths)
+                if resolved:
+                    alias = imp.get("alias")
+                    names = imp.get("names", [])
+                    if alias:
+                        file_imports[alias] = resolved
+                    elif names:
+                        for n in names:
+                            name = n.get("name", "") if isinstance(n, dict) else str(n)
+                            if name:
+                                file_imports[name] = resolved
+                    elif not imp.get("is_from") and mod:
+                        short = mod.split(".")[-1]
+                        file_imports[short] = resolved
+
+            # Top-level functions
+            for fn in pf.get("functions", []):
+                line_start = fn.get("line_start") or fn.get("lineno")
+                line_end = fn.get("line_end")
+                if not line_start or not line_end:
+                    continue
+                caller_id = _func_id(rel, fn["name"])
+                body_text = _slice_lines(lines, line_start, line_end)
+                for target_id in _scan_calls_capped(
+                    body_text, func_name_to_ids, rel, file_imports,
+                    caller_id, self._LARGE_REPO_FANOUT_CAP,
+                ):
+                    if not G.has_edge(caller_id, target_id):
+                        G.add_edge(caller_id, target_id, type="CALLS", weight=call_w)
+
+            # Methods
+            for cls in pf.get("classes", []):
+                for method in cls.get("methods", []):
+                    line_start = method.get("line_start") or method.get("lineno")
+                    line_end = method.get("line_end")
+                    if not line_start or not line_end:
+                        continue
+                    caller_id = _method_id(rel, cls["name"], method["name"])
+                    body_text = _slice_lines(lines, line_start, line_end)
+                    for target_id in _scan_calls_capped(
+                        body_text, func_name_to_ids, rel, file_imports,
+                        caller_id, self._LARGE_REPO_FANOUT_CAP,
+                    ):
+                        if not G.has_edge(caller_id, target_id):
                             G.add_edge(caller_id, target_id, type="CALLS", weight=call_w)
 
     # ------------------------------------------------------------------

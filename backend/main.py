@@ -22,8 +22,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
     handlers=[logging.StreamHandler(), _file_handler],
 )
-for _lib in ("httpcore", "httpx", "chromadb", "urllib3", "openai._base_client",
-             "chromadb.telemetry", "chromadb.telemetry.product.posthog"):
+for _lib in ("httpcore", "httpx", "urllib3", "openai._base_client"):
     logging.getLogger(_lib).setLevel(logging.ERROR)
 # Suppress Neo4j INFORMATION notifications about pre-existing constraints/indexes
 logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)

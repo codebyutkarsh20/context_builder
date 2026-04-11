@@ -93,14 +93,14 @@ def _classify_community(repo_name: str, intent: dict, data_dir: Path) -> str | N
 
 
 def _prelocalize(repo_name: str, intent: dict, data_dir: Path) -> list[str]:
-    """Lightweight pre-localization: ChromaDB + graph neighbors → top-5 confirmed files.
+    """Lightweight pre-localization: LLM hints + graph neighbors → top-5 confirmed files.
 
     Runs in intake_node before the ReAct loop starts. Narrows from all repo
     files down to the most likely 5, so the agent starts with a strong prior
     and skips most early exploration tool calls (~40% savings).
 
     Strategy (Agentless 2-phase pattern):
-      1. ChromaDB semantic search on bug description → top-10 nodes
+      1. Seed from LLM hints (highest confidence)
       2. Graph neighbor expansion from hint_files/functions → 5-8 files
       3. Union + score → top-5 by combined score
     """
@@ -121,19 +121,7 @@ def _prelocalize(repo_name: str, intent: dict, data_dir: Path) -> list[str]:
     for f in hint_files:
         scores[f] += 3
 
-    # 2. ChromaDB vector search
-    try:
-        from embeddings.embedder import NodeEmbedder
-        embedder = NodeEmbedder(repo_name, data_dir)
-        results = embedder.query(bug_query, n_results=10)
-        for r in results:
-            file_ = r.get("metadata", {}).get("file", "")
-            if file_:
-                scores[file_] += 2
-    except Exception as e:
-        logger.debug("ChromaDB pre-localization failed (non-fatal): %s", e)
-
-    # 3. Graph neighbor expansion — files that call hint files/functions
+    # 2. Graph neighbor expansion — files that call hint files/functions
     try:
         graph_data, _ = load_graph_data(repo_name)
         neighbors = find_callers_from_graph(graph_data, hint_files, hint_functions)
@@ -141,6 +129,22 @@ def _prelocalize(repo_name: str, intent: dict, data_dir: Path) -> list[str]:
             scores[f] += 1
     except Exception as e:
         logger.debug("Graph neighbor expansion failed (non-fatal): %s", e)
+
+    # 3. Flow boost — files in high-criticality flows touching hint area
+    try:
+        import json as _json_f
+        flows_path = data_dir / repo_name / "flows.json"
+        if flows_path.exists():
+            flows_data = _json_f.loads(flows_path.read_text())
+            hint_set = set(hint_files)
+            for flow in flows_data.get("flows", []):
+                flow_files = set(flow.get("files", []))
+                if flow_files & hint_set:
+                    crit = flow.get("criticality", 0)
+                    for ff in flow_files:
+                        scores[ff] += crit  # higher criticality → bigger boost
+    except Exception as e:
+        logger.debug("Flow boost failed (non-fatal): %s", e)
 
     # Return top-5 unique file paths, excluding test files
     _test_noise = ("test_", "/tests/", "/test/", "conftest")
@@ -292,14 +296,26 @@ def _run_localization(state: ReactAgentState, repo_name: str) -> ReactAgentState
             top_locs = scout_report.get("top_locations", [])
             if top_locs:
                 intent = state.get("intent", {})
-                # Inject Scout's top files as confirmed_files (overrides simple pre-localization)
-                scout_files = [loc["file"] for loc in top_locs if loc.get("file")][:5]
+                # Inject Scout's top files — but VALIDATE they exist first.
+                # Scout can hallucinate paths based on bug description.
+                repo_path_for_check = _resolve_repo_path(state.get("work_order", {}))
+                scout_files_raw = [loc["file"] for loc in top_locs if loc.get("file")][:5]
+                scout_files = []
+                for sf in scout_files_raw:
+                    if repo_path_for_check and (repo_path_for_check / sf).exists():
+                        scout_files.append(sf)
+                    else:
+                        logger.warning("Scout hallucinated path (doesn't exist): %s", sf)
                 if scout_files:
                     intent["confirmed_files"] = scout_files
+                    intent["likely_affected_modules"] = scout_files  # Override with validated paths
+                else:
+                    logger.warning("All scout paths hallucinated — falling back to pre-localization")
                 intent["scout_report"] = scout_report
                 state["intent"] = intent
                 logger.info(
-                    "Scout FL: top locations %s (cost $%.4f)",
+                    "Scout FL: validated %d/%d locations %s (cost $%.4f)",
+                    len(scout_files), len(scout_files_raw),
                     scout_files, scout_report.get("scout_cost_usd", 0),
                 )
     except Exception as e:
@@ -420,6 +436,63 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     from agent.graph_utils import build_kickstart_context, load_business_rules
     kickstart = build_kickstart_context(repo_name, str(repo_path), intent, DATA_DIR)
 
+    # BUILD STRUCTURED CODE MAP for localized files — gives the agent a compact
+    # overview (function signatures + line numbers) instead of dumping whole files.
+    # Research: Composio FQDN maps use ~500 tokens vs 25K for whole files.
+    # The agent reads specific sections via read_file when it needs the actual code.
+    hint_files_for_map = intent.get("likely_affected_modules", [])[:5]
+    code_map_sections = []
+    for hf in hint_files_for_map:
+        try:
+            fpath = repo_path / hf
+            if not fpath.exists():
+                continue
+            content = fpath.read_text(encoding="utf-8", errors="replace")
+            lines = content.split("\n")
+            # Extract function/class signatures with line numbers
+            import re
+            sigs = []
+            for i, line in enumerate(lines):
+                stripped = line.rstrip()
+                lineno = i + 1
+                # Python patterns
+                if re.match(r"^\s*(class\s+\w+|(?:async\s+)?def\s+\w+)", stripped):
+                    sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
+                # Decorators (show what the function does)
+                elif re.match(r"^\s*@(router|app)\.", stripped):
+                    sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
+            if sigs:
+                code_map_sections.append(
+                    f"{hf} ({len(lines)} lines):\n" + "\n".join(sigs)
+                )
+                logger.info("Code map for %s: %d signatures from %d lines", hf, len(sigs), len(lines))
+        except Exception as e:
+            logger.debug("Could not build code map for %s: %s", hf, e)
+
+    if code_map_sections:
+        kickstart += (
+            "\n\n## CODE MAP (function signatures + line numbers for localized files)\n"
+            "Use read_file(file, start_line, end_line) to read the specific section you need.\n\n"
+            + "\n\n".join(code_map_sections)
+        )
+        logger.info("Code map: %d files, %d total chars", len(code_map_sections), sum(len(s) for s in code_map_sections))
+    else:
+        # No code map — scout paths didn't match real files. Give the agent a directory listing instead.
+        logger.warning("No code map built — hint files don't exist. Adding directory listing as fallback.")
+        try:
+            routers_dir = repo_path / "backend" / "app" / "routers"
+            if routers_dir.exists():
+                py_files = sorted(routers_dir.glob("*.py"))
+                listing = "\n".join(f"  {f.relative_to(repo_path)} ({f.stat().st_size // 1000}KB)" for f in py_files)
+                kickstart += f"\n\n## REPO FILES (no code map available — start with get_file_structure)\n{listing}"
+            else:
+                # Generic fallback — list top-level Python files
+                py_files = sorted(repo_path.rglob("*.py"))[:20]
+                listing = "\n".join(f"  {f.relative_to(repo_path)}" for f in py_files)
+                kickstart += f"\n\n## REPO FILES (no code map available — start with get_file_structure)\n{listing}"
+        except Exception:
+            pass
+
     # Load conventions and business rules
     from agent.react_prompt import (
         build_system_prompt,
@@ -530,12 +603,18 @@ def _push_and_create_pr(
                 ["git", "config", "credential.helper", ""],
                 cwd=sandbox_path, capture_output=True, timeout=10,
             )
-            # Set remote URL with token
-            remote_url = subprocess.run(
-                ["git", "remote", "get-url", "origin"],
-                cwd=sandbox_path, capture_output=True, text=True, timeout=10,
-            ).stdout.strip()
+            # Check if origin exists and points to GitHub
+            remote_url = ""
+            try:
+                remote_url = subprocess.run(
+                    ["git", "remote", "get-url", "origin"],
+                    cwd=sandbox_path, capture_output=True, text=True, timeout=10,
+                ).stdout.strip()
+            except Exception:
+                pass
+
             if remote_url and "github.com" in remote_url:
+                # Origin exists and is GitHub — add auth token
                 auth_url = remote_url.replace(
                     "https://", f"https://x-access-token:{gh_token}@"
                 )
@@ -543,6 +622,31 @@ def _push_and_create_pr(
                     ["git", "remote", "set-url", "origin", auth_url],
                     cwd=sandbox_path, capture_output=True, timeout=10,
                 )
+            elif not remote_url or "github.com" not in remote_url:
+                # No origin or origin is not GitHub — try to detect GitHub repo via gh CLI
+                try:
+                    gh_repo = subprocess.run(
+                        ["gh", "repo", "view", "--json", "url", "-q", ".url"],
+                        cwd=sandbox_path, capture_output=True, text=True, timeout=15,
+                    ).stdout.strip()
+                    if gh_repo and "github.com" in gh_repo:
+                        auth_url = gh_repo.replace(
+                            "https://github.com/",
+                            f"https://x-access-token:{gh_token}@github.com/"
+                        ) + ".git"
+                        if remote_url:
+                            subprocess.run(
+                                ["git", "remote", "set-url", "origin", auth_url],
+                                cwd=sandbox_path, capture_output=True, timeout=10,
+                            )
+                        else:
+                            subprocess.run(
+                                ["git", "remote", "add", "origin", auth_url],
+                                cwd=sandbox_path, capture_output=True, timeout=10,
+                            )
+                        logger.info("Set origin to GitHub: %s", gh_repo)
+                except Exception as gh_err:
+                    logger.debug("Could not detect GitHub repo: %s", gh_err)
 
         push_result = subprocess.run(
             ["git", "push", "-u", "origin", branch_name],
@@ -619,20 +723,31 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
     repo_path = _resolve_repo_path(work_order)
     dry_run = state.get("dry_run", False)
 
-    if state.get("escalated"):
-        logger.info("ESCALATED: %s — reason: %s",
-                    ticket_id, state.get("escalate_reason", "unknown"))
-        state["status"] = PipelineStatus.ESCALATED
-        _report_progress(state)
-        if trace:
-            trace.stage_end("finalize")
-        _cleanup_sandbox(sandbox_path, repo_path, branch_name)
-        return state
-
-    if not state.get("submitted"):
+    if state.get("escalated") or not state.get("submitted"):
+        reason = state.get("escalate_reason", "Agent did not submit or escalate")
+        logger.info("ESCALATED: %s — reason: %s", ticket_id, reason)
         state["status"] = PipelineStatus.ESCALATED
         state["escalated"] = True
-        state["escalate_reason"] = "Agent did not submit or escalate"
+        state["escalate_reason"] = reason
+
+        # Even on escalation, create a PR if the agent made edits and got review
+        # approval. This preserves the work for human review instead of discarding it.
+        review = state.get("review", {})
+        has_edits = sandbox_path and Path(sandbox_path).exists() and branch_name
+        review_approved = review.get("verdict") == "APPROVE"
+        if has_edits and review_approved and not dry_run:
+            logger.info("Escalated but review approved — creating PR for human review")
+            pr_title, pr_body = _build_pr_body(state, ticket_id, sandbox_path)
+            pr_body += "\n\n> **Note:** Agent escalated after making this fix. " \
+                       "Review approved but agent could not complete the full pipeline. " \
+                       f"Reason: {reason[:200]}"
+            pr_info = _push_and_create_pr(
+                sandbox_path, branch_name, base_branch, pr_title, pr_body,
+            )
+            state["pr_url"] = pr_info.get("pr_url", f"branch://{branch_name}")
+            if "error" in pr_info:
+                logger.warning("PR creation on escalation failed: %s", pr_info["error"])
+
         _report_progress(state)
         if trace:
             trace.stage_end("finalize")
@@ -658,7 +773,23 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
         if not test_already_passed and repair.get("patches"):
             try:
                 from agent.sandbox import run_tests as _run_tests
-                gt_result = _run_tests(Path(sandbox_path), repo_path=repo_path)
+                from agent.agent_config import AgentConfig
+
+                # Use test config from work_order if provided (eval bugs carry
+                # test_command/setup_commands from bugs.json).  Live repos
+                # without these fields fall back to auto-detection as before.
+                eval_test_cmd = work_order.get("test_command", "")
+                if eval_test_cmd:
+                    eval_cfg = AgentConfig({
+                        "test_command": eval_test_cmd,
+                        "setup_commands": work_order.get("setup_commands", []),
+                        "test_timeout": work_order.get("test_timeout", 300),
+                    })
+                    gt_result = _run_tests(
+                        Path(sandbox_path), repo_path=repo_path, agent_config=eval_cfg,
+                    )
+                else:
+                    gt_result = _run_tests(Path(sandbox_path), repo_path=repo_path)
                 state["test_result"] = gt_result[:2000]
                 logger.info("Ground-truth tests (dry-run eval): %s", gt_result[:120])
             except Exception as e:
@@ -1211,11 +1342,12 @@ def _run_best_of_n(
 
     def _score(r: dict) -> tuple:
         test_ok = (r.get("test_result") or "").strip().lower().startswith("passed")
+        epr = r.get("epr_score", 0.0)
         verifier_ok = r.get("verifier_verdict", "") == "APPROVE"
         confidence = (r.get("review") or {}).get("confidence", 0.0)
         cost = -(r.get("cost_usd") or 0.0)  # Negative so lower cost = higher rank
         submitted = r.get("submitted", False)
-        return (submitted, test_ok, verifier_ok, confidence, cost)
+        return (submitted, test_ok, epr, verifier_ok, confidence, cost)
 
     best = max(results, key=_score)
     submitted_count = sum(1 for r in results if r.get("submitted"))

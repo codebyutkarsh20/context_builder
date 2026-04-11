@@ -304,14 +304,14 @@ class RunTrace:
 _PHASE_MAP = {
     # Explore
     "grep_repo": "explore", "read_file": "explore", "read_function": "explore",
-    "list_files": "explore", "search_code": "explore", "get_function_info": "explore",
-    "get_file_structure": "explore", "get_file_summary": "explore",
+    "list_files": "explore", "get_function_info": "explore",
+    "get_file_structure": "explore", "get_blast_radius": "explore",
     "record_localization": "explore",
     # Edit
     "create_sandbox": "edit", "string_replace": "edit", "check_syntax": "edit",
-    "create_file": "edit", "get_callers": "edit", "get_blast_radius": "edit",
+    "create_file": "edit", "get_callers": "edit",
     # Test
-    "run_tests": "test",
+    "run_tests": "test", "run_brt": "test",
     # Review
     "request_review": "review",
     # Submit

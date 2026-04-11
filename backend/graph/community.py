@@ -42,6 +42,9 @@ _PATH_STOPWORDS: frozenset[str] = frozenset(
         "migrations", "static", "assets", "scripts", "config",
         "settings", "constants", "types", "interfaces", "schemas",
         "py", "js", "ts", "go", "java", "rb",
+        # Generic structural tokens that dominate in monorepos
+        "backend", "frontend", "api", "v1", "v2",
+        "helper", "type", "interface", "constant", "constants",
     }
 )
 
@@ -78,19 +81,46 @@ def _extract_path_tokens(file_path: str) -> list[str]:
     return tokens
 
 
-def _derive_community_name(file_paths: list[str], top_n: int = 2) -> str:
+def _derive_community_name(
+    file_paths: list[str],
+    all_communities_tokens: Counter[str],
+    top_n: int = 2,
+) -> str:
     """Derive a human-readable community name from a list of file paths.
 
-    Counts token frequencies across all paths, drops stopwords, and joins the
-    top-*top_n* tokens with a hyphen.  Falls back to ``"misc"`` when no
-    meaningful tokens are found.
+    Counts token frequencies within this community, then applies an IDF-style
+    penalty for tokens that appear across many communities (generic tokens like
+    "api" or "backend").  The score for each token is::
+
+        score = count_in_this_community / log(1 + count_in_all_communities)
+
+    Falls back to ``"misc"`` when no meaningful tokens are found.
+
+    Parameters
+    ----------
+    file_paths:
+        File paths belonging to this community.
+    all_communities_tokens:
+        Counter mapping each token to how many communities it appears in.
+        Used to penalise ubiquitous path segments.
+    top_n:
+        Number of top-scoring tokens to join into the community name.
     """
+    import math
+
     counter: Counter[str] = Counter()
     for fp in file_paths:
         for tok in _extract_path_tokens(fp):
             counter[tok] += 1
 
-    top_tokens = [tok for tok, _ in counter.most_common(top_n)]
+    if not counter:
+        return "misc"
+
+    scored = {
+        tok: count / math.log(1 + all_communities_tokens.get(tok, 1))
+        for tok, count in counter.items()
+    }
+    top_tokens = sorted(scored, key=scored.__getitem__, reverse=True)[:top_n]
     return "-".join(top_tokens) if top_tokens else "misc"
 
 
@@ -166,28 +196,36 @@ def _run_leiden(
     node_ids: list[str] = [n["id"] for n in nodes if "id" in n]
     id_to_idx: dict[str, int] = {nid: i for i, nid in enumerate(node_ids)}
 
-    g = ig.Graph(n=len(node_ids), directed=False)
+    g = ig.Graph(n=len(node_ids), directed=True)
     g.vs["name"] = node_ids
 
     edge_list: list[tuple[int, int]] = []
     weight_list: list[float] = []
+    seen_edges: set[tuple[int, int]] = set()
 
     for edge in edges:
         src_idx = id_to_idx.get(edge.get("source", ""))
         tgt_idx = id_to_idx.get(edge.get("target", ""))
         if src_idx is None or tgt_idx is None or src_idx == tgt_idx:
             continue
+        key = (src_idx, tgt_idx)
+        if key in seen_edges:
+            continue
+        seen_edges.add(key)
         w = EDGE_WEIGHTS.get((edge.get("type") or "").upper(), 0.5)
-        edge_list.append((src_idx, tgt_idx))
+        edge_list.append(key)
         weight_list.append(w)
 
     if edge_list:
         g.add_edges(edge_list)
         g.es["weight"] = weight_list
 
+    # ModularityVertexPartition supports directed graphs; RBConfigurationVertexPartition
+    # is undirected-only.  Use CPMVertexPartition when a resolution parameter is
+    # needed on a directed graph; fall back to ModularityVertexPartition otherwise.
     partition = leidenalg.find_partition(
         g,
-        leidenalg.RBConfigurationVertexPartition,
+        leidenalg.CPMVertexPartition,
         weights="weight" if edge_list else None,
         resolution_parameter=resolution,
         seed=42,
@@ -310,10 +348,28 @@ def _build_community_dicts(
         Index of the misc bucket in *communities*, or ``None`` if there is
         no misc bucket.
     """
+    # Pre-compute per-community token sets so _derive_community_name can apply
+    # IDF weighting: tokens that appear in many communities are penalised.
+    community_file_paths: list[list[str]] = [
+        _collect_file_paths(node_ids, node_map) for node_ids in communities
+    ]
+    all_communities_tokens: Counter[str] = Counter()
+    for fp_list in community_file_paths:
+        # Count each token once per community (not per file) for IDF denominator.
+        community_token_set: set[str] = set()
+        for fp in fp_list:
+            community_token_set.update(_extract_path_tokens(fp))
+        for tok in community_token_set:
+            all_communities_tokens[tok] += 1
+
     result: list[dict] = []
     for idx, node_ids in enumerate(communities):
-        file_paths = _collect_file_paths(node_ids, node_map)
-        name = "misc" if idx == misc_index else _derive_community_name(file_paths)
+        file_paths = community_file_paths[idx]
+        name = (
+            "misc"
+            if idx == misc_index
+            else _derive_community_name(file_paths, all_communities_tokens)
+        )
 
         file_counter: Counter[str] = Counter()
         for nid in node_ids:

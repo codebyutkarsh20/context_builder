@@ -1,10 +1,9 @@
 """
 tools.py — MCP tool endpoints for the AI Deploy Agent.
 
-Three tool endpoints that agents can call:
+Two tool endpoints that agents can call:
 1. get_function_context — full context for a function (description, callers, callees, rules)
 2. get_blast_radius — downstream impact analysis for modified files
-3. search_by_concept — semantic search via ChromaDB embeddings
 """
 
 import json
@@ -266,66 +265,3 @@ def get_blast_radius(
     }
 
 
-# ---------------------------------------------------------------------------
-# 3. search_by_concept (semantic search via ChromaDB)
-# ---------------------------------------------------------------------------
-
-@router.get("/search-by-concept")
-def search_by_concept(
-    q: str = Query(..., min_length=1, max_length=1000, description="Natural language query"),
-    repo: str = Query(..., description="Repository name"),
-    limit: int = Query(10, ge=1, le=50),
-):
-    """Semantic search across code knowledge graph using embeddings."""
-    t0 = time.monotonic()
-    repo = validate_repo_name(repo)
-
-    try:
-        from embeddings.embedder import NodeEmbedder
-        embedder = NodeEmbedder(repo, _DATA_DIR)
-        info = embedder.collection_info()
-        if info.get("count", 0) == 0:
-            return {
-                "query": q, "repo": repo, "count": 0, "results": [],
-                "error": "Embeddings not available for this repository",
-            }
-
-        raw_results = embedder.query(text=q, n_results=limit)
-    except Exception as e:
-        logger.warning("Semantic search failed for '%s': %s", repo, e)
-        return {
-            "query": q, "repo": repo, "count": 0, "results": [],
-            "error": f"Search unavailable: {e}",
-        }
-
-    # Enrich results with data from enriched_nodes.json
-    enriched = _load_enriched(repo)
-
-    results = []
-    for r in raw_results:
-        node_id = r.get("id", "")
-        meta = r.get("metadata", {})
-        enode = enriched.get(node_id, {})
-
-        description = enode.get("llm_summary") or enode.get("summary") or enode.get("docstring") or ""
-        if not description:
-            description = r.get("text", "")[:200]
-
-        results.append({
-            "id": node_id,
-            "name": meta.get("name") or enode.get("name") or _node_short_name(node_id),
-            "type": meta.get("type") or enode.get("type", "unknown"),
-            "file": meta.get("file") or enode.get("file") or _node_file(node_id),
-            "score": round(r.get("score", 0.0), 4),
-            "pagerank": round(float(meta.get("pagerank", 0) or enode.get("pagerank", 0)), 6),
-            "description": description[:300],
-        })
-
-    elapsed = time.monotonic() - t0
-    return {
-        "query": q,
-        "repo": repo,
-        "count": len(results),
-        "results": results,
-        "response_time_ms": round(elapsed * 1000, 1),
-    }
