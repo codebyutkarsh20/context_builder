@@ -2,9 +2,6 @@
 
 ## Active
 
-### P1 — Expand eval dataset with multi-file bugs
-**What:** Add 8-10 multi-file bugs from SWE-bench. Current 25 bugs are all single-file.
-**Why:** Real production bugs are ~50% multi-file. We have get_callers/get_blast_radius tools but no eval data to test them.
 
 ### P1 — Concept-to-code mapping for business-language tickets
 **What:** When a ticket uses business terms ("requisition", "approval flow") that don't match function names, the agent can't find the right code. Need to map business concepts → code entities using the knowledge graph.
@@ -39,6 +36,10 @@
 **Depends on:** Production validation shipped (current sprint).
 
 ## Completed
+
+### P1 — Expand eval dataset with multi-file bugs
+**Completed:** v3.0 (2026-04-12)
+`eval/bugs.json`: added 10 multi-file bugs from SWE-bench-Verified. Sourced via `datasets` lib — filtered for 2+ source-file patches in repos we support (django, pytest). All bugs validated against `dataset.py` schema. Dataset grows from 25 → 35 bugs (25 single-file + 10 multi-file). Multi-file scoring already handled by `_score_multi_file_complete()` and `multi_file_complete_rate` in `scoring.py`.
 
 ### P1 — Multi-candidate patch sampling
 **Completed:** v2.9 (2026-04-09)
