@@ -37,6 +37,14 @@
 
 ## Completed
 
+### P1 — Django SWE-bench test infrastructure (3 infra bugs)
+**Completed:** v3.1 (2026-04-12)
+`repo_manager.py`: three Django eval infra fixes landed together.
+1. **Missing INSTALLED_APPS**: detect minimal test_sqlite.py → write `swe_bench_django_settings.py` to venv site-packages with full INSTALLED_APPS + MIGRATION_MODULES (mirrors Django's runtests.py setup_collect_tests).
+2. **InvalidBasesError**: `MIGRATION_MODULES = {'auth': None, 'contenttypes': None, 'sessions': None}` prevents migration state resolver from choking on `auth_tests.UserProxy → auth.User` inheritance.
+3. **Duplicate-module PYTHONPATH error**: use relative `"tests"` (not absolute `{repo_dir}/tests`) so Python resolves against the sandbox worktree's cwd, making both the file path and the sys.path entry point to the same physical file.
+New helpers: `_extract_django_test_apps()`, `_django_test_app_has_models()`, `_find_site_packages()`, `_write_full_django_settings()`.
+
 ### P1 — Expand eval dataset with multi-file bugs
 **Completed:** v3.0 (2026-04-12)
 `eval/bugs.json`: added 10 multi-file bugs from SWE-bench-Verified. Sourced via `datasets` lib — filtered for 2+ source-file patches in repos we support (django, pytest). All bugs validated against `dataset.py` schema. Dataset grows from 25 → 35 bugs (25 single-file + 10 multi-file). Multi-file scoring already handled by `_score_multi_file_complete()` and `multi_file_complete_rate` in `scoring.py`.
