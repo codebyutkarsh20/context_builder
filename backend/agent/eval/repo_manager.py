@@ -267,6 +267,21 @@ class RepoManager:
                 capture_output=True, text=True, timeout=15,
             ).returncode == 0
             if import_ok:
+                # For Django repos, also ensure pytest-django is installed in the cached venv
+                # (old cached venvs may not have it)
+                if self._is_django_repo(repo_dir):
+                    has_pytest_django = subprocess.run(
+                        [str(venv_python), "-c", "import pytest_django"],
+                        capture_output=True, timeout=10,
+                    ).returncode == 0
+                    if not has_pytest_django:
+                        logger.info("Cached Django venv missing pytest-django — installing")
+                        pip = str(venv_dir / "bin" / "pip")
+                        subprocess.run(
+                            [pip, "install", "--quiet", "pytest-django"],
+                            capture_output=True, timeout=60,
+                        )
+                        self._write_django_pytest_ini(repo_dir)
                 logger.info("Venv cache hit: %s", venv_dir)
                 self._write_agent_config(repo_dir, venv_pytest, bug)
                 return venv_dir
@@ -351,12 +366,201 @@ class RepoManager:
             capture_output=True, timeout=120,
         )
 
+        # Django-specific: install pytest-django and write pytest.ini with settings.
+        # Django tests require DJANGO_SETTINGS_MODULE; plain pytest without pytest-django
+        # will fail at setUpClass because django.setup() is never called.
+        if self._is_django_repo(repo_dir):
+            logger.info("Detected Django repo — installing pytest-django + writing pytest.ini")
+            subprocess.run(
+                [pip, "install", "--quiet", "pytest-django"],
+                capture_output=True, timeout=60,
+            )
+            self._write_django_pytest_ini(repo_dir)
+
         # Write stamp
         stamp.write_text("ok")
 
         self._write_agent_config(repo_dir, venv_pytest, bug)
         logger.info("Venv ready: %s", venv_dir)
         return venv_dir
+
+    @staticmethod
+    def _is_django_repo(repo_dir: Path) -> bool:
+        """Return True if this looks like the Django source repo."""
+        return (
+            (repo_dir / "django" / "__init__.py").exists()
+            and (repo_dir / "tests").is_dir()
+        )
+
+    @staticmethod
+    def _extract_django_test_apps(fail_to_pass: list[str]) -> list[str]:
+        """Extract Django internal test app names from FAIL_TO_PASS test IDs.
+
+        SWE-bench test IDs come in two formats:
+          unittest: "test_name (app.module.ClassName.test_name)"
+          pytest:   "app/module.py::Class::test_name"
+
+        Returns a deduplicated list of top-level module names (e.g. "auth_tests",
+        "queries") that need to be in INSTALLED_APPS for models to resolve.
+
+        Skips anything that starts with "django." (those are built-in apps already
+        in the standard ALWAYS_INSTALLED_APPS list).
+        """
+        apps: list[str] = []
+        for test_id in fail_to_pass:
+            top = ""
+            if "(" in test_id and ")" in test_id:
+                # e.g. "test_x (auth_tests.test_basic.TestGetUser)"
+                inner = test_id[test_id.index("(") + 1 : test_id.index(")")]
+                top = inner.split(".")[0]
+            elif "::" in test_id:
+                # e.g. "auth_tests/test_basic.py::Class::test_method"
+                top = test_id.split("::")[0].split("/")[0].removesuffix(".py")
+            if top and not top.startswith("django"):
+                apps.append(top)
+        seen: set[str] = set()
+        return [a for a in apps if not (a in seen or seen.add(a))]  # type: ignore[func-returns-value]
+
+    @staticmethod
+    def _django_test_app_has_models(app_dir: Path) -> bool:
+        """Return True if a Django internal test app directory defines models.
+
+        Apps that only contain SimpleTestCase/functional tests don't need to be
+        in INSTALLED_APPS; only apps that define ORM models do.
+        """
+        if not app_dir.is_dir():
+            return False
+        return (app_dir / "models.py").exists() or (app_dir / "models").is_dir()
+
+    @staticmethod
+    def _find_site_packages(venv_dir: Path) -> Path | None:
+        """Return the site-packages directory inside a venv, or None if not found."""
+        lib_dir = venv_dir / "lib"
+        if not lib_dir.is_dir():
+            return None
+        for entry in lib_dir.iterdir():
+            if entry.name.startswith("python") and (entry / "site-packages").is_dir():
+                return entry / "site-packages"
+        return None
+
+    @staticmethod
+    def _write_full_django_settings(
+        site_packages: Path, module_name: str, extra_apps: list[str] | None = None
+    ) -> None:
+        """Write a complete Django settings module to site-packages.
+
+        Used when the repo's test_sqlite.py lacks INSTALLED_APPS (common in
+        SWE-bench Django instances).  Writing to site-packages means the module
+        is importable by the venv's pytest regardless of the worktree path.
+
+        Parameters
+        ----------
+        extra_apps : list of str, optional
+            Django internal test app names (e.g. ["auth_tests", "queries"]) to
+            append to INSTALLED_APPS so their models resolve correctly.
+        """
+        extra_apps_list = extra_apps or []
+        extra_app_lines = "".join(f"    '{app}',\n" for app in extra_apps_list)
+        # Disable migrations for core Django apps AND internal test apps.
+        # Mirrors what Django's runtests.py does (see setup_collect_tests).
+        # Without this, auth_tests.UserProxy (which inherits auth.User) raises
+        # InvalidBasesError because the migration state can't resolve the base class
+        # before auth migrations have been applied.
+        # Setting these to None makes Django create tables directly via CREATE TABLE
+        # instead of applying migrations, sidestepping the state resolution issue.
+        all_no_migrate = ["auth", "contenttypes", "sessions"] + extra_apps_list
+        migration_module_lines = "".join(
+            f"    '{app}': None,\n" for app in all_no_migrate
+        )
+        migration_modules_block = (
+            "MIGRATION_MODULES = {\n"
+            f"{migration_module_lines}"
+            "}\n"
+        )
+        content = (
+            "# Auto-generated by SWE-bench eval infrastructure\n"
+            "# Provides a complete Django settings module for repos whose\n"
+            "# test_sqlite.py is minimal and lacks INSTALLED_APPS.\n"
+            "DATABASES = {\n"
+            "    'default': {\n"
+            "        'ENGINE': 'django.db.backends.sqlite3',\n"
+            "        'NAME': ':memory:',\n"
+            "    },\n"
+            "    'other': {\n"
+            "        'ENGINE': 'django.db.backends.sqlite3',\n"
+            "        'NAME': ':memory:',\n"
+            "    },\n"
+            "}\n"
+            "USE_TZ = False\n"
+            "DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'\n"
+            "SECRET_KEY = 'swe-bench-test-secret-key'\n"
+            "PASSWORD_HASHERS = ['django.contrib.auth.hashers.MD5PasswordHasher']\n"
+            "INSTALLED_APPS = [\n"
+            "    'django.contrib.auth',\n"
+            "    'django.contrib.contenttypes',\n"
+            "    'django.contrib.sessions',\n"
+            "    'django.contrib.messages',\n"
+            "    'django.contrib.staticfiles',\n"
+            "    'django.contrib.admin',\n"
+            "    'django.contrib.sites',\n"
+            f"{extra_app_lines}"
+            "]\n"
+            f"{migration_modules_block}"
+        )
+        target = site_packages / f"{module_name}.py"
+        target.write_text(content)
+        logger.debug("Wrote full Django settings to %s", target)
+
+    @staticmethod
+    def _write_django_pytest_ini(repo_dir: Path) -> None:
+        """Write pytest.ini that configures pytest-django with SQLite settings.
+
+        Django's `tests/test_sqlite.py` (or `tests/test_settings.py`) is the
+        standard settings module used by SWE-bench.  pytest-django reads
+        `DJANGO_SETTINGS_MODULE` from pytest.ini so no shell env var is needed.
+        """
+        # Prefer test_sqlite.py (Django 3.x+); fallback to test_settings.py
+        tests_dir = repo_dir / "tests"
+        if (tests_dir / "test_sqlite.py").exists():
+            django_settings = "tests.test_sqlite"
+        elif (tests_dir / "test_settings.py").exists():
+            django_settings = "tests.test_settings"
+        else:
+            # Older Django — generate a minimal settings file
+            django_settings = "tests.test_sqlite"
+            minimal = (
+                "DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3', "
+                "'NAME': ':memory:'}}\n"
+                "USE_TZ = True\n"
+                "DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'\n"
+                "SECRET_KEY = 'swe-bench-test-secret-key'\n"
+                "INSTALLED_APPS = [\n"
+                "    'django.contrib.auth',\n"
+                "    'django.contrib.contenttypes',\n"
+                "    'django.contrib.sessions',\n"
+                "    'django.contrib.messages',\n"
+                "    'django.contrib.sites',\n"
+                "    'django.contrib.admin',\n"
+                "]\n"
+            )
+            (tests_dir / "test_sqlite.py").write_text(minimal)
+            logger.info("Wrote minimal tests/test_sqlite.py for Django pytest-django")
+
+        pytest_ini_path = repo_dir / "pytest.ini"
+        if pytest_ini_path.exists():
+            # Don't overwrite existing pytest.ini — just ensure DJANGO_SETTINGS_MODULE
+            existing = pytest_ini_path.read_text()
+            if "DJANGO_SETTINGS_MODULE" not in existing:
+                pytest_ini_path.write_text(
+                    existing.rstrip() + f"\nDJANGO_SETTINGS_MODULE = {django_settings}\n"
+                )
+        else:
+            pytest_ini_path.write_text(
+                "[pytest]\n"
+                f"DJANGO_SETTINGS_MODULE = {django_settings}\n"
+                "addopts = -x --timeout=60 -q\n"
+            )
+        logger.info("Wrote pytest.ini: DJANGO_SETTINGS_MODULE = %s", django_settings)
 
     def _write_agent_config(self, repo_dir: Path, venv_pytest: Path, bug: dict) -> None:
         """Write .agent_config.json so the sandbox uses the venv pytest."""
@@ -373,10 +577,73 @@ class RepoManager:
         else:
             test_command = f"{pytest_path} -x --timeout=60 -q"
 
-        config = {
+        config: dict = {
             "test_command": test_command,
             "pytest_path": pytest_path,
         }
+
+        # Django repos need DJANGO_SETTINGS_MODULE in the test environment.
+        # The sandbox is a git worktree and pytest.ini from the original repo dir
+        # isn't automatically present there, so we inject the env var via config.
+        if self._is_django_repo(repo_dir):
+            tests_dir = repo_dir / "tests"
+            if (tests_dir / "test_sqlite.py").exists():
+                django_settings = "tests.test_sqlite"
+                settings_text = (tests_dir / "test_sqlite.py").read_text()
+            elif (tests_dir / "test_settings.py").exists():
+                django_settings = "tests.test_settings"
+                settings_text = (tests_dir / "test_settings.py").read_text()
+            else:
+                django_settings = "tests.test_sqlite"
+                settings_text = ""
+
+            # If the detected settings file is missing INSTALLED_APPS (as many
+            # minimal SWE-bench test_sqlite.py files are), write a complete settings
+            # module to the venv's site-packages so auth/contenttypes tests pass.
+            # site-packages is always on sys.path when using the venv's pytest binary,
+            # so the module will be importable from the sandbox worktree too.
+            #
+            # Also add `tests/` to PYTHONPATH so Django's internal test apps
+            # (auth_tests, queries, etc.) can be imported as top-level modules.
+            # The sandbox prepends the worktree root to PYTHONPATH; this value
+            # appended after it so Django source from the worktree takes priority.
+            extra_pythonpath: str | None = None
+            if "INSTALLED_APPS" not in settings_text:
+                # Only include test apps that define Django models.
+                # SimpleTestCase-only apps (utils_tests, template_tests, etc.)
+                # don't need INSTALLED_APPS registration, and including them can
+                # cause pytest duplicate-module-path errors when PYTHONPATH is set.
+                raw_apps = self._extract_django_test_apps(bug.get("fail_to_pass", []))
+                test_apps = [
+                    app for app in raw_apps
+                    if self._django_test_app_has_models(repo_dir / "tests" / app)
+                ]
+                venv_dir = venv_pytest.parent.parent
+                site_packages = self._find_site_packages(venv_dir)
+                if site_packages:
+                    settings_module = "swe_bench_django_settings"
+                    self._write_full_django_settings(site_packages, settings_module, test_apps)
+                    django_settings = settings_module
+                    logger.info(
+                        "Django settings missing INSTALLED_APPS — wrote full settings "
+                        "(model_apps=%s, skipped=%s) to %s",
+                        test_apps,
+                        [a for a in raw_apps if a not in test_apps],
+                        site_packages / f"{settings_module}.py",
+                    )
+                # Add tests/ to PYTHONPATH only for model-bearing test apps.
+                # Use *relative* path "tests" so Python resolves it against the
+                # subprocess cwd (the sandbox worktree root) — this avoids the
+                # pytest duplicate-module error that occurs with absolute paths
+                # pointing at the original repo's tests/ dir.
+                if test_apps:
+                    extra_pythonpath = "tests"
+
+            django_env: dict[str, str] = {"DJANGO_SETTINGS_MODULE": django_settings}
+            if extra_pythonpath:
+                django_env["PYTHONPATH"] = extra_pythonpath
+            config["env"] = django_env
+            logger.debug("Django repo: injecting DJANGO_SETTINGS_MODULE = %s", django_settings)
 
         config_path = repo_dir / ".agent_config.json"
         config_path.write_text(json.dumps(config, indent=2))
