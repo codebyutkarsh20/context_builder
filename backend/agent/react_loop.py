@@ -102,6 +102,22 @@ def react_loop(
     all_tools = explore_tools + REACT_TOOLS
     tool_map = {t.name: t for t in all_tools}
 
+    # Capture thread-local context from the CURRENT (main) thread so we can
+    # propagate it into ThreadPoolExecutor worker threads.
+    # threading.local() values are NOT inherited by new threads — each worker
+    # starts with a blank TLS, causing "repo path not set" errors in explore_tools.
+    # We store the context in a mutable dict so the sandbox-creation handler
+    # can update the repo_path in place (switching from original → sandbox path)
+    # and all subsequent worker threads automatically use the new value.
+    from agent.explore_tools import _tls as _explore_tls, set_context as _explore_set_ctx
+    from agent.react_tools import _tls as _react_tls_local, set_react_context as _react_set_ctx
+    _thread_ctx: dict = {
+        "repo_name": getattr(_explore_tls, "repo_name", ""),
+        "repo_path": getattr(_explore_tls, "repo_path", None),
+        "data_dir": getattr(_explore_tls, "data_dir", None),
+        "fix_type": getattr(_react_tls_local, "fix_type", "bug_fix"),
+    }
+
     llm = ChatAnthropic(
         model=REACT_MODEL,
         max_tokens=16000,
@@ -342,7 +358,19 @@ def react_loop(
 
             # --- Run a single batch (concurrent or serial) ---
             def _execute_one_tool(tc_entry: dict) -> tuple[dict, str]:
-                """Execute a single tool call. Returns (tc_entry, result_str)."""
+                """Execute a single tool call. Returns (tc_entry, result_str).
+
+                When running inside a ThreadPoolExecutor worker, the thread-local
+                storage (_tls) starts blank. We re-inject the captured context so
+                explore_tools can find the repo_path.
+                """
+                # Re-inject thread-local context captured from the parent thread.
+                # This is a no-op when called from the main thread (serial execution).
+                _explore_set_ctx(
+                    _thread_ctx["repo_name"],
+                    _thread_ctx["repo_path"],
+                    _thread_ctx["data_dir"],
+                )
                 tn = tc_entry["name"]
                 ta = tc_entry["args"]
                 t = tool_map.get(tn)
@@ -476,9 +504,12 @@ def react_loop(
                     state["branch_name"] = get_branch_name()
                     state["base_branch"] = get_base_branch()
                     if sandbox_path:
-                        from agent.explore_tools import set_context
                         repo_name = state.get("work_order", {}).get("repo_name", "")
-                        set_context(repo_name, str(sandbox_path), None)
+                        _explore_set_ctx(repo_name, str(sandbox_path), None)
+                        # Also update the captured context dict so future worker
+                        # threads automatically use the sandbox path.
+                        _thread_ctx["repo_name"] = repo_name
+                        _thread_ctx["repo_path"] = sandbox_path
 
                 if tool_name == "record_localization" and "OK:" in str(result_str):
                     loc = get_localization()

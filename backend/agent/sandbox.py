@@ -55,6 +55,15 @@ def run_tests(
     if agent_config is None and repo_path:
         agent_config = load_agent_config(repo_path)
 
+    # Ensure tests import from the sandbox worktree, not the installed package.
+    # For packages with a src/ layout (Flask, Django, requests…), PYTHONPATH
+    # must include the worktree's src/ directory so Python resolves the package
+    # from the modified source BEFORE the editable install in the venv
+    # (which still points to the original cloned repo).
+    # For root-layout packages (pytest, sympy…), use the worktree root.
+    _src_dir = worktree_path / "src"
+    _pythonpath_injection = str(_src_dir if _src_dir.is_dir() else worktree_path)
+
     # ------------------------------------------------------------------ #
     # Path A — config-driven: .agent_config.json present and non-default  #
     # ------------------------------------------------------------------ #
@@ -67,6 +76,11 @@ def run_tests(
         test_pattern = agent_config.test_pattern
 
         env = {**os.environ, **extra_env}
+        # Prepend worktree source so modified code takes precedence over installed pkg
+        env["PYTHONPATH"] = (
+            _pythonpath_injection + ":" + env["PYTHONPATH"]
+            if env.get("PYTHONPATH") else _pythonpath_injection
+        )
 
         # Run setup commands first (e.g., pip install, db migrate)
         for cmd in setup_commands:
@@ -149,10 +163,14 @@ def run_tests(
     if test_path:
         cmd.append(test_path)
 
+    auto_env = {**os.environ, "PYTHONPATH": (
+        _pythonpath_injection + ":" + os.environ["PYTHONPATH"]
+        if os.environ.get("PYTHONPATH") else _pythonpath_injection
+    )}
     logger.info("Running tests in %s: %s", test_cwd, " ".join(cmd))
     try:
         result = subprocess.run(
-            cmd, cwd=test_cwd, capture_output=True, text=True, timeout=300,
+            cmd, cwd=test_cwd, capture_output=True, text=True, timeout=300, env=auto_env,
         )
         raw_output = (result.stdout + "\n" + result.stderr).strip()
         return _format_test_output(result.returncode, raw_output, timeout=300)
