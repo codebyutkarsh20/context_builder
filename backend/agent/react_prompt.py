@@ -50,15 +50,20 @@ def build_system_prompt(
     conventions_section: str = "",
     business_rules_section: str = "",
     brts: list[dict] | None = None,
-) -> str:
-    """Build the full system prompt for the ReAct agent.
+) -> tuple[str, str]:
+    """Build the system prompt split into (static_block, dynamic_block).
 
-    Args:
-        work_order: Bug ticket work order.
-        intent: IntentAnalysis dict from intake.
-        kickstart_context: Orientation context from graph/failure signals.
-        conventions_section: Project conventions (linters, formatters).
-        business_rules_section: Business rules from knowledge graph.
+    Returns a tuple so the caller can apply cache_control only to the static
+    block — the part that is identical across ALL bugs and ALL repos.
+
+    static_block  — workflow, tools, rules, strategy (~3500 tokens, cacheable)
+    dynamic_block — repo name, bug ticket, intent, code map, BRTs, conventions
+                    (~500-3000 tokens, changes every run, not cached)
+
+    Caching benefit:
+      Within one run  (30 calls): both blocks cached after call 1 — already happening
+      Across eval runs           : static_block cached between consecutive bugs
+                                   if they run within the 5-min ephemeral window
     """
     repo_name = work_order.get("repo_name", "unknown")
     repo_path = work_order.get("repo_path", "")
@@ -81,7 +86,11 @@ def build_system_prompt(
     task_noun = "bug" if is_bug else "feature" if is_feature else "change"
     task_verb = "fixing a production bug" if is_bug else "implementing a feature" if is_feature else "making a code change"
 
-    return f"""You are an AI software engineer {task_verb} in repo `{repo_name}`.
+    # -------------------------------------------------------------------------
+    # STATIC BLOCK — identical for every bug_fix run on every repo.
+    # Put cache_control on this in react_loop.py.
+    # -------------------------------------------------------------------------
+    static_block = f"""You are an AI software engineer. You fix production bugs, implement features, and make code changes in software repositories.
 
 ## YOUR WORKFLOW — TOOL CALL BUDGET: ~30 CALLS (hard limit: 40)
 
@@ -206,32 +215,6 @@ Examples:
   - WRONG:   '/home/user/repos/flask/src/app/models.py'
 The sandbox and repo root are handled internally. Never include them in your paths.
 
-## {'BUG TICKET' if is_bug else 'FEATURE REQUEST' if is_feature else 'TASK'}
-
-Title: {work_order.get('title', '')}
-Priority: {work_order.get('priority', 'medium')}
-Component: {work_order.get('affected_component', 'unknown')}
-Type: {fix_type}
-
-Description:
-{work_order.get('description', '')}
-
-## INTENT ANALYSIS
-
-Expected behavior: {intent.get('expected_behavior', '')}
-Actual behavior: {intent.get('actual_behavior', '')}
-Likely affected modules: {intent.get('likely_affected_modules', [])}
-Likely affected functions: {intent.get('likely_affected_functions', [])}
-Fix type: {intent.get('fix_type', 'bug_fix')}
-Severity: {intent.get('severity', 'medium')}
-{f"Pre-localized files (high confidence — start here): {intent.get('confirmed_files', [])}" if intent.get('confirmed_files') else ""}
-{criteria_str}
-{notes_str}
-{brt_section}
-{kickstart_context}
-{conventions_section}
-{business_rules_section}
-
 ## PRE-EXISTING LINT/TEST ERRORS
 
 Many open-source repos have pre-existing lint warnings (e.g. ruff E741, E721, pyflakes).
@@ -286,7 +269,45 @@ Escalating early saves money. {'A wrong fix is worse than no fix.' if is_bug els
 ## IMPORTANT
 
 {'Find the bug, fix it, test it, get it reviewed, and submit.' if is_bug else 'Understand the codebase, implement the change, test it, get it reviewed, and submit.'} Be methodical but efficient.
-Stop exploring as soon as you have enough evidence. Make minimal, targeted {'fixes' if is_bug else 'changes'}."""
+Stop exploring as soon as you have enough evidence. Make minimal, targeted {'fixes' if is_bug else 'changes'}.
+
+## ASSISTANT KNOWLEDGE CUTOFF
+
+Your training data has a cutoff of August 2025. For repos last updated after that date,
+you may not know the latest APIs. When in doubt, read the source — do not assume API shapes."""
+
+    # -------------------------------------------------------------------------
+    # DYNAMIC BLOCK — repo name + ticket + intent + code map + BRTs.
+    # Changes every run. NOT cached between bugs. Always built fresh.
+    # -------------------------------------------------------------------------
+    dynamic_block = f"""## {'BUG TICKET' if is_bug else 'FEATURE REQUEST' if is_feature else 'TASK'}
+
+Title: {work_order.get('title', '')}
+Priority: {work_order.get('priority', 'medium')}
+Component: {work_order.get('affected_component', 'unknown')}
+Type: {fix_type}
+Repo: {repo_name}
+
+Description:
+{work_order.get('description', '')}
+
+## INTENT ANALYSIS
+
+Expected behavior: {intent.get('expected_behavior', '')}
+Actual behavior: {intent.get('actual_behavior', '')}
+Likely affected modules: {intent.get('likely_affected_modules', [])}
+Likely affected functions: {intent.get('likely_affected_functions', [])}
+Fix type: {intent.get('fix_type', 'bug_fix')}
+Severity: {intent.get('severity', 'medium')}
+{f"Pre-localized files (high confidence — start here): {intent.get('confirmed_files', [])}" if intent.get('confirmed_files') else ""}
+{criteria_str}
+{notes_str}
+{brt_section}
+{kickstart_context}
+{conventions_section}
+{business_rules_section}"""
+
+    return static_block, dynamic_block
 
 
 def build_task_message(work_order: dict, intent: dict) -> str:

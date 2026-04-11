@@ -385,11 +385,12 @@ class TestPromptGuardrailAlignment:
     def test_prompt_tool_budget_matches_guardrail(self):
         """Prompt says '30' tool call budget, guardrail limit is 40."""
         from agent.react_prompt import build_system_prompt
-        prompt = build_system_prompt(
+        static_block, dynamic_block = build_system_prompt(
             {"repo_name": "test", "title": "bug", "description": "desc"},
             {"expected_behavior": "", "actual_behavior": ""},
             "",
         )
+        prompt = static_block + "\n\n" + dynamic_block
         # Prompt says budget of 30 (guidance), guardrail enforces 40 (hard limit)
         assert "30" in prompt
         assert MAX_TOOL_CALLS == 40  # Hard limit is higher than soft budget
@@ -443,11 +444,12 @@ class TestPromptGuardrailAlignment:
         from agent.react_prompt import build_system_prompt
         from agent.react_tools import REACT_TOOLS
 
-        prompt = build_system_prompt(
+        static_block, dynamic_block = build_system_prompt(
             {"repo_name": "test", "title": "t", "description": "d"},
             {"expected_behavior": "", "actual_behavior": ""},
             "",
         )
+        prompt = static_block + "\n\n" + dynamic_block
         for tool in REACT_TOOLS:
             assert tool.name in prompt, (
                 f"Tool '{tool.name}' exists in REACT_TOOLS but is not documented in the system prompt"
@@ -456,22 +458,24 @@ class TestPromptGuardrailAlignment:
     def test_prompt_documents_sandbox_requirement(self):
         """Prompt must tell agent to create sandbox before editing."""
         from agent.react_prompt import build_system_prompt
-        prompt = build_system_prompt(
+        static_block, dynamic_block = build_system_prompt(
             {"repo_name": "test", "title": "t", "description": "d"},
             {"expected_behavior": "", "actual_behavior": ""},
             "",
         )
+        prompt = static_block + "\n\n" + dynamic_block
         assert "create_sandbox" in prompt
         assert "before" in prompt.lower()
 
     def test_prompt_documents_review_requirement(self):
         """Prompt must tell agent to request_review before submit_fix."""
         from agent.react_prompt import build_system_prompt
-        prompt = build_system_prompt(
+        static_block, dynamic_block = build_system_prompt(
             {"repo_name": "test", "title": "t", "description": "d"},
             {"expected_behavior": "", "actual_behavior": ""},
             "",
         )
+        prompt = static_block + "\n\n" + dynamic_block
         assert "request_review" in prompt
         assert "submit_fix" in prompt
 

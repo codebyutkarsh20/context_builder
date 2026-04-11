@@ -74,7 +74,8 @@ def _estimate_cost(
 
 def react_loop(
     state: ReactAgentState,
-    system_prompt: str,
+    static_block: str,
+    dynamic_block: str,
     task_message: str,
     explore_tools: list,
     trace: RunTrace | None = None,
@@ -87,7 +88,10 @@ def react_loop(
 
     Args:
         state: ReactAgentState to populate with results.
-        system_prompt: Full system prompt with context.
+        static_block: Cacheable system prompt prefix (workflow, tools, rules, strategy).
+            Identical across all bugs of the same fix_type. cache_control applied here.
+        dynamic_block: Non-cached system prompt suffix (repo, ticket, intent, code map, BRTs).
+            Changes every run — not worth caching.
         task_message: Initial user message.
         explore_tools: Read-only exploration tools from explore_tools.py.
         trace: Optional RunTrace for observability.
@@ -104,17 +108,27 @@ def react_loop(
         timeout=120.0,
     ).bind_tools(all_tools, parallel_tool_calls=True)
 
-    # Enable Anthropic prompt caching on the system prompt.
-    # The system prompt + tool definitions are identical across all 30+ LLM calls
-    # in a single bug fix. Caching saves ~87% on input tokens for the static prefix.
-    # Cache read: 0.1x base price. Write: 1.25x (amortized over 30 calls).
+    # Two-block prompt caching strategy:
+    #   Block 1 (static_block): workflow, tools, rules, strategy — same for all bugs of the
+    #     same fix_type. cache_control applied here. Cached across consecutive eval bugs
+    #     that run within the 5-min Anthropic ephemeral window.
+    #   Block 2 (dynamic_block): repo name, ticket, intent, code map, BRTs — changes per bug.
+    #     No cache_control. Always fresh.
+    # Within one run (30+ LLM calls): both blocks are identical → both cached after call 1.
+    # Across eval bugs: block 1 cache hit saves ~3500 tokens × 0.9 per call.
     messages: list = [
         SystemMessage(
-            content=[{
-                "type": "text",
-                "text": system_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }]
+            content=[
+                {
+                    "type": "text",
+                    "text": static_block,
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": dynamic_block,
+                },
+            ]
         ),
         HumanMessage(content=task_message),
     ]

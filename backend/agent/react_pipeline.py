@@ -520,7 +520,7 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     hint_functions = intent.get("likely_affected_functions", [])[:5]
     business_rules = load_business_rules(repo_name, hint_files) if hint_files else ""
 
-    system_prompt = build_system_prompt(
+    static_block, dynamic_block = build_system_prompt(
         work_order=work_order,
         intent=intent,
         kickstart_context=kickstart,
@@ -541,10 +541,13 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
         except Exception:
             pass
 
+        full_prompt = static_block + "\n\n" + dynamic_block
         trace.emit("prompt_build", "react_agent", {
-            "system_prompt_chars": len(system_prompt),
-            "system_prompt_tokens_approx": len(system_prompt) // 4,
-            "system_prompt_text": system_prompt,
+            "system_prompt_chars": len(full_prompt),
+            "system_prompt_tokens_approx": len(full_prompt) // 4,
+            "system_prompt_text": full_prompt,
+            "static_block_chars": len(static_block),
+            "dynamic_block_chars": len(dynamic_block),
             "task_message_text": task_message,
             "task_message_chars": len(task_message),
             "kickstart_chars": len(kickstart),
@@ -560,7 +563,8 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     from agent.react_loop import react_loop
     state = react_loop(
         state=state,
-        system_prompt=system_prompt,
+        static_block=static_block,
+        dynamic_block=dynamic_block,
         task_message=task_message,
         explore_tools=list(EXPLORE_TOOLS),
         trace=trace,
