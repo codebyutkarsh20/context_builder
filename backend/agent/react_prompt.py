@@ -137,6 +137,10 @@ information. **create_sandbox will fail until a plan exists.**
 
   You CANNOT call create_sandbox without a plan.
   You CANNOT call string_replace, create_file, or run_tests without a sandbox.
+
+  **If an edit makes things worse**: call **undo_last_edit()** to surgically
+  revert ONLY the most recent string_replace / create_file. Cheaper than
+  re-creating the sandbox. Repeated calls undo the second-most-recent, etc.
   If you get "ERROR: No sandbox exists", call create_sandbox() immediately — it is
   a 1-call setup step, NOT a reason to escalate.
 

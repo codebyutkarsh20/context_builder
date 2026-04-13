@@ -51,6 +51,9 @@ def set_react_context(
         delattr(_tls, "plan_history")
     if hasattr(_tls, "current_plan"):
         delattr(_tls, "current_plan")
+    # Reset edit history — undo_last_edit must not see edits from prior runs
+    if hasattr(_tls, "edit_history"):
+        delattr(_tls, "edit_history")
 
 
 def set_sandbox_path(sandbox_path: Path, branch_name: str, base_branch: str) -> None:
@@ -193,6 +196,44 @@ def reset_plan_state() -> None:
         delattr(_tls, "current_plan")
 
 
+# ---------------------------------------------------------------------------
+# Edit history — per-file before-snapshots so the agent can undo
+# (Ports Claude Code's fileHistory snapshot pattern, scoped to one run.)
+# ---------------------------------------------------------------------------
+
+# Stored on TLS as a list of dicts:
+#   {"file_path": str, "before_content": str | None, "after_content": str,
+#    "tool": "string_replace" | "create_file"}
+# `before_content` is None when the file didn't exist (create_file on a new file).
+
+def _record_edit_snapshot(
+    file_path: str,
+    before_content: str | None,
+    after_content: str,
+    tool: str,
+) -> None:
+    """Snapshot a file's pre/post-edit content so undo_last_edit can revert it."""
+    if not hasattr(_tls, "edit_history"):
+        _tls.edit_history = []
+    _tls.edit_history.append({
+        "file_path": file_path,
+        "before_content": before_content,
+        "after_content": after_content,
+        "tool": tool,
+    })
+
+
+def get_edit_history() -> list[dict]:
+    """Return the in-memory edit history for inspection / tests."""
+    return getattr(_tls, "edit_history", [])
+
+
+def reset_edit_history() -> None:
+    """Reset edit history — called between runs."""
+    if hasattr(_tls, "edit_history"):
+        delattr(_tls, "edit_history")
+
+
 def _resolve_sandbox_path(file_path: str) -> Path | None:
     """Resolve a file path within the sandbox. Returns None if outside sandbox."""
     sandbox = getattr(_tls, "sandbox_path", None)
@@ -288,8 +329,9 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
             for i in range(len(norm_content) - len(norm_old) + 1):
                 if norm_content[i:i + len(norm_old)] == norm_old:
                     actual_old = "\n".join(lines[i:i + len(norm_old)])
-                    content = content.replace(actual_old, new_string, 1)
-                    resolved.write_text(content, encoding="utf-8")
+                    new_ws_content = content.replace(actual_old, new_string, 1)
+                    _record_edit_snapshot(file_path, content, new_ws_content, "string_replace")
+                    resolved.write_text(new_ws_content, encoding="utf-8")
                     autofix_msg = _try_autofix(resolved)
                     result = f"OK: replaced (whitespace-normalized) in {file_path}"
                     return f"{result}\n{autofix_msg}" if autofix_msg else result
@@ -304,6 +346,8 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
             )
 
         new_content = content.replace(old_string, new_string, 1)
+        # Snapshot BEFORE writing — so undo_last_edit can restore the original
+        _record_edit_snapshot(file_path, content, new_content, "string_replace")
         resolved.write_text(new_content, encoding="utf-8")
 
         old_lines_count = old_string.count("\n") + 1
@@ -339,6 +383,63 @@ def _try_autofix(file_path: Path) -> str:
         return ""
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return ""
+
+
+@tool
+def undo_last_edit() -> str:
+    """Undo the most recent string_replace or create_file in the sandbox.
+
+    Use this when you've made an edit that turned out to be wrong — e.g.,
+    tests went from passing to failing after the edit, or check_syntax
+    reported a problem you can't easily patch. Cheaper than starting
+    over: it reverts ONLY the last edit, leaving everything else intact.
+
+    Behavior:
+      - For string_replace: restores the file to its content before the replace.
+      - For create_file (overwriting an existing file): restores the prior content.
+      - For create_file (new file that didn't exist): deletes the file.
+      - The undone edit is removed from history — call this again to undo
+        the second-most-recent edit, etc.
+
+    Returns OK with the file path that was reverted, or ERROR if there's
+    nothing to undo.
+    """
+    history = getattr(_tls, "edit_history", None)
+    if not history:
+        return "ERROR: No edits to undo (edit_history is empty)."
+
+    last = history.pop()
+    file_path = last["file_path"]
+    before = last["before_content"]
+    tool_name = last["tool"]
+
+    sandbox = getattr(_tls, "sandbox_path", None)
+    if not sandbox:
+        return f"ERROR: No sandbox — cannot undo edit on {file_path}."
+
+    resolved = _resolve_sandbox_path(file_path)
+    if resolved is None:
+        return f"ERROR: Path traversal blocked: {file_path}"
+
+    try:
+        if before is None:
+            # File was newly created — undoing means deleting it
+            if resolved.exists():
+                resolved.unlink()
+                return f"OK: undone — deleted newly-created file {file_path}"
+            return f"OK: undone — file {file_path} already absent"
+        # File existed before — restore prior content
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(before, encoding="utf-8")
+        return (
+            f"OK: undone {tool_name} on {file_path} — "
+            f"restored {len(before)} chars of prior content. "
+            f"({len(history)} earlier edit(s) still in history.)"
+        )
+    except Exception as e:
+        # Restore the history entry on failure so the agent can retry
+        history.append(last)
+        return f"ERROR: failed to revert {file_path}: {e}"
 
 
 @tool
@@ -392,6 +493,15 @@ def create_file(file_path: str, content: str) -> str:
 
     try:
         resolved.parent.mkdir(parents=True, exist_ok=True)
+        # Snapshot whether the file existed (and what it contained) before
+        # so undo_last_edit can restore it precisely.
+        prior_content: str | None = None
+        if resolved.exists():
+            try:
+                prior_content = resolved.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                prior_content = None  # treat unreadable file as a fresh creation
+        _record_edit_snapshot(file_path, prior_content, content, "create_file")
         resolved.write_text(content, encoding="utf-8")
         lines = content.count("\n") + 1
         return f"OK: created {file_path} ({lines} lines)"
@@ -1210,7 +1320,7 @@ def get_blast_radius(file_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 PLAN_TOOLS = [produce_plan]
-EDIT_TOOLS = [string_replace, check_syntax, create_file]
+EDIT_TOOLS = [string_replace, check_syntax, create_file, undo_last_edit]
 SANDBOX_TOOLS = [create_sandbox, run_tests, run_brt]
 MULTI_FILE_TOOLS = [get_callers]
 COMPLETION_TOOLS = [record_localization, request_review, submit_fix, escalate]

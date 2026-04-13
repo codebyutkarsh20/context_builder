@@ -8,6 +8,7 @@ Mirrors the exploration_node pattern (pipeline.py:798-894) but with ALL tools av
 from __future__ import annotations
 
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
@@ -58,6 +59,76 @@ _MODEL_PRICING = {
 }
 
 REACT_MODEL = "claude-sonnet-4-6"
+
+
+def _build_status_refresh(gs, current_phase: str) -> str:
+    """Build a short status block injected periodically so the agent sees its
+    own progress and current sandbox state without re-reading files.
+
+    Mirrors Claude Code's queryContext rebuild-per-turn pattern. Kept short
+    (~300 tokens) so cache impact is bounded — the message is appended at the
+    tail of the conversation, after the cached prefix.
+
+    Returns empty string if there's nothing useful to report (e.g. agent
+    hasn't created sandbox yet).
+    """
+    import subprocess
+
+    parts: list[str] = ["[STATUS REFRESH — current state of your work]"]
+    parts.append(f"Phase: {current_phase}")
+    parts.append(f"Tool calls used: {gs.tool_call_count}/{gs.max_tool_calls}")
+
+    if gs.sandbox_path:
+        try:
+            # Get diff stats (files + line counts) — short, high-signal
+            result = subprocess.run(
+                ["git", "diff", "--stat", "HEAD"],
+                cwd=gs.sandbox_path,
+                capture_output=True, text=True, timeout=5,
+            )
+            stat_lines = (result.stdout or "").strip().splitlines()
+            if stat_lines:
+                # Trim to first 6 lines (per-file stats) — last line is "N files, M insertions"
+                shown = stat_lines[:6] + [stat_lines[-1]] if len(stat_lines) > 7 else stat_lines
+                parts.append("\nFiles modified in sandbox:")
+                for line in shown:
+                    parts.append(f"  {line.strip()}")
+            else:
+                parts.append("Sandbox exists but no edits committed yet.")
+        except Exception:
+            pass
+
+    # Test status
+    if gs.tests_attempted:
+        if gs.tests_passed:
+            parts.append("\nLast test result: PASSED")
+        elif gs.tests_skipped:
+            parts.append("\nLast test result: SKIPPED (env issue, not your fix)")
+        else:
+            parts.append(f"\nLast test result: FAILED ({gs.test_failure_count} failures)")
+    else:
+        parts.append("\nNo tests attempted yet.")
+
+    # Review status
+    if gs.review_count > 0:
+        parts.append(f"Review verdict: {gs.review_verdict or 'pending'} ({gs.review_count} requests)")
+
+    # Anti-pattern hints — surface stuck-detection signals
+    if gs.grep_count >= 8:
+        parts.append(
+            f"\n⚠ You've called grep_repo {gs.grep_count} times. "
+            "Try delegate_explore() or read_function() instead."
+        )
+    if gs.tool_call_count >= int(gs.max_tool_calls * 0.6) and gs.string_replace_count == 0:
+        parts.append(
+            f"\n⚠ {gs.tool_call_count}/{gs.max_tool_calls} calls used and 0 edits made. "
+            "Pick your best hypothesis and apply it now."
+        )
+
+    # Don't emit the block if it's just the boilerplate (no actionable info)
+    if len(parts) <= 3:
+        return ""
+    return "\n".join(parts)
 
 
 def _estimate_cost(
@@ -134,11 +205,39 @@ def react_loop(
         "fix_type": getattr(_react_tls_local, "fix_type", "bug_fix"),
     }
 
-    llm = ChatAnthropic(
-        model=REACT_MODEL,
-        max_tokens=16000,
-        timeout=120.0,
-    ).bind_tools(all_tools, parallel_tool_calls=True)
+    # Two LLM instances — one with extended thinking for early "hard thinking"
+    # turns (intake / plan production / before first edit), one without for
+    # fast iteration once the agent is in the edit-test-review loop.
+    #
+    # Extended thinking helps when the model is deciding:
+    #   - what the root cause is (before any edits)
+    #   - what target files / approach to put in the plan
+    #   - whether to revise the plan after new observations
+    # It's much less valuable during edit-test loops where decisions are
+    # tactical ("retry this grep with a different pattern").
+    #
+    # Threshold: enable thinking until the first successful string_replace.
+    # After that, switch to the non-thinking LLM to keep cost bounded.
+    # Budget: 2048 tokens of thinking per turn, capped by the model.
+    _THINKING_BUDGET = int(os.environ.get("REACT_THINKING_BUDGET", "2048"))
+    _THINKING_ENABLED = os.environ.get("DISABLE_REACT_THINKING", "") not in ("1", "true", "True")
+
+    def _build_llm(with_thinking: bool):
+        kwargs: dict = {
+            "model": REACT_MODEL,
+            "max_tokens": 16000,
+            "timeout": 120.0,
+        }
+        if with_thinking and _THINKING_ENABLED:
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": _THINKING_BUDGET}
+            # Thinking requires temperature=1 per Anthropic API contract
+            kwargs["temperature"] = 1.0
+        return ChatAnthropic(**kwargs).bind_tools(all_tools, parallel_tool_calls=True)
+
+    llm_thinking = _build_llm(with_thinking=True)
+    llm_fast = _build_llm(with_thinking=False)
+    # Start with the thinking LLM — switches to fast once first edit lands
+    llm = llm_thinking
 
     # Two-block prompt caching strategy:
     #   Block 1 (static_block): workflow, tools, rules, strategy — same for all bugs of the
@@ -187,6 +286,14 @@ def react_loop(
     microcompact_state = MicrocompactState()
     current_phase = "explore"  # Track phase transitions
 
+    # Stuck-detection state (P3 — diminishing returns + auto-replan).
+    # Tracks token-count growth per turn and edit/test counts at each check
+    # point. If 3 consecutive checks show < 500 tokens added AND no new
+    # edits or tests, the agent is in a non-productive loop — inject a
+    # forced replan nudge instead of silently burning more budget.
+    _stuck_history: list[dict] = []
+    _replan_injected_at: set[int] = set()  # avoid re-injecting at the same call number
+
     if trace:
         trace.stage_start("react_loop")
 
@@ -223,6 +330,83 @@ def react_loop(
             )
             messages.append(HumanMessage(content=nudge))
             logger.info("PHASE NUDGE injected at call %d: forcing edit phase", _nudge_at)
+
+        # P3: DIMINISHING-RETURNS DETECTION + AUTO-REPLAN.
+        # Ported from Claude Code's checkTokenBudget (query/tokenBudget.ts).
+        # If 3 consecutive turns add < 500 tokens AND no new edits/tests,
+        # the agent is in a non-productive loop (re-reading same files,
+        # re-grepping the same patterns). Inject a forced REPLAN nudge
+        # instead of escalating — the agent gets a chance to revise the plan
+        # with a fresh hypothesis BEFORE we give up.
+        _DIMINISHING_TOKEN_DELTA = 500   # tokens — Claude Code's threshold
+        _DIMINISHING_RUNS_REQUIRED = 3   # consecutive checks
+        _CHECK_EVERY = 4                 # check every N tool calls
+
+        if (gs.tool_call_count > 0
+                and gs.tool_call_count % _CHECK_EVERY == 0
+                and gs.tool_call_count not in _replan_injected_at):
+            current_tokens = count_tokens_approx(messages)
+            checkpoint = {
+                "call": gs.tool_call_count,
+                "tokens": current_tokens,
+                "edits": gs.string_replace_count,
+                "tests": gs.run_tests_count,
+                "reviews": gs.review_count,
+            }
+            _stuck_history.append(checkpoint)
+            # Keep last 4 checkpoints (we look at the last 3 deltas)
+            if len(_stuck_history) > 4:
+                _stuck_history.pop(0)
+
+            # Need at least 4 checkpoints to compute 3 deltas
+            if len(_stuck_history) >= 4:
+                deltas = []
+                for i in range(1, len(_stuck_history)):
+                    deltas.append({
+                        "tokens": _stuck_history[i]["tokens"] - _stuck_history[i - 1]["tokens"],
+                        "new_edits": _stuck_history[i]["edits"] - _stuck_history[i - 1]["edits"],
+                        "new_tests": _stuck_history[i]["tests"] - _stuck_history[i - 1]["tests"],
+                    })
+                last3 = deltas[-_DIMINISHING_RUNS_REQUIRED:]
+                all_diminishing = all(
+                    d["tokens"] < _DIMINISHING_TOKEN_DELTA
+                    and d["new_edits"] == 0
+                    and d["new_tests"] == 0
+                    for d in last3
+                )
+
+                if all_diminishing:
+                    # Lazy-import to avoid circular import
+                    from agent.react_tools import get_current_plan
+                    cur_plan = get_current_plan() or {}
+                    replan_nudge = (
+                        f"⚠ STUCK DETECTOR: For the last {len(last3)} checkpoints, "
+                        f"context grew by < {_DIMINISHING_TOKEN_DELTA} tokens per turn AND "
+                        "you've made no new edits or run no new tests. You appear to be "
+                        "re-exploring without progress.\n\n"
+                        "**REQUIRED NEXT ACTION**: Call produce_plan() with a REVISED "
+                        "hypothesis. Your current plan was:\n"
+                        f"  root_cause: {cur_plan.get('root_cause', '(none)')[:160]}\n"
+                        f"  target_files: {cur_plan.get('target_files', [])}\n\n"
+                        "Ask yourself:\n"
+                        "1. What does the EVIDENCE you've gathered actually show?\n"
+                        "2. Is the original root_cause still consistent with that evidence?\n"
+                        "3. If not, what's a different hypothesis that fits better?\n\n"
+                        "Do NOT just keep grepping. Either produce_plan() with a new "
+                        "hypothesis, or commit to your current plan and start editing."
+                    )
+                    messages.append(HumanMessage(content=replan_nudge))
+                    _replan_injected_at.add(gs.tool_call_count)
+                    logger.warning(
+                        "REPLAN NUDGE injected at call %d: 3 consecutive turns with no progress",
+                        gs.tool_call_count,
+                    )
+                    if trace:
+                        trace.emit("auto_replan_nudge", "react_loop", {
+                            "at_call": gs.tool_call_count,
+                            "deltas": last3,
+                            "current_plan": cur_plan,
+                        })
 
         # FORCE ESCALATION: 75% of budget, sandbox exists, still 0 edits = stuck
         _escalate_at = max(20, int(gs.max_tool_calls * 0.75))
@@ -279,6 +463,26 @@ def react_loop(
                 "phase": current_phase,
                 "messages": messages_snapshot,
             })
+
+        # Switch from thinking-LLM to fast-LLM once the first edit lands.
+        # Before any edit, the agent is doing root-cause analysis + plan
+        # production — extended thinking helps it get the hypothesis right.
+        # After the first edit, decisions are tactical (which test to run,
+        # which file to re-read) — thinking adds cost without commensurate
+        # quality gain.
+        if llm is llm_thinking and gs.string_replace_count >= 1:
+            llm = llm_fast
+            logger.info(
+                "Switched main loop to fast LLM (no thinking) after first edit at call %d",
+                gs.tool_call_count,
+            )
+            if trace:
+                trace.emit("llm_mode_switch", "react_loop", {
+                    "from": "thinking",
+                    "to": "fast",
+                    "at_call": gs.tool_call_count,
+                    "reason": "first_edit_landed",
+                })
 
         # Call the LLM — with multi-stage recovery for context overflow
         response = None
@@ -607,6 +811,26 @@ def react_loop(
                     "tokens_saved": pre_summarize - post_summarize,
                     "at_call": gs.tool_call_count,
                 })
+
+        # Dynamic context refresh — every 5 tool calls, inject a short
+        # status block so the agent sees its own progress without re-reading
+        # files or re-running greps. Mirrors Claude Code's queryContext
+        # rebuild-per-turn pattern, adapted for our cost-conscious budget.
+        # Skip if no edit has happened yet (nothing has changed worth refreshing).
+        _refresh_interval = int(os.environ.get("REACT_REFRESH_INTERVAL", "5"))
+        if (gs.tool_call_count > 0
+                and gs.tool_call_count % _refresh_interval == 0
+                and gs.sandbox_created
+                and gs.string_replace_count >= 1):
+            refresh_block = _build_status_refresh(gs, current_phase)
+            if refresh_block:
+                messages.append(HumanMessage(content=refresh_block))
+                if trace:
+                    trace.emit("context_refresh", "react_loop", {
+                        "at_call": gs.tool_call_count,
+                        "phase": current_phase,
+                        "chars": len(refresh_block),
+                    })
 
     # Save cache-safe params so post-loop subagents (verifier, summarizer) can
     # inherit our prompt-cached prefix instead of paying full price for a fresh
