@@ -33,6 +33,24 @@
 
 ## Completed
 
+### P1 — Main-agent decisioning (P1-P4: thinking, context refresh, auto-replan, undo)
+**Completed:** v3.4 (2026-04-13)
+Four ports from Claude Code that improve how the main agent reasons and recovers:
+- **P1 Extended thinking** on early turns (intake + plan production) — ChatAnthropic with `thinking={"type":"enabled","budget_tokens":2048}` until first edit, then switch to plain LLM. Defensive fallback for older anthropic SDKs that don't accept the kwarg.
+- **P2 Dynamic context refresh** every 5 tool calls post-first-edit — short HumanMessage with current phase, files modified (git diff --stat), last test result, anti-pattern hints. Mirrors Claude Code's queryContext-per-turn pattern.
+- **P3 Diminishing-returns stuck detection** — every 4 calls, compare last 3 deltas; if <500 tokens added AND 0 new edits/tests for 3 consecutive checks, inject REPLAN nudge with the current plan quoted, forcing the agent to either revise or commit.
+- **P4 Per-edit rollback** via `undo_last_edit` tool — string_replace and create_file snapshot file content before writing; agent can surgically undo the most recent edit (restore prior content, or delete newly-created file). 17 unit tests.
+
+### P1 — SDK dep-compat fixes for Flask/Werkzeug/Rich
+**Completed:** v3.3 (2026-04-13)
+`repo_manager.py`: dep-pinning matrix + test-dep installs for SWE-bench repos.
+- Jinja2 Markup-gone detection → pin jinja2<3.1 + itsdangerous<2.1 + markupsafe<2.1
+- Flask 2.0 → werkzeug>=2.0.0,<2.1 (as_tuple preserved)
+- Flask 2.1/2.2 → werkzeug>=2.0.3,<2.3 (url_parse preserved)
+- Werkzeug repo → install ephemeral_port_reserve + pytest-xprocess
+- Rich repo → install attrs (for test_pretty.py)
+Sentinel went from 1/5 → 3/5 pass; avg cost $0.79 → $0.38 (52% reduction); avg calls 32 → 14 (56% reduction).
+
 ### P1 — Concept-to-code mapping for business-language tickets
 **Completed:** v3.2 (2026-04-13)
 `graph_utils.query_concept_to_code()`: extracts keywords from ticket title + description, queries `BusinessRule` nodes in Neo4j (OPTIONAL MATCH `ENFORCED_BY` → Function), falls back to flat `business_rules.json` scan when Neo4j is unavailable.
