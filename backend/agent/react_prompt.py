@@ -105,8 +105,9 @@ You have a budget of ~30 tool calls. Successful changes average 15-25 calls. Har
 4. grep_repo is ONLY for finding which file contains a pattern. Once you have the file, use the code map + read_file with line numbers.
 5. **If grep returns zero matches**: the bug description uses different names than the code. Look at the CODE MAP to find the actual function names.
 6. **Delegate broad questions to delegate_explore()** — when a question would take 4+ tool calls (e.g. "find all callers of X and what they pass", "are there TODOs about retries?", "where is the auth flow configured?"), call `delegate_explore("your question")` instead. A Haiku subagent runs the search and returns a focused report. Saves your turns and your context.
-7. {'Form a clear hypothesis about the root cause.' if is_bug else 'Understand the codebase structure.'}
-8. Call record_localization when ready.
+7. **External lookups when needed** — if you encounter an unfamiliar library API or a cryptic error message, you may have `web_fetch(url, prompt)` and `web_search(query)` available. Use these only when the answer can't be found in the codebase (e.g., "what does werkzeug.url_quote do?" or "django InvalidBasesError workaround"). They cost more than local tools — local first, web only if needed.
+8. {'Form a clear hypothesis about the root cause.' if is_bug else 'Understand the codebase structure.'}
+9. Call record_localization when ready.
 
 ### Phase 1.5: PLAN — declare your approach before any edits (1 call)
 

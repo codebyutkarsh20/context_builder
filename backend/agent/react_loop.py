@@ -110,7 +110,12 @@ def react_loop(
     # Add the explore subagent tool — main agent can delegate "find me X"
     # questions to a Haiku-backed read-only subagent, saving turns + cost.
     from agent.explore_subagent import EXPLORE_SUBAGENT_TOOLS
-    all_tools = explore_tools + EXPLORE_SUBAGENT_TOOLS + REACT_TOOLS
+    # Add web_fetch + web_search — for looking up library docs / GitHub
+    # issues / Stack Overflow answers when the agent encounters unfamiliar
+    # APIs or error messages. Disabled by default (set ENABLE_WEB_TOOLS=1).
+    from agent.web_tools import WEB_TOOLS, WEB_TOOLS_ENABLED
+    web_tools = WEB_TOOLS if WEB_TOOLS_ENABLED else []
+    all_tools = explore_tools + EXPLORE_SUBAGENT_TOOLS + web_tools + REACT_TOOLS
     tool_map = {t.name: t for t in all_tools}
 
     # Capture thread-local context from the CURRENT (main) thread so we can
