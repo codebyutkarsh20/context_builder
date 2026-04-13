@@ -15,7 +15,14 @@ from typing import TYPE_CHECKING
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from agent.context_manager import cap_tool_output, count_tokens_approx, mask_old_observations, maybe_summarize
+from agent.context_manager import (
+    MicrocompactState,
+    cap_tool_output,
+    count_tokens_approx,
+    mask_old_observations,
+    maybe_summarize,
+    microcompact_in_place,
+)
 from agent.tool_metadata import is_concurrent_safe as _is_concurrent_safe
 from agent.trace import _PHASE_MAP
 from agent.react_guardrails import (
@@ -165,6 +172,11 @@ def react_loop(
             difficulty = "single-file"
     call_budget = budget_for_difficulty(difficulty)
     gs = GuardrailState(max_tool_calls=call_budget)
+    # Per-run microcompact state — tracks which tool_call_ids have been
+    # replaced with placeholders. Idempotent: same tool_call_id always maps
+    # to the same placeholder string, so the message prefix stays byte-stable
+    # across iterations and the Anthropic prompt cache survives.
+    microcompact_state = MicrocompactState()
     current_phase = "explore"  # Track phase transitions
 
     if trace:
@@ -558,16 +570,20 @@ def react_loop(
         if terminal:
             break
 
-        # Context window management (Layers 2 + 3)
+        # Context window management (Layers 2b + 3)
+        # Microcompact: cache-friendly in-place tool result eviction.
+        # Stable prefix → prompt cache survives across iterations.
         pre_mask_tokens = count_tokens_approx(messages)
-        messages = mask_old_observations(messages)
+        messages = microcompact_in_place(messages, microcompact_state)
         post_mask_tokens = count_tokens_approx(messages)
         if pre_mask_tokens != post_mask_tokens and trace:
             trace.emit("context_compaction", "react_loop", {
-                "action": "observation_masking",
+                "action": "microcompact",
                 "tokens_before": pre_mask_tokens,
                 "tokens_after": post_mask_tokens,
                 "tokens_saved": pre_mask_tokens - post_mask_tokens,
+                "compacted_count": microcompact_state.count,
+                "cumulative_tokens_saved": microcompact_state.tokens_saved,
                 "at_call": gs.tool_call_count,
             })
 

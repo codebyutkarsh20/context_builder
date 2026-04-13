@@ -3,12 +3,18 @@ context_manager.py — Context window management for the ReAct agent loop.
 
 Three-layer strategy to keep token usage under control:
   Layer 1: Per-tool output caps (at execution time, zero cost)
-  Layer 2: Observation masking with sliding window (every iteration, zero cost)
+  Layer 2a: Observation masking with sliding window (legacy — rebuilds prefix)
+  Layer 2b: Microcompact (cache-friendly, in-place, idempotent — preferred)
   Layer 3: LLM summarization as safety net (triggered rarely, ~$0.002 via Haiku)
 
 Research basis: SWE-Agent observation masking (arXiv 2508.21433) shows tool outputs
 are ~84% of tokens in coding agents. Simple masking works as well as expensive
 LLM summarization while avoiding trajectory elongation.
+
+Microcompact (Layer 2b) is ported from Claude Code's services/compact/microCompact.ts:
+once a tool result is "old enough" it's replaced with a placeholder ONCE and
+never modified again. The prefix stays stable across iterations, preserving
+the Anthropic prompt cache (~87% cost savings on cached prefix).
 """
 
 from __future__ import annotations
@@ -19,6 +25,32 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Microcompact configuration (Layer 2b)
+# ---------------------------------------------------------------------------
+
+# Tools whose results can be safely replaced with a one-line placeholder once
+# they're no longer in the recent window. These are exploration / lookup tools
+# whose value is "did you read this file? what did you find?" — the agent doesn't
+# need to re-read the full content from history once it's old.
+#
+# NOT compactable (kept in full forever): test results, edits, sandbox creation,
+# review verdicts, BRT runs, plan production, submit_fix — these are critical
+# state the agent and verifier must reference.
+COMPACTABLE_TOOLS = frozenset({
+    "read_file",
+    "read_function",
+    "grep_repo",
+    "list_files",
+    "get_file_structure",
+    "get_function_info",
+    "get_file_summary",
+    "get_callers",
+    "get_blast_radius",
+})
+
+MICROCOMPACT_KEEP_RECENT = 12  # Keep last N tool results in full
 
 # Layer 2: Observation masking config
 # With 160K context, we can keep more turns in full than the default 10.
@@ -91,6 +123,119 @@ def mask_old_observations(
         else:
             new_messages.append(msg)
 
+    return new_messages
+
+
+class MicrocompactState:
+    """Per-run state tracking which tool results have been microcompacted.
+
+    Keeping this state ensures the same `tool_call_id` is replaced with the
+    SAME placeholder every iteration — so the message prefix stays byte-stable
+    across LLM calls and the Anthropic prompt cache survives.
+    """
+
+    def __init__(self) -> None:
+        # Map tool_call_id → placeholder content (pre-rendered once, reused)
+        self.compacted: dict[str, str] = {}
+        # Total tokens saved across all compactions in this run
+        self.tokens_saved: int = 0
+        # Number of tool results compacted
+        self.count: int = 0
+
+    def reset(self) -> None:
+        self.compacted.clear()
+        self.tokens_saved = 0
+        self.count = 0
+
+
+def microcompact_in_place(
+    messages: list,
+    state: MicrocompactState,
+    keep_recent: int = MICROCOMPACT_KEEP_RECENT,
+    compactable_tools: frozenset[str] = COMPACTABLE_TOOLS,
+) -> list:
+    """Layer 2b: Cache-friendly in-place tool result eviction.
+
+    For each compactable tool result older than the recent window:
+      - If already compacted (in state.compacted), reuse the existing placeholder
+        — message stays byte-identical to previous iteration.
+      - Otherwise, render a placeholder ONCE, store it in state, replace the
+        message content.
+    Test results, edits, reviews, plans, BRTs, submit_fix — never compacted
+    (those are critical state that the agent + verifier must reference).
+
+    Differences from `mask_old_observations`:
+      - Stateful (idempotent): same input always produces the same prefix bytes
+      - Compactable-tool whitelist: only exploration/lookup tools are eligible
+      - Cache-preserving: the prompt prefix doesn't drift between iterations
+        as the window slides, so prompt cache hits remain near 100%
+
+    Args:
+        messages: Current message list.
+        state: Per-run MicrocompactState carrying the compacted-id map.
+        keep_recent: Number of compactable tool results to keep in full at the tail.
+        compactable_tools: Tool names eligible for compaction.
+
+    Returns:
+        New message list with old compactable tool results replaced by
+        placeholders. Already-compacted messages are reused verbatim.
+    """
+    if len(messages) < 4:
+        return messages
+
+    # Find compactable tool message indices (only Read/Grep/etc., not test results)
+    compactable_indices: list[int] = []
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        tool_name = _extract_tool_name(messages, i)
+        if tool_name in compactable_tools:
+            compactable_indices.append(i)
+
+    if len(compactable_indices) <= keep_recent:
+        return messages  # Nothing aged out yet
+
+    # Anything beyond the last `keep_recent` compactable results is eligible
+    eligible = compactable_indices[:-keep_recent]
+
+    # Build new message list — reuse existing references where possible to avoid
+    # extra copies (and to make the prefix-stability guarantee explicit).
+    new_messages = list(messages)
+    newly_compacted = 0
+    for idx in eligible:
+        msg = messages[idx]
+        tool_call_id = getattr(msg, "tool_call_id", "")
+        if not tool_call_id:
+            continue
+
+        # Reuse placeholder if we already compacted this id — message stays
+        # byte-identical to the previous iteration's prefix.
+        cached = state.compacted.get(tool_call_id)
+        if cached is not None:
+            # The message in `messages` should already BE the cached placeholder
+            # (from the previous iteration). If it's not (e.g. message list was
+            # reconstructed externally), restore the cached placeholder to keep
+            # the prefix stable.
+            if str(msg.content) != cached:
+                new_messages[idx] = ToolMessage(content=cached, tool_call_id=tool_call_id)
+            continue
+
+        # First compaction for this tool_call_id — render placeholder once
+        original = str(msg.content)
+        tool_name = _extract_tool_name(messages, idx)
+        summary = _extract_summary(original)
+        placeholder = MASK_TEMPLATE.format(tool_name=tool_name, summary=summary)
+        state.compacted[tool_call_id] = placeholder
+        state.tokens_saved += int(max(0, len(original) - len(placeholder)) * TOKEN_ESTIMATE_RATIO)
+        state.count += 1
+        newly_compacted += 1
+        new_messages[idx] = ToolMessage(content=placeholder, tool_call_id=tool_call_id)
+
+    if newly_compacted:
+        logger.info(
+            "Microcompact: replaced %d tool results (%d total compacted, ~%d tokens saved)",
+            newly_compacted, state.count, state.tokens_saved,
+        )
     return new_messages
 
 
