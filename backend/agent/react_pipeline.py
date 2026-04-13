@@ -1121,19 +1121,67 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
         explanation: str      # Why APPROVE/REJECT in 2-3 sentences
         regression_risk: str  # "LOW", "MEDIUM", "HIGH"
 
+    # Hardened verifier prompt (ported from Claude Code's verificationAgent).
+    # Anti-rationalization framing + required adversarial reasoning before APPROVE.
     prompt = (
-        f"You are an independent code reviewer. Review this patch with fresh eyes.\n\n"
+        "You are a verification specialist. Your job is NOT to confirm the patch works — "
+        "it's to try to break it on paper.\n\n"
+        "You have two documented failure patterns:\n"
+        "1. **Verification avoidance**: when faced with a check, you find reasons not "
+        "to run it — you read the diff, narrate what you would test, write 'APPROVE,' "
+        "and move on.\n"
+        "2. **Seduced by the first 80%**: you see a passing test result and feel "
+        "inclined to approve, not noticing that the patch only handles the happy path, "
+        "or that the test only covers one of three reported symptoms.\n\n"
+        "Your entire value is in finding the last 20%.\n\n"
+        "=== INPUT ===\n"
         f"BUG: {work_order.get('title', '')}\n"
         f"DESCRIPTION: {work_order.get('description', '')[:500]}\n\n"
         f"PATCH (what the agent changed):\n```diff\n{diff_text}\n```\n\n"
-        f"TESTS: {test_result[:500]}\n\n"
+        f"TEST RESULT: {test_result[:500]}\n\n"
         f"AGENT EXPLANATION: {explanation[:300]}\n\n"
-        "Evaluate:\n"
-        "1. Does this patch actually fix the described bug?\n"
-        "2. Are there any obvious regressions or side effects?\n"
-        "3. Is the change minimal and correct?\n\n"
-        "APPROVE if: patch clearly fixes the bug, no obvious regressions.\n"
-        "REJECT if: patch doesn't address the bug, introduces new bugs, or is dangerously wrong."
+        "=== EVALUATION ===\n"
+        "Walk through these checks IN ORDER. For each, write your reasoning before "
+        "moving on — do not skip.\n\n"
+        "1. **Does the diff address the reported symptom?** Quote the line in the "
+        "description that describes the bug, then point to the diff lines that change "
+        "the behavior. If you can't tie diff lines to symptom lines, that's a REJECT.\n"
+        "2. **Adversarial probe** (REQUIRED): Pick at least ONE break attempt and "
+        "reason about whether the patch handles it:\n"
+        "   - Boundary inputs: empty, None, 0, -1, very large, unicode, malformed\n"
+        "   - Concurrency: what if this is called twice in parallel?\n"
+        "   - Idempotency: what if the same call is repeated?\n"
+        "   - Related code: does another caller of the changed function rely on the "
+        "old behavior?\n"
+        "   State explicitly which probe you ran and what you concluded.\n"
+        "3. **Test coverage**: does the test result actually exercise the fix? A "
+        "passing test on an unrelated path is not evidence. If the test command was "
+        "`pytest -x` on a file with pre-existing failures, the test may have stopped "
+        "before reaching the fix — note this.\n"
+        "4. **Side effects in the diff**: does the patch touch anything the bug didn't "
+        "ask for? Removed validation? Disabled checks? Renamed exports? These are "
+        "REJECT signals unless explicitly justified.\n\n"
+        "=== RECOGNIZE YOUR OWN RATIONALIZATIONS ===\n"
+        "If you catch yourself thinking any of these, REJECT or escalate:\n"
+        "- 'The diff looks correct' → reading is not verification, did you check "
+        "behavior?\n"
+        "- 'The test passed so it's fine' → verify the test exercised the fix\n"
+        "- 'The agent's explanation is plausible' → plausible is not verified\n"
+        "- 'This is probably an edge case nobody hits' → not your call\n\n"
+        "=== VERDICTS ===\n"
+        "APPROVE: only if (a) diff lines tie to symptom, (b) at least one adversarial "
+        "probe was reasoned about and the patch survives it, (c) test result exercises "
+        "the fix, (d) no unrequested side effects.\n"
+        "REJECT: any of the above fail, or you spot regression risk.\n\n"
+        "Confidence: how sure are you? Use 0.5 if you couldn't run the adversarial "
+        "probe (e.g., diff is truncated and you can't see context). Use 0.9+ only if "
+        "you ran a probe and it survived.\n\n"
+        "Set regression_risk=HIGH if the patch removes validation, changes a public "
+        "API signature, or touches >5 files. MEDIUM if it changes shared utilities. "
+        "LOW if it's a localized fix in one function.\n\n"
+        "Your `explanation` field MUST mention which adversarial probe you ran. If "
+        "the explanation has no probe, the caller will treat it as REJECT regardless "
+        "of your verdict."
     )
 
     # Run confirmed BRTs against the patched sandbox (speculative EPR check)
@@ -1183,6 +1231,30 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
             logger.warning("Verifier returned invalid verdict '%s' — treating as REJECT", result.verdict)
             result.verdict = "REJECT"
         result.confidence = max(0.0, min(1.0, result.confidence))
+
+        # Anti-rationalization gate: if the verifier APPROVES but the explanation
+        # contains no evidence of an adversarial probe, downgrade to REJECT with
+        # low confidence. This enforces the prompt requirement that the explanation
+        # must mention which probe was run.
+        if result.verdict == "APPROVE":
+            probe_signals = (
+                "boundary", "concurrency", "idempoten", "parallel", "edge",
+                "empty", "none", "unicode", "malformed", "probe", "considered",
+                "checked", "if called", "what if", "negative",
+            )
+            explanation_lower = (result.explanation or "").lower()
+            if not any(sig in explanation_lower for sig in probe_signals):
+                logger.warning(
+                    "Verifier APPROVE without adversarial-probe evidence — "
+                    "downgrading to REJECT (explanation: %s)",
+                    result.explanation[:120],
+                )
+                result.verdict = "REJECT"
+                result.confidence = min(result.confidence, 0.4)
+                result.explanation = (
+                    "[downgraded] Original APPROVE lacked adversarial-probe evidence. "
+                    + (result.explanation or "")
+                )
 
         state["verifier_verdict"] = result.verdict
         state["verifier_confidence"] = result.confidence

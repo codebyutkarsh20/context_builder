@@ -190,7 +190,12 @@ def test_verifier_approves_good_patch(tmp_path):
     class FakeVerifierResult(BaseModel):
         verdict: str = "APPROVE"
         confidence: float = 0.9
-        explanation: str = "Patch correctly fixes the bug"
+        # Includes adversarial-probe evidence so the anti-rationalization gate
+        # in verifier_node doesn't downgrade the verdict.
+        explanation: str = (
+            "Considered the boundary case (empty input, parallel callers) and "
+            "the patch correctly fixes the bug."
+        )
         regression_risk: str = "LOW"
 
     with patch("subprocess.run", return_value=mock_diff), \
@@ -199,7 +204,7 @@ def test_verifier_approves_good_patch(tmp_path):
 
     assert result["verifier_verdict"] == "APPROVE"
     assert result["verifier_confidence"] == pytest.approx(0.9, abs=0.01)
-    assert result["verifier_explanation"] == "Patch correctly fixes the bug"
+    assert "boundary" in result["verifier_explanation"]
     assert result["verifier_regression_risk"] == "LOW"
 
 

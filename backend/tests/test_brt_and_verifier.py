@@ -318,7 +318,9 @@ class TestVerifierNodeVerdict:
         class FakeVerifier(BaseModel):
             verdict: str = _verdict
             confidence: float = _confidence
-            explanation: str = "looks correct"
+            # Include a probe signal so APPROVE isn't downgraded by the
+            # anti-rationalization gate (see verifier_node).
+            explanation: str = "Considered the boundary case (empty input) and the patch handles it correctly."
             regression_risk: str = "LOW"
 
         with patch("subprocess.run", return_value=mock_diff), \
@@ -336,6 +338,38 @@ class TestVerifierNodeVerdict:
     def test_verifier_confidence_stored(self, tmp_path):
         result = self._run_verifier(tmp_path, "APPROVE", 0.85)
         assert result.get("verifier_confidence") == pytest.approx(0.85, abs=0.01)
+
+    def test_approve_without_probe_evidence_downgraded_to_reject(self, tmp_path):
+        """APPROVE with no adversarial-probe signal in explanation gets downgraded.
+
+        This is the anti-rationalization gate ported from Claude Code's verifier:
+        the model must show evidence it considered ways to break the patch before
+        approving. Pure 'looks correct' approvals are downgraded to REJECT.
+        """
+        from agent.react_pipeline import verifier_node
+        from pydantic import BaseModel
+
+        state = _minimal_state(submitted=True)
+        state["sandbox_path"] = str(tmp_path)
+        state["test_result"] = "passed"
+
+        mock_diff = MagicMock()
+        mock_diff.stdout = "diff --git a/f.py b/f.py\n+def fix(): pass\n"
+        mock_diff.returncode = 0
+
+        class LazyApprove(BaseModel):
+            verdict: str = "APPROVE"
+            confidence: float = 0.95
+            explanation: str = "The patch looks correct and fixes the bug."  # NO probe!
+            regression_risk: str = "LOW"
+
+        with patch("subprocess.run", return_value=mock_diff), \
+             patch("agent.llm.structured_call", return_value=LazyApprove()):
+            result = verifier_node(state)
+
+        assert result["verifier_verdict"] == "REJECT"
+        assert result["verifier_confidence"] <= 0.4
+        assert "[downgraded]" in result["verifier_explanation"]
 
     def test_verifier_failure_is_non_fatal(self, tmp_path):
         from agent.react_pipeline import verifier_node
