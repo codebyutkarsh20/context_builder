@@ -476,6 +476,23 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     from agent.graph_utils import build_kickstart_context, load_business_rules
     kickstart = build_kickstart_context(repo_name, str(repo_path), intent, DATA_DIR)
 
+    # Learn-from-fix: prepend lessons from past runs on this repo. The
+    # learn_from_fix module reads {DATA_DIR}/{repo_name}/agent_lessons.md
+    # (populated by record_lesson in finalize_node on previous runs).
+    # Returns "" if no lessons exist or feature is disabled.
+    try:
+        from agent.learn_from_fix import load_lessons
+        lessons_section = load_lessons(repo_name)
+        if lessons_section:
+            # Prepend so it's among the first things the agent sees
+            kickstart = lessons_section + "\n\n" + kickstart
+            logger.info(
+                "Injected %d chars of past-run lessons for %s",
+                len(lessons_section), repo_name,
+            )
+    except Exception as e:
+        logger.debug("load_lessons failed (non-fatal): %s", e)
+
     # BUILD STRUCTURED CODE MAP for localized files — gives the agent a compact
     # overview (function signatures + line numbers) instead of dumping whole files.
     # Research: Composio FQDN maps use ~500 tokens vs 25K for whole files.
@@ -846,6 +863,8 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
                 logger.debug("Ground-truth test execution skipped: %s", e)
 
         _report_progress(state)
+        # Record a lesson for future runs (escalated path)
+        _safe_record_lesson(state)
         if trace:
             trace.stage_end("finalize")
         _cleanup_sandbox(sandbox_path, repo_path, branch_name)
@@ -864,10 +883,26 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
     state = _populate_repair_and_localization(state, sandbox_path, repo_path)
 
     _report_progress(state)
+    # Record a lesson for future runs (successful path)
+    _safe_record_lesson(state)
     if trace:
         trace.stage_end("finalize")
     _cleanup_sandbox(sandbox_path, repo_path, branch_name)
     return state
+
+
+def _safe_record_lesson(state: dict) -> None:
+    """Call learn_from_fix.record_lesson with all exceptions swallowed.
+
+    record_lesson already swallows its own errors, but we add a second
+    layer of safety here since this runs during finalize (post-submit)
+    and any crash would break the pipeline.
+    """
+    try:
+        from agent.learn_from_fix import record_lesson
+        record_lesson(state)
+    except Exception as e:
+        logger.debug("record_lesson wrapper failed (non-fatal): %s", e)
 
 
 # ---------------------------------------------------------------------------
