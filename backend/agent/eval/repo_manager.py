@@ -387,10 +387,14 @@ class RepoManager:
             import_check = _import_check()
             err = import_check.stderr if import_check.returncode != 0 else ""
 
-        # Fix 2c: Some Flask 2.0 series also need werkzeug < 2.3 even when
-        # the import itself passes — the test suite uses url_parse with
-        # deprecation-as-error. Detect this pre-emptively for Flask 2.0-2.2
-        # so tests don't fail with a confusing DeprecationWarning.
+        # Fix 2c: Flask 2.0-2.2 + Werkzeug version-pinning matrix.
+        # Even when import itself passes, the test suite may use APIs that
+        # were removed in later Werkzeug versions:
+        #   - Werkzeug 2.1 removed `as_tuple` from EnvironBuilder.get_environ
+        #     → Flask 2.0 tests use this → must pin werkzeug<2.1
+        #   - Werkzeug 2.3 deprecated `url_parse` (deprecation-as-error in
+        #     test suites) → Flask 2.1/2.2 trip on this → must pin werkzeug<2.3
+        # We map Flask version → max acceptable Werkzeug:
         if pkg_name == "flask":
             flask_version_check = subprocess.run(
                 [str(venv_dir / "bin" / "python"), "-c",
@@ -398,21 +402,38 @@ class RepoManager:
                 capture_output=True, text=True, timeout=10,
             )
             fv = flask_version_check.stdout.strip()
-            if fv and (fv.startswith("2.0") or fv.startswith("2.1") or fv.startswith("2.2")):
-                wz_check = subprocess.run(
-                    [str(venv_dir / "bin" / "python"), "-c",
-                     "import werkzeug; print(werkzeug.__version__)"],
-                    capture_output=True, text=True, timeout=10,
-                )
-                wzv = wz_check.stdout.strip()
-                # Werkzeug 2.3+ has deprecated url_parse — downgrade for Flask 2.0-2.2
-                if wzv and (wzv.startswith("2.3") or wzv.startswith("2.4") or
-                            wzv.startswith("3.")):
-                    logger.info(
-                        "Flask %s needs Werkzeug <2.3 (detected %s) — pinning",
-                        fv, wzv,
+            if fv:
+                # Determine target werkzeug constraint
+                wz_constraint = None
+                if fv.startswith("2.0"):
+                    # Tests use as_tuple — needs werkzeug 2.0.x
+                    wz_constraint = "werkzeug>=2.0.0,<2.1"
+                elif fv.startswith("2.1") or fv.startswith("2.2"):
+                    # Tests use url_parse — needs werkzeug<2.3
+                    wz_constraint = "werkzeug>=2.0.3,<2.3"
+
+                if wz_constraint:
+                    wz_check = subprocess.run(
+                        [str(venv_dir / "bin" / "python"), "-c",
+                         "import werkzeug; print(werkzeug.__version__)"],
+                        capture_output=True, text=True, timeout=10,
                     )
-                    _pip_install("werkzeug>=2.0.3,<2.3")
+                    wzv = wz_check.stdout.strip()
+                    # Pin only if current werkzeug exceeds what this Flask supports
+                    needs_pin = False
+                    if wzv:
+                        if fv.startswith("2.0") and not wzv.startswith("2.0"):
+                            needs_pin = True
+                        elif (fv.startswith("2.1") or fv.startswith("2.2")) and \
+                             (wzv.startswith("2.3") or wzv.startswith("2.4") or
+                              wzv.startswith("3.")):
+                            needs_pin = True
+                    if needs_pin:
+                        logger.info(
+                            "Flask %s needs %s (detected werkzeug %s) — pinning",
+                            fv, wz_constraint, wzv,
+                        )
+                        _pip_install(wz_constraint)
 
         # Step 3: Run any custom setup_commands from the bug spec
         for cmd in bug.get("setup_commands", []):
@@ -445,15 +466,19 @@ class RepoManager:
             )
             self._write_django_pytest_ini(repo_dir)
 
-        # Werkzeug test deps: the werkzeug test suite uses ephemeral_port_reserve
-        # to allocate free ports for server tests. It's not declared in setup.py
-        # so editable install doesn't fetch it.
+        # Werkzeug test deps: the werkzeug test suite's conftest.py imports
+        # ephemeral_port_reserve (free port allocation) and xprocess (for
+        # subprocess fixtures). Neither is declared in setup.py — editable
+        # install doesn't fetch them. Without them, pytest exits with code 4
+        # at conftest import time before any test can run.
         if (repo_dir / "src" / "werkzeug").is_dir() or \
            (repo_dir / "werkzeug" / "__init__.py").exists():
-            logger.info("Detected Werkzeug repo — installing ephemeral_port_reserve")
+            logger.info(
+                "Detected Werkzeug repo — installing ephemeral_port_reserve + pytest-xprocess",
+            )
             subprocess.run(
-                [pip, "install", "--quiet", "ephemeral_port_reserve"],
-                capture_output=True, timeout=60,
+                [pip, "install", "--quiet", "ephemeral_port_reserve", "pytest-xprocess"],
+                capture_output=True, timeout=90,
             )
 
         # Rich test deps: tests/test_pretty.py imports `attr` (from the attrs
