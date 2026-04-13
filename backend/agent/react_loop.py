@@ -107,7 +107,10 @@ def react_loop(
     Returns:
         Updated state dict.
     """
-    all_tools = explore_tools + REACT_TOOLS
+    # Add the explore subagent tool — main agent can delegate "find me X"
+    # questions to a Haiku-backed read-only subagent, saving turns + cost.
+    from agent.explore_subagent import EXPLORE_SUBAGENT_TOOLS
+    all_tools = explore_tools + EXPLORE_SUBAGENT_TOOLS + REACT_TOOLS
     tool_map = {t.name: t for t in all_tools}
 
     # Capture thread-local context from the CURRENT (main) thread so we can
