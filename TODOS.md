@@ -3,10 +3,6 @@
 ## Active
 
 
-### P1 — Concept-to-code mapping for business-language tickets
-**What:** When a ticket uses business terms ("requisition", "approval flow") that don't match function names, the agent can't find the right code. Need to map business concepts → code entities using the knowledge graph.
-**Why:** Bug 3 (aria-ats: same requisition queried 3x) always escalates because the agent greps for business terms that don't exist as function names. The knowledge graph has BusinessRules + ENFORCED_BY edges that could bridge this gap.
-**Approach:** During intake, query the graph for BusinessRule nodes matching ticket keywords → get linked code functions via ENFORCED_BY → inject as "Relevant business rules" into task message.
 
 ### P2 — Continue extracting utilities from pipeline.py
 **What:** pipeline.py is still 3300 lines. Utility functions (_redact_secrets, _fuzzy_match_replace, should_iterate, etc.) are still imported by tests. Extract into focused modules: llm_utils.py, secrets.py, file_utils.py, analysis_utils.py, patch_utils_extended.py.
@@ -36,6 +32,12 @@
 **Depends on:** Production validation shipped (current sprint).
 
 ## Completed
+
+### P1 — Concept-to-code mapping for business-language tickets
+**Completed:** v3.2 (2026-04-13)
+`graph_utils.query_concept_to_code()`: extracts keywords from ticket title + description, queries `BusinessRule` nodes in Neo4j (OPTIONAL MATCH `ENFORCED_BY` → Function), falls back to flat `business_rules.json` scan when Neo4j is unavailable.
+Results merged into `intent.likely_affected_functions` + `intent.likely_affected_modules` in `intake_node()`, and a `## RELEVANT BUSINESS RULES` section is injected into the kickstart context.
+19 unit tests in `tests/test_concept_to_code.py` cover keyword extraction, JSON fallback, Neo4j mock path, exception fallback to JSON, section formatting, and intent-merge logic.
 
 ### P1 — Django SWE-bench test infrastructure (3 infra bugs)
 **Completed:** v3.1 (2026-04-12)

@@ -154,6 +154,190 @@ def build_reviewer_context(repo_name: str, modified_files: list[str]) -> str:
     return "\n".join(sections) if sections else "No business rules or blast radius data available."
 
 
+def query_concept_to_code(
+    ticket_title: str,
+    ticket_description: str,
+    repo_name: str,
+    *,
+    max_keywords: int = 8,
+    max_rules: int = 6,
+) -> dict:
+    """Map business-language ticket terms to code entities via the knowledge graph.
+
+    Extracts keywords from the ticket, queries BusinessRule nodes whose ``content``
+    matches any keyword, then follows ENFORCED_BY edges to retrieve linked functions
+    and their source files.  Also falls back to a flat ``business_rules.json`` scan
+    when Neo4j is unavailable.
+
+    Returns a dict with:
+        ``matched_rules``   — list of dicts: {rule_text, rule_type, source_file,
+                               function_names, function_files}
+        ``hint_functions``  — deduplicated function names to seed localization
+        ``hint_files``      — deduplicated source files to seed localization
+        ``concept_section`` — pre-formatted markdown block for the system prompt
+
+    Returns an empty dict (all empty lists, empty string) if nothing matches.
+    This function never raises — all errors are swallowed and logged.
+    """
+    result: dict = {
+        "matched_rules": [],
+        "hint_functions": [],
+        "hint_files": [],
+        "concept_section": "",
+    }
+
+    # ------------------------------------------------------------------ #
+    # Step 1: Extract meaningful keywords from the ticket                  #
+    # ------------------------------------------------------------------ #
+    import re
+    _STOP = frozenset({
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "should",
+        "could", "may", "might", "must", "shall", "can", "to", "of", "in",
+        "for", "on", "with", "at", "by", "from", "this", "that", "it", "its",
+        "we", "us", "our", "you", "your", "they", "their", "not", "no", "and",
+        "or", "but", "if", "then", "when", "where", "how", "what", "which",
+        "bug", "error", "issue", "problem", "fix", "feature", "request",
+        "ticket", "task", "story", "epic", "sprint", "todo", "note",
+    })
+
+    combined = f"{ticket_title} {ticket_description}"
+    # Extract words (and hyphenated compound terms) of 4+ chars
+    tokens = re.findall(r"[A-Za-z][a-zA-Z0-9_\-]{3,}", combined)
+    # Preserve casing for camelCase/PascalCase domain terms; lowercase for matching
+    seen: set[str] = set()
+    keywords: list[str] = []
+    for tok in tokens:
+        lower = tok.lower()
+        if lower not in _STOP and lower not in seen:
+            seen.add(lower)
+            keywords.append(tok)
+        if len(keywords) >= max_keywords:
+            break
+
+    if not keywords:
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Step 2: Query Neo4j BusinessRule nodes matching any keyword          #
+    # ------------------------------------------------------------------ #
+    matched: list[dict] = []
+    try:
+        from graph.neo4j_client import neo4j_client
+        if neo4j_client.is_connected():
+            # Build a WHERE clause that matches any keyword (case-insensitive)
+            # against the rule content.  Neo4j CONTAINS is case-sensitive so
+            # we toLower() both sides.
+            conditions = " OR ".join(
+                f"toLower(br.content) CONTAINS toLower($kw{i})"
+                for i in range(len(keywords))
+            )
+            params: dict = {f"kw{i}": kw for i, kw in enumerate(keywords)}
+            params["repo"] = repo_name
+
+            cypher = (
+                f"MATCH (br:BusinessRule) "
+                f"WHERE ({conditions}) "
+                f"OPTIONAL MATCH (br)-[:ENFORCED_BY]->(fn:Function) "
+                f"OPTIONAL MATCH (fn)<-[:CONTAINS]-(file:File) "
+                f"RETURN br.content AS rule_text, "
+                f"       br.rule_type AS rule_type, "
+                f"       br.source_file AS source_file, "
+                f"       collect(DISTINCT fn.name) AS function_names, "
+                f"       collect(DISTINCT file.path) AS function_files "
+                f"LIMIT {max_rules}"
+            )
+            rows = neo4j_client.run(cypher, params)
+            for row in rows:
+                matched.append({
+                    "rule_text": row.get("rule_text", ""),
+                    "rule_type": row.get("rule_type", ""),
+                    "source_file": row.get("source_file", ""),
+                    "function_names": [n for n in (row.get("function_names") or []) if n],
+                    "function_files": [f for f in (row.get("function_files") or []) if f],
+                })
+            logger.info(
+                "Concept-to-code: %d keywords → %d BusinessRule matches (Neo4j)",
+                len(keywords), len(matched),
+            )
+    except Exception as exc:
+        logger.debug("Neo4j concept-to-code query failed (falling back to JSON): %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Step 3: Fallback — scan flat business_rules.json                    #
+    # ------------------------------------------------------------------ #
+    if not matched:
+        rules_path = DATA_DIR / repo_name / "business_rules.json"
+        if rules_path.exists():
+            try:
+                all_rules = json.loads(rules_path.read_text())
+                kw_lower = [k.lower() for k in keywords]
+                for rule in all_rules:
+                    desc = rule.get("description", "").lower()
+                    if any(kw in desc for kw in kw_lower):
+                        func_ids = rule.get("function_id", "")
+                        func_names = [fid.split(".")[-1] for fid in func_ids.split(",") if fid.strip()]
+                        matched.append({
+                            "rule_text": rule.get("description", ""),
+                            "rule_type": rule.get("source", ""),
+                            "source_file": rule.get("file", ""),
+                            "function_names": func_names,
+                            "function_files": [rule.get("file", "")] if rule.get("file") else [],
+                        })
+                        if len(matched) >= max_rules:
+                            break
+                logger.info(
+                    "Concept-to-code: %d keywords → %d matches (JSON fallback)",
+                    len(keywords), len(matched),
+                )
+            except Exception as exc:
+                logger.debug("JSON concept-to-code fallback failed: %s", exc)
+
+    if not matched:
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Step 4: Aggregate hint functions/files and build the prompt section  #
+    # ------------------------------------------------------------------ #
+    all_functions: list[str] = []
+    all_files: list[str] = []
+    for m in matched:
+        all_functions.extend(m["function_names"])
+        all_files.extend(m["function_files"] or ([m["source_file"]] if m["source_file"] else []))
+
+    # Deduplicate preserving order
+    def _dedup(lst: list[str]) -> list[str]:
+        seen2: set[str] = set()
+        return [x for x in lst if x and not (x in seen2 or seen2.add(x))]  # type: ignore[func-returns-value]
+
+    hint_functions = _dedup(all_functions)[:6]
+    hint_files = _dedup(all_files)[:4]
+
+    # Build a compact prompt section
+    lines = ["## RELEVANT BUSINESS RULES (matched from ticket keywords)"]
+    lines.append(
+        "These rules were found in the knowledge graph by matching ticket terms "
+        "to BusinessRule nodes. The linked functions are probable entry points.\n"
+    )
+    for m in matched:
+        fn_str = (", ".join(m["function_names"][:3]) or "—") if m["function_names"] else "—"
+        lines.append(f"- [{m['rule_type'].upper()}] {m['rule_text'][:200]}")
+        lines.append(f"  Enforced by: {fn_str}  |  File: {m['source_file'] or '—'}")
+    if hint_functions:
+        lines.append(f"\nStart exploration at: {', '.join(hint_functions)}")
+
+    result["matched_rules"] = matched
+    result["hint_functions"] = hint_functions
+    result["hint_files"] = hint_files
+    result["concept_section"] = "\n".join(lines)
+
+    logger.info(
+        "Concept-to-code: injecting %d hint functions, %d hint files",
+        len(hint_functions), len(hint_files),
+    )
+    return result
+
+
 def load_business_rules(repo_name: str, fault_files: list[str]) -> str:
     """Load stored business rules + failure history relevant to the fault files."""
     from graph.neo4j_client import neo4j_client

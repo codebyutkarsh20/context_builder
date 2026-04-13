@@ -376,6 +376,32 @@ def intake_node(state: ReactAgentState) -> ReactAgentState:
     # 1. Translate ticket into structured intent
     state["intent"] = _translate_intent(work_order)
 
+    # 1b. Concept-to-code mapping: query BusinessRule nodes for ticket keywords
+    #     and inject any matched functions/files as localization hints.
+    #     This bridges business-language tickets (e.g. "requisition approval flow")
+    #     to code entities when grep-based search would find nothing.
+    from agent.graph_utils import query_concept_to_code
+    repo_name_for_c2c = work_order.get("repo_name", "")
+    title = work_order.get("title", "")
+    description = work_order.get("description", "")
+    c2c = query_concept_to_code(title, description, repo_name_for_c2c)
+    if c2c.get("matched_rules"):
+        intent = state.get("intent", {})
+        # Merge graph-derived hints into the intent, deduplicating against LLM hints
+        existing_funcs = intent.get("likely_affected_functions", []) or []
+        existing_mods = intent.get("likely_affected_modules", []) or []
+        merged_funcs = list(dict.fromkeys(existing_funcs + c2c["hint_functions"]))
+        merged_mods = list(dict.fromkeys(existing_mods + c2c["hint_files"]))
+        intent["likely_affected_functions"] = merged_funcs[:8]
+        intent["likely_affected_modules"] = merged_mods[:6]
+        # Stash concept section so react_agent_node can inject it into kickstart
+        intent["_concept_section"] = c2c["concept_section"]
+        state["intent"] = intent
+        logger.info(
+            "Concept-to-code: merged %d rules → intent.likely_affected_functions=%s",
+            len(c2c["matched_rules"]), merged_funcs[:4],
+        )
+
     # 2. Enrich with stack trace hints
     state = _enrich_with_stack_hints(state)
 
@@ -506,6 +532,12 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
                 kickstart += f"\n\n## REPO FILES (no code map available — start with get_file_structure)\n{listing}"
         except Exception:
             pass
+
+    # Inject concept-to-code section into kickstart if present (set during intake)
+    concept_section = intent.get("_concept_section", "")
+    if concept_section:
+        kickstart += f"\n\n{concept_section}"
+        logger.info("Injected concept-to-code section (%d chars) into kickstart", len(concept_section))
 
     # Load conventions and business rules
     from agent.react_prompt import (
