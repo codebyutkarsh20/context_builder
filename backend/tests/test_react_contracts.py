@@ -395,6 +395,48 @@ class TestPromptGuardrailAlignment:
         assert "30" in prompt
         assert MAX_TOOL_CALLS == 40  # Hard limit is higher than soft budget
 
+    def test_prompt_includes_fail_to_pass_tests_when_available(self):
+        """When the bug's work_order has fail_to_pass tests, they MUST appear
+        in the system prompt — otherwise the agent runs unrelated tests last
+        and the eval scorer marks even-correct-fixes as FAIL.
+        """
+        from agent.react_prompt import build_system_prompt
+        static_block, dynamic_block = build_system_prompt(
+            work_order={
+                "repo_name": "test",
+                "title": "bug",
+                "description": "desc",
+                "fail_to_pass": [
+                    "tests/test_foo.py::TestBar::test_specific_failure",
+                ],
+                "pass_to_pass": [
+                    "tests/test_foo.py::TestBar::test_already_passing",
+                ],
+            },
+            intent={"expected_behavior": "", "actual_behavior": ""},
+            kickstart_context="",
+        )
+        prompt = static_block + "\n\n" + dynamic_block
+        # The specific FAIL_TO_PASS test ID must be surfaced
+        assert "test_specific_failure" in prompt
+        # The "run these LAST before submit_fix" guidance must be present
+        assert "LAST" in prompt or "last" in prompt
+        assert "run_tests" in prompt
+
+    def test_prompt_omits_fail_to_pass_section_when_empty(self):
+        """When fail_to_pass is empty (e.g. sentinel bugs without SWE-bench
+        test lists), the FAIL_TO_PASS section must NOT appear — the guidance
+        would be misleading and waste prompt budget.
+        """
+        from agent.react_prompt import build_system_prompt
+        static_block, dynamic_block = build_system_prompt(
+            work_order={"repo_name": "test", "title": "bug", "description": "desc"},
+            intent={"expected_behavior": "", "actual_behavior": ""},
+            kickstart_context="",
+        )
+        prompt = static_block + "\n\n" + dynamic_block
+        assert "TESTS THAT MUST PASS" not in prompt
+
     def test_prompt_test_result_table_matches_guardrails(self):
         """The prompt's test result table must match guardrail behavior.
 

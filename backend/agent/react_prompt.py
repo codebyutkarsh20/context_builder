@@ -77,6 +77,33 @@ def build_system_prompt(
     notes = intent.get("notes", "")
     notes_str = f"\nNOTES:\n{notes}" if notes else ""
 
+    # FAIL_TO_PASS tests: the eval scorer checks these specific tests. The
+    # agent should run EXACTLY these tests last, right before submit_fix, so
+    # the "last test result" (which the scorer reads) reflects the bug's fix.
+    # Missing this is a known source of false-FAIL scoring — agent runs an
+    # unrelated test last and the run is marked FAIL even when the fix works.
+    fail_to_pass = work_order.get("fail_to_pass", []) or []
+    pass_to_pass = work_order.get("pass_to_pass", []) or []
+    ftp_str = ""
+    if fail_to_pass:
+        ftp_lines = "\n".join(f"  - {t}" for t in fail_to_pass[:8])
+        ftp_str = (
+            "\n\n## TESTS THAT MUST PASS (success bar for this ticket)\n\n"
+            "These specific tests currently FAIL. Your fix is correct if and only if they PASS:\n"
+            f"{ftp_lines}\n\n"
+            "**CRITICAL workflow rule**: Right before calling submit_fix, run EXACTLY these "
+            "tests (via run_tests with the specific test_path). The eval scorer reads the "
+            "LAST run_tests result — if you run an unrelated test file last, even a correct "
+            "fix will be scored as FAIL. Use the pytest node syntax: "
+            "`path/to/test_file.py::TestClass::test_method`.\n"
+        )
+        if pass_to_pass:
+            ptp_sample = pass_to_pass[:3]
+            ftp_str += (
+                f"\nThese tests currently PASS and MUST still pass after your fix "
+                f"(sample of {len(pass_to_pass)}): {ptp_sample}\n"
+            )
+
     brt_section = build_brt_section(brts or [])
     has_brts = bool(brts)
 
@@ -325,6 +352,7 @@ Severity: {intent.get('severity', 'medium')}
 {f"Pre-localized files (high confidence — start here): {intent.get('confirmed_files', [])}" if intent.get('confirmed_files') else ""}
 {criteria_str}
 {notes_str}
+{ftp_str}
 {brt_section}
 {kickstart_context}
 {conventions_section}
