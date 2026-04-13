@@ -46,6 +46,11 @@ def set_react_context(
     _tls.fix_type = fix_type
     if data_dir:
         _tls.data_dir = data_dir
+    # Reset plan state — each run starts with a blank plan slate
+    if hasattr(_tls, "plan_history"):
+        delattr(_tls, "plan_history")
+    if hasattr(_tls, "current_plan"):
+        delattr(_tls, "current_plan")
 
 
 def set_sandbox_path(sandbox_path: Path, branch_name: str, base_branch: str) -> None:
@@ -76,6 +81,116 @@ _BINARY_EXTENSIONS = frozenset({
     '.ttf', '.zip', '.tar', '.gz', '.db', '.sqlite', '.sqlite3', '.DS_Store',
     '.pdf', '.mp3', '.mp4',
 })
+
+
+# ---------------------------------------------------------------------------
+# Plan mode — agent must declare a structured plan before any edits
+# ---------------------------------------------------------------------------
+
+@tool
+def produce_plan(
+    root_cause: str,
+    target_files: list[str],
+    approach: str,
+    success_criteria: str,
+    risk: str = "LOW",
+    rollback: str = "",
+) -> str:
+    """Declare your implementation plan BEFORE creating a sandbox or making edits.
+
+    This is a self-commitment device borrowed from Claude Code's plan-mode
+    pattern: producing a structured plan first reduces wasted edits on
+    misguided fixes. The plan is logged in the trace and visible to the
+    independent verifier later.
+
+    You may call this tool again to revise the plan as you learn more during
+    exploration — only the latest plan is enforced. Each call is logged.
+
+    Args:
+        root_cause: One sentence — what's actually broken, in causal terms.
+            Example: "The retry decorator catches BaseException, swallowing
+            KeyboardInterrupt so Ctrl-C doesn't kill stuck workers."
+        target_files: List of relative file paths you intend to change. Be
+            specific — wildcards or "various files" are not acceptable.
+        approach: 2-4 sentences describing the change you'll make. Include
+            the function/method names that will be modified.
+        success_criteria: 1-3 testable conditions that prove the fix works.
+            These should map to the bug description, not to your implementation.
+            Example: "Ctrl-C terminates the worker within 1s instead of hanging."
+        risk: One of LOW, MEDIUM, HIGH. HIGH if removing validation, changing
+            public APIs, or touching > 5 files. MEDIUM for shared utilities.
+            LOW for localized fixes.
+        rollback: Optional — how to undo the change if it breaks production.
+            Required for risk=HIGH.
+
+    Returns:
+        Confirmation that the plan was recorded, plus next-step guidance.
+    """
+    if not root_cause or not target_files or not approach or not success_criteria:
+        return (
+            "ERROR: Plan is incomplete. All of root_cause, target_files, "
+            "approach, and success_criteria are required."
+        )
+    if risk not in ("LOW", "MEDIUM", "HIGH"):
+        return f"ERROR: risk must be one of LOW, MEDIUM, HIGH (got '{risk}')."
+    if risk == "HIGH" and not rollback:
+        return (
+            "ERROR: risk=HIGH requires a rollback strategy. "
+            "Describe how the change can be reverted if it breaks production."
+        )
+    if not isinstance(target_files, list) or any(
+        not isinstance(f, str) or not f.strip() for f in target_files
+    ):
+        return "ERROR: target_files must be a list of non-empty file path strings."
+
+    # Store the plan on thread-local for the guardrail + later inspection
+    plan: dict = {
+        "root_cause": root_cause,
+        "target_files": [f.strip() for f in target_files],
+        "approach": approach,
+        "success_criteria": success_criteria,
+        "risk": risk,
+        "rollback": rollback,
+    }
+    # Track plan history (revisions) on TLS
+    if not hasattr(_tls, "plan_history"):
+        _tls.plan_history = []
+    _tls.plan_history.append(plan)
+    _tls.current_plan = plan
+
+    revision_note = ""
+    if len(_tls.plan_history) > 1:
+        revision_note = f" (revision #{len(_tls.plan_history)})"
+
+    logger.info(
+        "Plan recorded%s: risk=%s, files=%s, root_cause=%s",
+        revision_note, risk, plan["target_files"][:3], root_cause[:80],
+    )
+
+    return (
+        f"OK: Plan recorded{revision_note}. risk={risk}, "
+        f"target_files={len(plan['target_files'])}.\n"
+        f"NEXT: Call create_sandbox(), then string_replace() on the target files.\n"
+        f"You may call produce_plan again if exploration reveals the plan needs revision."
+    )
+
+
+def get_current_plan() -> dict | None:
+    """Get the latest plan submitted via produce_plan (or None)."""
+    return getattr(_tls, "current_plan", None)
+
+
+def get_plan_history() -> list[dict]:
+    """Get the full history of plan revisions (or empty list)."""
+    return getattr(_tls, "plan_history", [])
+
+
+def reset_plan_state() -> None:
+    """Reset plan state (called between runs)."""
+    if hasattr(_tls, "plan_history"):
+        delattr(_tls, "plan_history")
+    if hasattr(_tls, "current_plan"):
+        delattr(_tls, "current_plan")
 
 
 def _resolve_sandbox_path(file_path: str) -> Path | None:
@@ -1094,10 +1209,11 @@ def get_blast_radius(file_path: str) -> str:
 # Tool collections
 # ---------------------------------------------------------------------------
 
+PLAN_TOOLS = [produce_plan]
 EDIT_TOOLS = [string_replace, check_syntax, create_file]
 SANDBOX_TOOLS = [create_sandbox, run_tests, run_brt]
 MULTI_FILE_TOOLS = [get_callers]
 COMPLETION_TOOLS = [record_localization, request_review, submit_fix, escalate]
 
 # All react-specific tools (exploration tools are added from explore_tools.py)
-REACT_TOOLS = EDIT_TOOLS + SANDBOX_TOOLS + MULTI_FILE_TOOLS + COMPLETION_TOOLS
+REACT_TOOLS = PLAN_TOOLS + EDIT_TOOLS + SANDBOX_TOOLS + MULTI_FILE_TOOLS + COMPLETION_TOOLS

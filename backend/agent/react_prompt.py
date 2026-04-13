@@ -107,16 +107,33 @@ You have a budget of ~30 tool calls. Successful changes average 15-25 calls. Har
 6. {'Form a clear hypothesis about the root cause.' if is_bug else 'Understand the codebase structure.'}
 7. Call record_localization when ready.
 
+### Phase 1.5: PLAN — declare your approach before any edits (1 call)
+
+After exploration is done and BEFORE creating a sandbox, call **produce_plan()** with:
+  - **root_cause**: one sentence — what's actually broken in causal terms
+  - **target_files**: the specific files you'll modify (no wildcards)
+  - **approach**: 2-4 sentences describing the change (include function names)
+  - **success_criteria**: 1-3 testable conditions that prove the fix works
+  - **risk**: LOW / MEDIUM / HIGH (HIGH if removing validation or touching > 5 files)
+  - **rollback**: required if risk=HIGH
+
+This is a self-commitment device — articulating the plan first prevents wasted
+edits on misguided fixes. The plan is recorded and visible to the verifier later.
+You may revise the plan by calling produce_plan again if exploration reveals new
+information. **create_sandbox will fail until a plan exists.**
+
 ### Phase 2: EDIT — STRICT SEQUENCE (budget: 3-5 calls)
 
   ╔══════════════════════════════════════════════════════╗
   ║  MANDATORY ORDER — do not skip or reorder steps:    ║
+  ║  Step 0: produce_plan()     ← REQUIRED before edit  ║
   ║  Step 1: create_sandbox()   ← ALWAYS FIRST          ║
   ║  Step 2: string_replace()   ← apply your fix        ║
   ║  Step 3: check_syntax()     ← verify no errors      ║
   ║  Step 4: read_function()    ← confirm edit is right ║
   ╚══════════════════════════════════════════════════════╝
 
+  You CANNOT call create_sandbox without a plan.
   You CANNOT call string_replace, create_file, or run_tests without a sandbox.
   If you get "ERROR: No sandbox exists", call create_sandbox() immediately — it is
   a 1-call setup step, NOT a reason to escalate.

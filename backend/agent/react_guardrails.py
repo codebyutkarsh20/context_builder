@@ -60,6 +60,10 @@ class GuardrailState:
         self.tool_call_count: int = 0
         self.cost_usd: float = 0.0
         self.start_time: float = time.monotonic()
+        # Plan-mode tracking
+        self.plan_produced: bool = False
+        self.plan_produced_at_call: int = 0
+        self.plan_revision_count: int = 0
         # Anti-pattern tracking
         self.tool_history: list[str] = []  # Last N tool names
         self.grep_count: int = 0
@@ -116,6 +120,22 @@ def check_tool_call(
     limit_error = check_limits(gs)
     if limit_error and tool_name not in TERMINAL_TOOLS:
         return limit_error
+
+    # Plan-mode gate — must declare a plan before creating a sandbox.
+    # This forces structured thinking ("what am I about to do?") before
+    # any code change. Borrowed from Claude Code's plan-mode pattern,
+    # but autonomous: the agent self-validates by producing a plan
+    # rather than waiting for human approval.
+    if tool_name == "create_sandbox" and not gs.plan_produced:
+        return (
+            "ERROR: No plan declared yet — create_sandbox requires a plan first.\n"
+            "NEXT STEP: Call produce_plan(root_cause, target_files, approach, "
+            "success_criteria, risk) to declare what you intend to do, "
+            "then retry create_sandbox.\n"
+            "The plan is a self-commitment device — it forces you to articulate "
+            "the root cause and your approach before editing. You may revise "
+            "the plan later by calling produce_plan again."
+        )
 
     # Sandbox gate
     if tool_name in SANDBOX_REQUIRED_TOOLS and not gs.sandbox_created:
@@ -232,6 +252,14 @@ def update_from_tool_result(
             gs._last_edit_call = gs.tool_call_count  # Track for post-edit explore cap
     elif tool_name == "request_review":
         gs.review_count += 1
+
+    if tool_name == "produce_plan" and result.startswith("OK:"):
+        # First plan or revision — both update plan state
+        if not gs.plan_produced:
+            gs.plan_produced = True
+            gs.plan_produced_at_call = gs.tool_call_count
+        else:
+            gs.plan_revision_count += 1
 
     if tool_name == "create_sandbox" and "OK:" in result:
         gs.sandbox_created = True

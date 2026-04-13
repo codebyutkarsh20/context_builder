@@ -1121,6 +1121,28 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
         explanation: str      # Why APPROVE/REJECT in 2-3 sentences
         regression_risk: str  # "LOW", "MEDIUM", "HIGH"
 
+    # If the agent produced a plan, include it in the verifier prompt so the
+    # verifier can cross-check whether the diff matches the declared plan.
+    plan_section = ""
+    try:
+        from agent.react_tools import get_current_plan
+        plan = get_current_plan()
+        if plan:
+            plan_section = (
+                "\n=== AGENT'S DECLARED PLAN ===\n"
+                f"Root cause: {plan.get('root_cause', '')}\n"
+                f"Target files: {', '.join(plan.get('target_files', []))}\n"
+                f"Approach: {plan.get('approach', '')}\n"
+                f"Success criteria: {plan.get('success_criteria', '')}\n"
+                f"Risk: {plan.get('risk', 'LOW')}\n\n"
+                "**Cross-check**: does the diff match this plan? If the diff "
+                "touches files NOT in target_files, or implements a different "
+                "approach than declared, that's a REJECT signal — the agent "
+                "deviated from its plan without justification.\n"
+            )
+    except Exception as e:
+        logger.debug("Plan fetch for verifier failed (non-fatal): %s", e)
+
     # Hardened verifier prompt (ported from Claude Code's verificationAgent).
     # Anti-rationalization framing + required adversarial reasoning before APPROVE.
     prompt = (
@@ -1139,7 +1161,8 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
         f"DESCRIPTION: {work_order.get('description', '')[:500]}\n\n"
         f"PATCH (what the agent changed):\n```diff\n{diff_text}\n```\n\n"
         f"TEST RESULT: {test_result[:500]}\n\n"
-        f"AGENT EXPLANATION: {explanation[:300]}\n\n"
+        f"AGENT EXPLANATION: {explanation[:300]}\n"
+        f"{plan_section}\n"
         "=== EVALUATION ===\n"
         "Walk through these checks IN ORDER. For each, write your reasoning before "
         "moving on — do not skip.\n\n"
