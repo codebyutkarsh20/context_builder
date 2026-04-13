@@ -328,23 +328,91 @@ class RepoManager:
                 break
             logger.debug("Install spec '%s' failed: %s", spec, result.stderr[:80])
 
-        # Step 2: Werkzeug compat patch.
-        # Flask 2.0-2.2 (and similar 2021-era packages) require werkzeug 2.0.x:
-        # - werkzeug 2.1+ removed as_tuple from EnvironBuilder (breaks flask testing)
-        # - werkzeug 3.0+ removed url_quote (breaks flask import)
-        # pip with no upper bound installs the latest (3.x), so we downgrade after install.
+        # Step 2: Dependency compatibility patches.
+        # SWE-bench repos (2017-2022 era) often have unpinned deps that drift
+        # on modern Python. We detect specific import/usage errors and pin the
+        # right version. The pattern: try `import {pkg}`, parse the error, apply
+        # the matching fix, then re-check.
         pkg_name = repo_dir.name.split("_")[0]  # e.g., "flask" from "flask_d8c37f43"
-        import_check = subprocess.run(
-            [str(venv_dir / "bin" / "python"), "-c", f"import {pkg_name}"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if import_check.returncode != 0 and "werkzeug" in import_check.stderr:
-            # Old package uses werkzeug API removed in 3.0+ — pin to 2.x
-            logger.info("werkzeug incompatibility in %s — pinning to <3.0", pkg_name)
-            subprocess.run(
-                [pip, "install", "--quiet", "werkzeug>=2.2.2,<3.0"],
-                capture_output=True, timeout=60,
+
+        def _import_check() -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [str(venv_dir / "bin" / "python"), "-c", f"import {pkg_name}"],
+                capture_output=True, text=True, timeout=15,
             )
+
+        def _pip_install(spec: str) -> None:
+            subprocess.run(
+                [pip, "install", "--quiet", spec],
+                capture_output=True, timeout=90,
+            )
+
+        import_check = _import_check()
+        err = import_check.stderr if import_check.returncode != 0 else ""
+
+        # Fix 2a: Jinja2 3.1+ removed `Markup` / `escape` — breaks old Flask.
+        # When this fires, the package is "old-Flask era" (pre-2022), which means
+        # itsdangerous 2.1+ and markupsafe 2.1+ also break it. Pin all three at
+        # once to avoid playing whack-a-mole on each subsequent re-import.
+        # Signature: ImportError: cannot import name 'Markup' from 'jinja2'
+        if "from 'jinja2'" in err and ("Markup" in err or "escape" in err):
+            logger.info(
+                "Jinja2/Markup incompatibility in %s — pinning jinja2<3.1, "
+                "itsdangerous<2.1, markupsafe<2.1 (old-Flask-era ecosystem)",
+                pkg_name,
+            )
+            _pip_install("jinja2<3.1")
+            _pip_install("itsdangerous<2.1")
+            _pip_install("markupsafe<2.1")
+            import_check = _import_check()
+            err = import_check.stderr if import_check.returncode != 0 else ""
+
+        # Fix 2a-bis: itsdangerous 2.1+ removed the `json` submodule — Flask 1.x
+        # imports `from itsdangerous import json`. If we land here, jinja2 was
+        # already importable but itsdangerous broke the chain.
+        if "itsdangerous" in err and "json" in err:
+            logger.info("itsdangerous incompatibility in %s — pinning <2.1", pkg_name)
+            _pip_install("itsdangerous<2.1")
+            import_check = _import_check()
+            err = import_check.stderr if import_check.returncode != 0 else ""
+
+        # Fix 2b: Werkzeug 2.1+ removed `as_tuple` from EnvironBuilder;
+        # Werkzeug 2.3+ deprecates `url_parse`; Werkzeug 3.0+ removes
+        # `url_quote`. Old Flask (0.x, 1.x, 2.0-2.2) pre-dates all of these.
+        # Historical default was <3.0 but that still breaks Flask 2.0/2.1
+        # which trips over url_parse deprecation-as-error during tests.
+        if "werkzeug" in err.lower():
+            logger.info("Werkzeug incompatibility in %s — pinning werkzeug<2.3", pkg_name)
+            _pip_install("werkzeug>=2.0.3,<2.3")
+            import_check = _import_check()
+            err = import_check.stderr if import_check.returncode != 0 else ""
+
+        # Fix 2c: Some Flask 2.0 series also need werkzeug < 2.3 even when
+        # the import itself passes — the test suite uses url_parse with
+        # deprecation-as-error. Detect this pre-emptively for Flask 2.0-2.2
+        # so tests don't fail with a confusing DeprecationWarning.
+        if pkg_name == "flask":
+            flask_version_check = subprocess.run(
+                [str(venv_dir / "bin" / "python"), "-c",
+                 "import flask; print(flask.__version__)"],
+                capture_output=True, text=True, timeout=10,
+            )
+            fv = flask_version_check.stdout.strip()
+            if fv and (fv.startswith("2.0") or fv.startswith("2.1") or fv.startswith("2.2")):
+                wz_check = subprocess.run(
+                    [str(venv_dir / "bin" / "python"), "-c",
+                     "import werkzeug; print(werkzeug.__version__)"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                wzv = wz_check.stdout.strip()
+                # Werkzeug 2.3+ has deprecated url_parse — downgrade for Flask 2.0-2.2
+                if wzv and (wzv.startswith("2.3") or wzv.startswith("2.4") or
+                            wzv.startswith("3.")):
+                    logger.info(
+                        "Flask %s needs Werkzeug <2.3 (detected %s) — pinning",
+                        fv, wzv,
+                    )
+                    _pip_install("werkzeug>=2.0.3,<2.3")
 
         # Step 3: Run any custom setup_commands from the bug spec
         for cmd in bug.get("setup_commands", []):
@@ -376,6 +444,28 @@ class RepoManager:
                 capture_output=True, timeout=60,
             )
             self._write_django_pytest_ini(repo_dir)
+
+        # Werkzeug test deps: the werkzeug test suite uses ephemeral_port_reserve
+        # to allocate free ports for server tests. It's not declared in setup.py
+        # so editable install doesn't fetch it.
+        if (repo_dir / "src" / "werkzeug").is_dir() or \
+           (repo_dir / "werkzeug" / "__init__.py").exists():
+            logger.info("Detected Werkzeug repo — installing ephemeral_port_reserve")
+            subprocess.run(
+                [pip, "install", "--quiet", "ephemeral_port_reserve"],
+                capture_output=True, timeout=60,
+            )
+
+        # Rich test deps: tests/test_pretty.py imports `attr` (from the attrs
+        # package). Not declared in setup.cfg/setup.py so editable install
+        # doesn't fetch it. Check the test files to decide.
+        if (repo_dir / "rich" / "__init__.py").exists() or \
+           (repo_dir / "src" / "rich").is_dir():
+            logger.info("Detected Rich repo — installing attrs for test_pretty")
+            subprocess.run(
+                [pip, "install", "--quiet", "attrs"],
+                capture_output=True, timeout=60,
+            )
 
         # Write stamp
         stamp.write_text("ok")
