@@ -33,6 +33,13 @@
 
 ## Completed
 
+### P1 — Learn-from-fix adaptation + FAIL_TO_PASS injection (v3.5)
+**Completed:** v3.5 (2026-04-13)
+Two improvements that together pushed pass rate from 60% → **80% (mission target hit)**:
+- **FAIL_TO_PASS injection**: system prompt now includes the specific SWE-bench test IDs that must pass, plus guidance to run them LAST before submit_fix (fixes RICH-2187 style "agent's fix works but scorer reads unrelated last-test = FAIL").
+- **Learn-from-fix**: `backend/agent/learn_from_fix.py` — after each run, a Haiku extractor writes a structured lesson (`**Pattern** / **Lesson** / **Tactic**`) to `{DATA_DIR}/{repo_name}/agent_lessons.md`. Next run on the same repo loads the 5 most recent lessons into the kickstart. Per-repo isolated, capped at 25 lessons/file with oldest-evicted, with rule-based fallback if the Haiku call fails. 24 unit tests.
+Bug fix: initial impl read `state.run_outcome.tests_passed` (trace field, not state field). Fixed by `_derive_tests_passed(state)` helper that reads `test_result` string + verifier verdict with confidence threshold.
+
 ### P1 — Main-agent decisioning (P1-P4: thinking, context refresh, auto-replan, undo)
 **Completed:** v3.4 (2026-04-13)
 Four ports from Claude Code that improve how the main agent reasons and recovers:
