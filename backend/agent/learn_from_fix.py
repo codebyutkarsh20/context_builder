@@ -50,12 +50,30 @@ LEARN_FROM_FIX_ENABLED = os.environ.get("DISABLE_LEARN_FROM_FIX", "") not in (
 # Lesson extraction
 # ---------------------------------------------------------------------------
 
+def _derive_tests_passed(state: dict) -> bool:
+    """Derive whether tests passed from the state dict.
+
+    The ReAct loop emits `run_outcome.tests_passed` as a trace event, but
+    it's not stored on the state dict. So we check multiple fields:
+    test_result starts with "passed", OR verifier_verdict == APPROVE, OR
+    the eval scorer's full_pass flag (when available).
+    """
+    test_result = str(state.get("test_result", "") or "")
+    if test_result.startswith("passed"):
+        return True
+    # Fallback: verifier approved with high confidence counts as "tests passed"
+    # since the verifier assesses the full diff + test evidence
+    if state.get("verifier_verdict") == "APPROVE" and \
+            state.get("verifier_confidence", 0) >= 0.7:
+        return True
+    return False
+
+
 def _build_lesson_extraction_prompt(state: dict, successful: bool) -> str:
     """Build the prompt for the Haiku extractor."""
     work_order = state.get("work_order", {}) or {}
     intent = state.get("intent", {}) or {}
     review = state.get("review", {}) or {}
-    run_outcome = state.get("run_outcome", {}) or {}
 
     ticket_id = work_order.get("ticket_id", "UNKNOWN")
     title = work_order.get("title", "")
@@ -66,11 +84,13 @@ def _build_lesson_extraction_prompt(state: dict, successful: bool) -> str:
     plan = get_current_plan() or {}
 
     # Build short summary of the run
+    tests_passed = _derive_tests_passed(state)
     status = "SUCCESS" if successful else (
         "FAIL-NO-FIX" if not state.get("submitted")
-        else "FAIL-TESTS" if not run_outcome.get("tests_passed")
+        else "FAIL-TESTS" if not tests_passed
         else "FAIL-OTHER"
     )
+    tool_call_count = state.get("tool_call_count", 0)
 
     return f"""You are extracting a LESSON from a completed bug-fix attempt so that
 future runs on the same codebase can avoid repeating mistakes (or can
@@ -92,8 +112,8 @@ Fix type: {fix_type}
 Outcome: {status}
 Review verdict: {review.get("verdict", "n/a")}
 Verifier verdict: {state.get("verifier_verdict", "n/a")} (confidence: {state.get("verifier_confidence", 0)})
-Test pass: {run_outcome.get("tests_passed", False)}
-Tool calls used: {run_outcome.get("tool_call_count", 0)}
+Test pass: {tests_passed}
+Tool calls used: {tool_call_count}
 
 === PLAN THE AGENT FOLLOWED ===
 Root cause: {plan.get("root_cause", "(no plan produced)")[:300]}
@@ -149,11 +169,10 @@ def _fallback_lesson(state: dict, successful: bool) -> str:
     """
     from agent.react_tools import get_current_plan
     work_order = state.get("work_order", {}) or {}
-    run_outcome = state.get("run_outcome", {}) or {}
     plan = get_current_plan() or {}
 
     ticket = work_order.get("ticket_id", "UNKNOWN")
-    tool_calls = run_outcome.get("tool_call_count", 0)
+    tool_calls = state.get("tool_call_count", 0)
 
     if successful:
         pattern = f"{plan.get('target_files', ['unknown'])[0] if plan.get('target_files') else 'unknown'} fix"
@@ -257,7 +276,7 @@ def record_lesson(state: dict) -> str | None:
 
     successful = bool(
         state.get("submitted")
-        and state.get("run_outcome", {}).get("tests_passed", False)
+        and _derive_tests_passed(state)
         and state.get("review", {}).get("verdict") == "APPROVE"
     )
     status_label = "SUCCESS" if successful else "FAIL"

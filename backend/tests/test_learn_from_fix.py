@@ -50,14 +50,56 @@ def _minimal_state(
         },
         "intent": {"fix_type": "bug_fix"},
         "submitted": successful,
-        "run_outcome": {
-            "tests_passed": successful,
-            "tool_call_count": 20,
-        },
+        "test_result": "passed" if successful else "failed",
+        "tool_call_count": 20,
         "review": {"verdict": "APPROVE" if successful else "REJECT"},
     }
     state.update(extra)
     return state
+
+
+# ---------------------------------------------------------------------------
+# _derive_tests_passed — critical for correct SUCCESS/FAIL classification
+# ---------------------------------------------------------------------------
+
+class TestDeriveTestsPassed:
+    def test_test_result_passed_string(self):
+        assert lff._derive_tests_passed({"test_result": "passed: 5 tests"}) is True
+        assert lff._derive_tests_passed({"test_result": "passed"}) is True
+
+    def test_test_result_failed_string(self):
+        assert lff._derive_tests_passed({"test_result": "failed"}) is False
+
+    def test_test_result_skipped(self):
+        """skipped tests alone don't count as passed (unless verifier approves high-conf)."""
+        assert lff._derive_tests_passed({"test_result": "skipped"}) is False
+
+    def test_verifier_high_confidence_approve_counts_as_pass(self):
+        state = {
+            "test_result": "skipped",
+            "verifier_verdict": "APPROVE",
+            "verifier_confidence": 0.9,
+        }
+        assert lff._derive_tests_passed(state) is True
+
+    def test_verifier_low_confidence_approve_does_not_count(self):
+        state = {
+            "test_result": "skipped",
+            "verifier_verdict": "APPROVE",
+            "verifier_confidence": 0.5,
+        }
+        assert lff._derive_tests_passed(state) is False
+
+    def test_verifier_reject_never_counts_as_pass(self):
+        state = {
+            "test_result": "skipped",
+            "verifier_verdict": "REJECT",
+            "verifier_confidence": 0.95,
+        }
+        assert lff._derive_tests_passed(state) is False
+
+    def test_empty_state_returns_false(self):
+        assert lff._derive_tests_passed({}) is False
 
 
 # ---------------------------------------------------------------------------
