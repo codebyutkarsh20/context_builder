@@ -600,6 +600,22 @@ def react_loop(
                     "at_call": gs.tool_call_count,
                 })
 
+    # Save cache-safe params so post-loop subagents (verifier, summarizer) can
+    # inherit our prompt-cached prefix instead of paying full price for a fresh
+    # call. Mirrors Claude Code's saveCacheSafeParams pattern.
+    try:
+        from agent.forked_subagent import CacheSafeParams, save_cache_safe_params
+        # Reconstruct a flat string version of the system prompt for cache match
+        # (verifier uses ChatAnthropic.invoke with a SystemMessage(content=str)).
+        save_cache_safe_params(CacheSafeParams(
+            system_prompt=static_block + "\n\n" + dynamic_block,
+            messages=list(messages[1:]),  # drop the system message — we re-add it
+            model=REACT_MODEL,
+            cache_control_block={"type": "ephemeral"},
+        ))
+    except Exception as e:
+        logger.debug("Failed to save cache-safe params (non-fatal): %s", e)
+
     # Finalize state
     state["tool_call_count"] = gs.tool_call_count
     state["cost_usd"] = round(gs.cost_usd, 6)

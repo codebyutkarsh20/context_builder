@@ -1247,7 +1247,40 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
         logger.info("EPR score: %.0f%% (%d/%d BRTs pass)", epr * 100, brt_pass_count, brt_total)
 
     try:
-        result = _structured_call("claude-sonnet-4-6", 1200, VerifierResult, prompt)
+        # Try the cache-preserving forked path first — verifier inherits the
+        # main agent's prompt prefix, paying only for the new task message +
+        # response. Falls back to fresh structured_call if no parent params
+        # are cached (e.g., react loop crashed before saving them).
+        result: Any = None
+        forked_used = False
+        try:
+            from agent.forked_subagent import (
+                run_forked_subagent,
+                get_last_cache_safe_params,
+            )
+            if get_last_cache_safe_params() is not None:
+                fork_result = run_forked_subagent(
+                    task=prompt,
+                    schema=VerifierResult,
+                    max_tokens=1200,
+                )
+                if fork_result.get("parsed") is not None and fork_result.get("error") is None:
+                    result = fork_result["parsed"]
+                    forked_used = True
+                    cache_read = fork_result.get("cache_read_tokens", 0)
+                    logger.info(
+                        "Verifier ran via forked subagent — cache_read=%d tokens",
+                        cache_read,
+                    )
+        except Exception as e:
+            logger.debug("Forked verifier path failed (%s) — falling back to fresh call", e)
+
+        if result is None:
+            # Fallback: fresh-context structured_call (pre-fork behavior)
+            result = _structured_call("claude-sonnet-4-6", 1200, VerifierResult, prompt)
+            logger.info("Verifier ran via fresh structured_call (no fork)")
+
+        state["verifier_used_fork"] = forked_used
 
         # Validate the Pydantic result has sane values
         if result.verdict not in ("APPROVE", "REJECT"):
