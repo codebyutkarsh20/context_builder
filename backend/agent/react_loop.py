@@ -232,7 +232,20 @@ def react_loop(
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": _THINKING_BUDGET}
             # Thinking requires temperature=1 per Anthropic API contract
             kwargs["temperature"] = 1.0
-        return ChatAnthropic(**kwargs).bind_tools(all_tools, parallel_tool_calls=True)
+        try:
+            return ChatAnthropic(**kwargs).bind_tools(all_tools, parallel_tool_calls=True)
+        except TypeError as e:
+            # Older anthropic SDKs may not accept `thinking` kwarg. Fall back
+            # to plain LLM rather than crashing the run. Logged once at startup.
+            if with_thinking and "thinking" in str(e).lower():
+                logger.warning(
+                    "Thinking config rejected by SDK (%s) — falling back to plain LLM",
+                    str(e)[:100],
+                )
+                kwargs.pop("thinking", None)
+                kwargs.pop("temperature", None)
+                return ChatAnthropic(**kwargs).bind_tools(all_tools, parallel_tool_calls=True)
+            raise
 
     llm_thinking = _build_llm(with_thinking=True)
     llm_fast = _build_llm(with_thinking=False)
@@ -494,6 +507,25 @@ def react_loop(
                 err_str = str(e).lower()
                 is_prompt_too_long = "prompt is too long" in err_str or "413" in err_str or "context_length" in err_str
                 is_output_limit = "max_tokens" in err_str or "output" in err_str
+                is_thinking_unsupported = "thinking" in err_str and "unexpected keyword" in err_str
+
+                # Recovery: SDK rejects the `thinking` parameter (older anthropic
+                # SDK or a server change). Permanently switch to the fast LLM
+                # for the rest of the run so we don't loop forever.
+                if is_thinking_unsupported and llm is llm_thinking:
+                    logger.warning(
+                        "SDK rejected thinking config — switching to fast LLM permanently",
+                    )
+                    llm = llm_fast
+                    llm_thinking = llm_fast  # prevent re-switching back later
+                    if trace:
+                        trace.emit("llm_mode_switch", "react_loop", {
+                            "from": "thinking",
+                            "to": "fast",
+                            "at_call": gs.tool_call_count,
+                            "reason": "thinking_unsupported_by_sdk",
+                        })
+                    continue
 
                 if is_prompt_too_long and _recovery_attempt == 0:
                     # Recovery level 1: Force aggressive summarization
