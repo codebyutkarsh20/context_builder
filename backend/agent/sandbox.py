@@ -76,11 +76,18 @@ def run_tests(
         test_pattern = agent_config.test_pattern
 
         env = {**os.environ, **extra_env}
-        # Prepend worktree source so modified code takes precedence over installed pkg
-        env["PYTHONPATH"] = (
-            _pythonpath_injection + ":" + env["PYTHONPATH"]
-            if env.get("PYTHONPATH") else _pythonpath_injection
+        # Prepend worktree source so modified code takes precedence over installed pkg.
+        # Only inject PYTHONPATH for Python test runners — npm/go/cargo ignore it,
+        # and setting it unconditionally is a sign of Python-centric assumptions.
+        _is_python_runner = any(
+            kw in (test_cmd_base or "").lower()
+            for kw in ("pytest", "python", "tox", "unittest", "nose")
         )
+        if _is_python_runner:
+            env["PYTHONPATH"] = (
+                _pythonpath_injection + ":" + env["PYTHONPATH"]
+                if env.get("PYTHONPATH") else _pythonpath_injection
+            )
 
         # Run setup commands first (e.g., pip install, db migrate)
         for cmd in setup_commands:
@@ -151,6 +158,12 @@ def run_tests(
         if (search_dir / "package.json").exists() and cmd is None:
             cmd = ["npm", "test"]
             test_cwd = search_dir
+        if (search_dir / "go.mod").exists() and cmd is None:
+            cmd = ["go", "test", "./..."]
+            test_cwd = search_dir
+        if (search_dir / "Cargo.toml").exists() and cmd is None:
+            cmd = ["cargo", "test"]
+            test_cwd = search_dir
         if (search_dir / "Makefile").exists() and cmd is None:
             cmd = ["make", "test"]
             test_cwd = search_dir
@@ -163,10 +176,16 @@ def run_tests(
     if test_path:
         cmd.append(test_path)
 
-    auto_env = {**os.environ, "PYTHONPATH": (
-        _pythonpath_injection + ":" + os.environ["PYTHONPATH"]
-        if os.environ.get("PYTHONPATH") else _pythonpath_injection
-    )}
+    # Only inject PYTHONPATH for Python test runners
+    auto_env = {**os.environ}
+    _auto_is_python = cmd and any(
+        kw in str(cmd[0]).lower() for kw in ("pytest", "python", "tox")
+    )
+    if _auto_is_python:
+        auto_env["PYTHONPATH"] = (
+            _pythonpath_injection + ":" + os.environ["PYTHONPATH"]
+            if os.environ.get("PYTHONPATH") else _pythonpath_injection
+        )
     logger.info("Running tests in %s: %s", test_cwd, " ".join(cmd))
     try:
         result = subprocess.run(

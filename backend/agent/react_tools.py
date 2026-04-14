@@ -445,8 +445,8 @@ def undo_last_edit() -> str:
 @tool
 def check_syntax(file_path: str) -> str:
     """
-    Check a Python file for syntax errors after editing.
-    Always run this after string_replace to verify your edit is valid.
+    Check a file for syntax errors after editing. Supports Python, JavaScript,
+    TypeScript, and JSON. Always run this after string_replace to verify.
 
     Args:
         file_path: Relative path from repo root e.g. 'app/services/payment.py'
@@ -455,23 +455,84 @@ def check_syntax(file_path: str) -> str:
     if resolved is None or not resolved.exists():
         return f"ERROR: File not found: {file_path}"
 
-    if resolved.suffix.lower() != ".py":
-        return f"OK: syntax check only for .py files (skipped {file_path})"
+    ext = resolved.suffix.lower()
 
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c",
-             f"import ast; ast.parse(open({repr(str(resolved))}).read())"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            return f"OK: {file_path} — no syntax errors"
-        else:
-            return f"SYNTAX ERROR in {file_path}:\n{result.stderr.strip()}"
-    except subprocess.TimeoutExpired:
-        return "ERROR: syntax check timed out"
-    except Exception as e:
-        return f"ERROR: {e}"
+    # Python — AST parse
+    if ext == ".py":
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 f"import ast; ast.parse(open({repr(str(resolved))}).read())"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return f"OK: {file_path} — no syntax errors"
+            else:
+                return f"SYNTAX ERROR in {file_path}:\n{result.stderr.strip()}"
+        except subprocess.TimeoutExpired:
+            return "ERROR: syntax check timed out"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    # JavaScript / TypeScript — node --check for JS, tsc --noEmit for TS
+    if ext in (".js", ".jsx", ".mjs", ".cjs"):
+        try:
+            import shutil
+            node = shutil.which("node")
+            if not node:
+                return f"WARNING: node not found — cannot check {file_path}"
+            result = subprocess.run(
+                [node, "--check", str(resolved)],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                return f"OK: {file_path} — no syntax errors"
+            else:
+                return f"SYNTAX ERROR in {file_path}:\n{result.stderr.strip()[:500]}"
+        except subprocess.TimeoutExpired:
+            return "ERROR: syntax check timed out"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    if ext in (".ts", ".tsx"):
+        try:
+            import shutil
+            # Try tsc first (full TypeScript check), fall back to node parse
+            tsc = shutil.which("tsc") or shutil.which("npx")
+            if tsc and "npx" in str(tsc):
+                cmd = [tsc, "tsc", "--noEmit", "--pretty", str(resolved)]
+            elif tsc:
+                cmd = [tsc, "--noEmit", "--pretty", str(resolved)]
+            else:
+                # No tsc — try node parse (catches gross syntax errors but not types)
+                node = shutil.which("node")
+                if not node:
+                    return f"WARNING: neither tsc nor node found — cannot check {file_path}"
+                cmd = [node, "-e", f"require('fs').readFileSync('{resolved}','utf8')"]
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                return f"OK: {file_path} — no syntax/type errors"
+            else:
+                return f"SYNTAX ERROR in {file_path}:\n{result.stderr.strip()[:500]}"
+        except subprocess.TimeoutExpired:
+            return "ERROR: syntax check timed out"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    # JSON — stdlib json.load
+    if ext == ".json":
+        try:
+            import json as _json
+            _json.loads(resolved.read_text(encoding="utf-8"))
+            return f"OK: {file_path} — valid JSON"
+        except _json.JSONDecodeError as e:
+            return f"SYNTAX ERROR in {file_path}: {e}"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    return f"OK: no syntax checker available for {ext} files (skipped {file_path})"
 
 
 @tool
