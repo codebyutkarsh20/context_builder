@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [3.5.0] - 2026-04-13
+
+### Added
+- Concept-to-code mapping: `query_concept_to_code()` bridges business-language tickets to code via BusinessRule graph nodes.
+- Hardened verifier prompt with anti-rationalization gate: APPROVE without adversarial-probe evidence auto-downgraded to REJECT.
+- Autonomous Plan Mode: `produce_plan` tool gates `create_sandbox`; verifier cross-checks plan vs diff.
+- Cache-friendly microcompact: in-place idempotent tool-result eviction preserving prompt-cache prefix bytes.
+- Forked subagent infrastructure: `CacheSafeParams` + thread-local slot for cache-preserving subordinate LLM calls.
+- Explore subagent: Haiku-backed read-only `delegate_explore` tool for parallel codebase search.
+- WebFetch + WebSearch tools (disabled by default, `ENABLE_WEB_TOOLS=1`).
+- Extended thinking on early turns (pre-first-edit); switches to fast LLM after. Configurable via `REACT_THINKING_BUDGET`.
+- Dynamic context refresh every 5 tool calls (git diff stat, test status, anti-pattern hints).
+- Diminishing-returns stuck detection with auto-replan nudge (not hard escalation).
+- Per-edit rollback: `undo_last_edit` tool with file-content snapshots.
+- Learn-from-fix: per-repo `agent_lessons.md` persists across runs; next run reads 5 most recent.
+- FAIL_TO_PASS test injection into system prompt ("run these LAST before submit_fix").
+- SWE-bench dep-compat for 10+ repo families (Django, Flask, Werkzeug, Rich, Matplotlib, Xarray, Requests, Sympy, Sklearn, Sphinx, Astropy, Pytest).
+- Eval dataset expanded to 35 bugs (25 single-file + 10 multi-file from SWE-bench-Verified).
+- 159 new unit tests (678 → 837 total).
+
+### Changed
+- Sentinel pass rate: 12% → 80% (mission target hit).
+- Cost/bug: $0.79 → $0.37 (53% reduction).
+- Tool calls/bug: 32 → 16 (50% reduction).
+- Localization: 88% → 100%.
+- CLAUDE.md rewritten following best practices (< 80 lines, progressive disclosure to agent_docs/).
+- Stale root docs (PLAN.md, AGENTS.md, GEMINI.md, OUTPUT.md) removed or moved to agent_docs/.
+- Anthropic SDK upgraded from 0.40.0 to 0.94.0 (enables extended thinking).
+
 ## [0.3.0.0] - 2026-04-01
 
 ### Added
