@@ -492,6 +492,92 @@ class RepoManager:
                 capture_output=True, timeout=60,
             )
 
+        # Matplotlib test deps: matplotlib requires numpy at import time.
+        # The editable install often doesn't pull it (or pulls a version too new).
+        if (repo_dir / "lib" / "matplotlib").is_dir() or \
+           (repo_dir / "matplotlib" / "__init__.py").exists():
+            logger.info("Detected Matplotlib repo — installing numpy + freetype build deps")
+            subprocess.run(
+                [pip, "install", "--quiet", "numpy<2.0", "pillow", "kiwisolver",
+                 "cycler", "fonttools", "pyparsing", "packaging", "python-dateutil"],
+                capture_output=True, timeout=120,
+            )
+
+        # Xarray test deps: old xarray uses np.unicode_ removed in numpy 2.0.
+        # Also needs pandas, scipy for full test suite.
+        if (repo_dir / "xarray" / "__init__.py").exists():
+            logger.info("Detected Xarray repo — installing numpy<2.0 + pandas + scipy")
+            subprocess.run(
+                [pip, "install", "--quiet", "numpy<2.0", "pandas<2.0", "scipy",
+                 "packaging", "setuptools"],
+                capture_output=True, timeout=120,
+            )
+
+        # Requests test deps: old requests bundles urllib3 internally
+        # (`from requests.packages import urllib3`). Modern pip un-bundles it.
+        # Also needs pytest-httpbin, trustme, etc for conftest.py.
+        if (repo_dir / "requests" / "__init__.py").exists() and \
+           not (repo_dir / "django").exists():  # avoid matching Django's requests tests
+            logger.info("Detected Requests repo — installing test deps")
+            subprocess.run(
+                [pip, "install", "--quiet", "pytest-httpbin", "trustme",
+                 "pytest-mock", "urllib3<2.0", "chardet", "idna<3.0"],
+                capture_output=True, timeout=120,
+            )
+
+        # Sympy: needs mpmath at import time; conftest.py imports sympy which
+        # imports mpmath. Not always pulled by editable install.
+        if (repo_dir / "sympy" / "__init__.py").exists():
+            logger.info("Detected Sympy repo — installing mpmath")
+            subprocess.run(
+                [pip, "install", "--quiet", "mpmath"],
+                capture_output=True, timeout=60,
+            )
+
+        # Scikit-learn: needs numpy, scipy, joblib, threadpoolctl at import time.
+        if (repo_dir / "sklearn" / "__init__.py").exists():
+            logger.info("Detected Sklearn repo — installing numpy + scipy + joblib")
+            subprocess.run(
+                [pip, "install", "--quiet", "numpy<2.0", "scipy", "joblib",
+                 "threadpoolctl"],
+                capture_output=True, timeout=120,
+            )
+
+        # Sphinx: needs docutils, Jinja2, snowballstemmer, babel, etc.
+        if (repo_dir / "sphinx" / "__init__.py").exists():
+            logger.info("Detected Sphinx repo — installing core deps")
+            subprocess.run(
+                [pip, "install", "--quiet", "docutils<0.20", "Jinja2",
+                 "snowballstemmer", "babel", "alabaster", "imagesize",
+                 "packaging", "pygments", "requests", "sphinxcontrib-htmlhelp",
+                 "sphinxcontrib-serializinghtml", "sphinxcontrib-qthelp",
+                 "sphinxcontrib-devhelp", "sphinxcontrib-applehelp",
+                 "sphinxcontrib-jsmath"],
+                capture_output=True, timeout=120,
+            )
+
+        # Astropy: needs numpy, packaging, PyYAML, pyerfa at import time.
+        if (repo_dir / "astropy" / "__init__.py").exists():
+            logger.info("Detected Astropy repo — installing numpy + core deps")
+            subprocess.run(
+                [pip, "install", "--quiet", "numpy<2.0", "packaging",
+                 "PyYAML", "pyerfa"],
+                capture_output=True, timeout=120,
+            )
+
+        # Pytest repos: pytest testing itself is tricky — the venv's pytest
+        # binary imports the INSTALLED pytest, not the source. For SWE-bench
+        # pytest bugs, run tests via `python -m pytest` so the source takes
+        # precedence (PYTHONPATH injection from sandbox.py handles this).
+        if (repo_dir / "_pytest" / "__init__.py").exists() or \
+           (repo_dir / "src" / "_pytest" / "__init__.py").exists():
+            logger.info("Detected Pytest source repo — installing test deps")
+            subprocess.run(
+                [pip, "install", "--quiet", "xmlschema", "hypothesis",
+                 "pygments", "py", "iniconfig", "attrs"],
+                capture_output=True, timeout=90,
+            )
+
         # Write stamp
         stamp.write_text("ok")
 
