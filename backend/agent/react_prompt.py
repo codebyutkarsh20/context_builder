@@ -94,8 +94,12 @@ def build_system_prompt(
             "**CRITICAL workflow rule**: Right before calling submit_fix, run EXACTLY these "
             "tests (via run_tests with the specific test_path). The eval scorer reads the "
             "LAST run_tests result — if you run an unrelated test file last, even a correct "
-            "fix will be scored as FAIL. Use the pytest node syntax: "
-            "`path/to/test_file.py::TestClass::test_method`.\n"
+            "fix will be scored as FAIL.\n"
+            "Test path syntax depends on the project:\n"
+            "  - Python/pytest: `path/to/test_file.py::TestClass::test_method`\n"
+            "  - JavaScript/Jest: `path/to/test.spec.js -t 'test name'`\n"
+            "  - JavaScript/Vitest: `path/to/test.spec.ts`\n"
+            "  - Go: `./pkg/... -run TestFuncName`\n"
         )
         if pass_to_pass:
             ptp_sample = pass_to_pass[:3]
@@ -213,7 +217,7 @@ information. **create_sandbox will fail until a plan exists.**
 
 ### Editing (requires sandbox — you must read_file/read_function BEFORE editing):
 - string_replace(file_path, old_string, new_string) — Replace exact string in a file. ruff --fix runs automatically after each edit.
-- check_syntax(file_path) — Verify Python file has no syntax errors
+- check_syntax(file_path) — Verify file has no syntax errors (Python/JS/TS/JSON)
 - create_file(file_path, content) — Create a new file (e.g., test files)
 
 ### Sandbox & Testing:

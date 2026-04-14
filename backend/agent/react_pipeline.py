@@ -368,6 +368,21 @@ def intake_node(state: ReactAgentState) -> ReactAgentState:
             cleanup_stale_worktrees(repo_path)
         except Exception as e:
             logger.debug("Stale worktree cleanup failed (non-fatal): %s", e)
+    # Auto-detect project type and write .agent_config.json if missing.
+    # This ensures sandbox.run_tests, check_syntax, and linters all know
+    # the repo's language, test runner, and lint tool — even for repos the
+    # agent has never seen before. Existing .agent_config.json takes priority
+    # (detection only fills gaps).
+    if repo_path and repo_path.is_dir():
+        try:
+            from agent.repo_detection import write_agent_config_from_detection
+            config_path = repo_path / ".agent_config.json"
+            if not config_path.exists():
+                write_agent_config_from_detection(repo_path)
+                logger.info("Auto-detected project config for %s", repo_path.name)
+        except Exception as e:
+            logger.debug("repo_detection failed (non-fatal): %s", e)
+
     state["status"] = PipelineStatus.INTAKE
     _report_progress(state)
 
