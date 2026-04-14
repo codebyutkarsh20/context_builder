@@ -564,13 +564,24 @@ def react_loop(
         gs.cost_usd += call_cost
 
         if trace:
-            # Capture full response content for replay/debugging
+            # Capture full response content for replay/debugging —
+            # including extended thinking blocks (the agent's internal
+            # reasoning before deciding on tool calls).
             response_text = ""
+            thinking_text = ""
             if isinstance(response.content, str):
                 response_text = response.content
             elif isinstance(response.content, list):
-                text_blocks = [b.get("text", "") for b in response.content if isinstance(b, dict) and b.get("type") == "text"]
+                text_blocks = []
+                thinking_blocks = []
+                for b in response.content:
+                    if isinstance(b, dict):
+                        if b.get("type") == "text":
+                            text_blocks.append(b.get("text", ""))
+                        elif b.get("type") == "thinking":
+                            thinking_blocks.append(b.get("thinking", ""))
                 response_text = "\n".join(text_blocks)
+                thinking_text = "\n---\n".join(thinking_blocks)
 
             response_tool_calls = []
             if response.tool_calls:
@@ -581,7 +592,7 @@ def react_loop(
                         "id": tc["id"],
                     })
 
-            trace.emit("llm_response", "react_loop", {
+            llm_event_data: dict = {
                 "model": REACT_MODEL,
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
@@ -594,7 +605,13 @@ def react_loop(
                 "context_tokens": context_tokens,
                 "response_text": response_text,
                 "response_tool_calls": response_tool_calls,
-            })
+                "thinking_used": llm is llm_thinking,
+            }
+            # Include thinking text when present — this is the "decision
+            # replay" data that lets you see WHY the agent chose its action.
+            if thinking_text:
+                llm_event_data["thinking_text"] = thinking_text[:8000]
+            trace.emit("llm_response", "react_loop", llm_event_data)
 
         # Log cache hit on first cached call
         if cache_read > 0 and gs.tool_call_count <= 2:
@@ -661,12 +678,16 @@ def react_loop(
                 except Exception as te:
                     raw = f"ERROR: Tool execution failed: {te}"
                 dur = round((time.monotonic() - tool_t0) * 1000)
-                capped = cap_tool_output(tn, str(raw))
+                capped, truncation_info = cap_tool_output(tn, str(raw))
                 if trace:
-                    trace.emit("tool_result", "react_loop", {
+                    tool_result_data: dict = {
                         "tool_name": tn, "duration_ms": dur,
                         "result_preview": str(capped), "phase": current_phase,
-                    })
+                    }
+                    # Log truncation so debugging can see what the agent missed
+                    if truncation_info.get("truncated"):
+                        tool_result_data["truncation"] = truncation_info
+                    trace.emit("tool_result", "react_loop", tool_result_data)
                 return tc_entry, capped
 
             is_concurrent_batch = len(batch) > 1 and all(b.get("_concurrent") for b in batch)

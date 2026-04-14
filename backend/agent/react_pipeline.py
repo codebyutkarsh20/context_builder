@@ -878,7 +878,7 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
                 logger.debug("Ground-truth test execution skipped: %s", e)
 
         _report_progress(state)
-        # Record a lesson for future runs (escalated path)
+        _emit_failure_diagnosis(state)
         _safe_record_lesson(state)
         if trace:
             trace.stage_end("finalize")
@@ -898,7 +898,7 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
     state = _populate_repair_and_localization(state, sandbox_path, repo_path)
 
     _report_progress(state)
-    # Record a lesson for future runs (successful path)
+    _emit_failure_diagnosis(state)
     _safe_record_lesson(state)
     if trace:
         trace.stage_end("finalize")
@@ -907,17 +907,116 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
 
 
 def _safe_record_lesson(state: dict) -> None:
-    """Call learn_from_fix.record_lesson with all exceptions swallowed.
-
-    record_lesson already swallows its own errors, but we add a second
-    layer of safety here since this runs during finalize (post-submit)
-    and any crash would break the pipeline.
-    """
+    """Call learn_from_fix.record_lesson with all exceptions swallowed."""
     try:
         from agent.learn_from_fix import record_lesson
         record_lesson(state)
     except Exception as e:
         logger.debug("record_lesson wrapper failed (non-fatal): %s", e)
+
+
+def _emit_failure_diagnosis(state: dict) -> None:
+    """Generate and emit a structured failure diagnosis into the trace.
+
+    Called after every run (success or fail). For FAIL runs, this provides
+    a "decision replay" summary that answers "where did the agent go wrong?"
+    without requiring manual trace inspection.
+
+    The diagnosis is stored in the trace JSON as a `failure_diagnosis` event,
+    readable by both the UI and `cli.py eval diagnose`.
+    """
+    trace = _get_trace()
+    if not trace:
+        return
+
+    try:
+        from agent.react_tools import get_current_plan, get_edit_history
+
+        work_order = state.get("work_order", {}) or {}
+        intent = state.get("intent", {}) or {}
+        plan = get_current_plan() or {}
+        edits = get_edit_history()
+
+        submitted = state.get("submitted", False)
+        escalated = state.get("escalated", False)
+        test_result = state.get("test_result", "")
+        verifier = state.get("verifier_verdict", "")
+        explanation = state.get("explanation", "")
+        escalate_reason = state.get("escalate_reason", "")
+        tool_calls = state.get("tool_call_count", 0)
+        cost = state.get("cost_usd", 0.0)
+
+        # Classify the failure mode
+        if submitted and "passed" in str(test_result).lower():
+            outcome = "SUCCESS"
+            failure_mode = "none"
+        elif escalated:
+            if "never attempted" in escalate_reason.lower() or "0 edits" in escalate_reason:
+                failure_mode = "stuck_exploring"
+            elif "time limit" in escalate_reason.lower():
+                failure_mode = "timeout"
+            elif "cost cap" in escalate_reason.lower():
+                failure_mode = "cost_exceeded"
+            else:
+                failure_mode = "escalated_other"
+            outcome = "FAIL"
+        elif submitted and "failed" in str(test_result).lower():
+            failure_mode = "tests_failed"
+            outcome = "FAIL"
+        elif submitted and ("skipped" in str(test_result).lower() or "error" in str(test_result).lower()):
+            failure_mode = "test_infra_broken"
+            outcome = "FAIL"
+        elif not submitted:
+            failure_mode = "no_fix_submitted"
+            outcome = "FAIL"
+        else:
+            failure_mode = "unknown"
+            outcome = "FAIL" if not submitted else "SUCCESS"
+
+        # Build the step-by-step replay
+        steps: list[str] = []
+        steps.append(f"1. TICKET: {work_order.get('title', '?')[:100]}")
+
+        if plan:
+            steps.append(f"2. PLAN: root_cause='{plan.get('root_cause', '?')[:120]}'")
+            steps.append(f"   target_files={plan.get('target_files', [])}")
+        else:
+            steps.append("2. PLAN: (none produced)")
+
+        if edits:
+            for i, e in enumerate(edits[:5], 1):
+                steps.append(f"3.{i}. EDIT: {e['tool']} on {e['file_path']}")
+        else:
+            steps.append("3. EDITS: (none)")
+
+        if test_result:
+            steps.append(f"4. TESTS: {str(test_result)[:150]}")
+        else:
+            steps.append("4. TESTS: (not run)")
+
+        if verifier:
+            steps.append(f"5. VERIFIER: {verifier} — {state.get('verifier_explanation', '')[:150]}")
+
+        if outcome == "FAIL":
+            steps.append(f"6. FAILURE MODE: {failure_mode}")
+            if escalate_reason:
+                steps.append(f"   REASON: {escalate_reason[:200]}")
+
+        diagnosis = {
+            "outcome": outcome,
+            "failure_mode": failure_mode,
+            "ticket_id": work_order.get("ticket_id", "?"),
+            "tool_calls": tool_calls,
+            "cost_usd": round(cost, 4),
+            "plan_produced": bool(plan),
+            "edits_count": len(edits),
+            "tests_attempted": bool(test_result),
+            "verifier_verdict": verifier or "not_run",
+            "replay_steps": steps,
+        }
+        trace.emit("failure_diagnosis", "finalize", diagnosis)
+    except Exception as e:
+        logger.debug("failure_diagnosis failed (non-fatal): %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -1366,6 +1465,21 @@ def verifier_node(state: ReactAgentState) -> ReactAgentState:
         state["verifier_confidence"] = result.confidence
         state["verifier_explanation"] = result.explanation
         state["verifier_regression_risk"] = result.regression_risk
+
+        # Emit full verifier reasoning into the trace for debugging.
+        # This is the "decision replay" data for the verification stage —
+        # shows exactly what the verifier saw, what probe it ran, and why
+        # it decided APPROVE/REJECT.
+        trace = _get_trace()
+        if trace:
+            trace.emit("verifier_result", "verifier", {
+                "verdict": result.verdict,
+                "confidence": result.confidence,
+                "explanation": result.explanation,
+                "regression_risk": result.regression_risk,
+                "used_fork": state.get("verifier_used_fork", False),
+                "downgraded": "[downgraded]" in (result.explanation or ""),
+            })
 
         logger.info(
             "Verifier verdict: %s (confidence: %.0f%%, risk: %s)",

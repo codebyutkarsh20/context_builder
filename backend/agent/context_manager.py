@@ -70,13 +70,29 @@ TOKEN_ESTIMATE_RATIO = 0.25  # Rough chars-to-tokens for code
 DEFAULT_CAP = 4000
 
 
-def cap_tool_output(tool_name: str, output: str) -> str:
-    """Layer 1: Cap tool output at the per-tool limit (from tool_metadata registry)."""
+def cap_tool_output(tool_name: str, output: str) -> tuple[str, dict]:
+    """Layer 1: Cap tool output at the per-tool limit (from tool_metadata registry).
+
+    Returns (capped_output, truncation_info) where truncation_info is a dict:
+      - truncated: bool
+      - original_chars: int (only if truncated)
+      - kept_chars: int (only if truncated)
+      - lost_chars: int (only if truncated)
+    """
     from agent.tool_metadata import get_output_cap
     cap = get_output_cap(tool_name)
     if len(output) <= cap:
-        return output
-    return output[:cap] + f"\n[... truncated, {len(output) - cap} more chars]"
+        return output, {"truncated": False}
+    lost = len(output) - cap
+    return (
+        output[:cap] + f"\n[... truncated, {lost} more chars]",
+        {
+            "truncated": True,
+            "original_chars": len(output),
+            "kept_chars": cap,
+            "lost_chars": lost,
+        },
+    )
 
 
 def count_tokens_approx(messages: list) -> int:
