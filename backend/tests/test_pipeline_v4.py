@@ -2089,7 +2089,7 @@ class TestTask6ToolCollections:
     def test_react_tools_has_10_tools(self):
         """REACT_TOOLS should have exactly 10 tools."""
         from agent.react_tools import REACT_TOOLS
-        assert len(REACT_TOOLS) == 11  # +1 for create_sandbox fallback
+        assert len(REACT_TOOLS) == 12  # +1 create_sandbox fallback, +1 switch_repo
 
     def test_edit_tools_composition(self):
         """EDIT_TOOLS: string_replace, create_file, undo_last_edit."""

@@ -1068,6 +1068,36 @@ def setup_node(state: ReactAgentState) -> ReactAgentState:
         state["branch_name"] = repo_result["branch_name"]
         state["base_branch"] = repo_result["base_branch"]
 
+    # --- Multi-repo: register all repos for switch_repo tool ---
+    from agent.react_tools import register_repo, _repo_registry
+    _repo_registry.clear()  # Reset registry for this run
+
+    # Register the primary repo
+    if repo_path:
+        register_repo(
+            repo_name, repo_path,
+            sandbox_path=Path(repo_result["sandbox_path"]) if repo_result.get("sandbox_path") else None,
+            branch_name=repo_result.get("branch_name", ""),
+            base_branch=repo_result.get("base_branch", "main"),
+        )
+
+    # Register additional repos from work_order (multi-repo tickets)
+    additional_repos = work_order.get("repos", [])
+    for extra_repo in additional_repos:
+        extra_name = extra_repo.get("name", "")
+        extra_path = extra_repo.get("path", "")
+        if extra_name and extra_path and extra_name != repo_name:
+            extra_path_obj = Path(extra_path)
+            if extra_path_obj.is_dir():
+                register_repo(extra_name, extra_path_obj)
+                logger.info("setup_node: registered additional repo '%s' at %s", extra_name, extra_path)
+
+    if len(_repo_registry) > 1:
+        logger.info(
+            "setup_node: multi-repo mode — %d repos registered: %s",
+            len(_repo_registry), list(_repo_registry.keys()),
+        )
+
     # Merge scout files into intent
     intent = state.get("intent", {})
     scout_files = scout_result.get("scout_files", [])

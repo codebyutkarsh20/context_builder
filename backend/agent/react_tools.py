@@ -77,6 +77,33 @@ def set_sandbox_path(sandbox_path: Path, branch_name: str, base_branch: str) -> 
     _tls.base_branch = base_branch
 
 
+# ---------------------------------------------------------------------------
+# Multi-repo support — switch between repos within one run
+# ---------------------------------------------------------------------------
+
+# Registry of all repos available in this run: {repo_name: {path, sandbox_path, branch, base_branch}}
+_repo_registry: dict[str, dict] = {}
+
+
+def register_repo(
+    repo_name: str, repo_path: Path,
+    sandbox_path: Path | None = None,
+    branch_name: str = "", base_branch: str = "main",
+) -> None:
+    """Register a repo for multi-repo runs. Called from setup_node."""
+    _repo_registry[repo_name] = {
+        "repo_path": repo_path,
+        "sandbox_path": sandbox_path,
+        "branch_name": branch_name,
+        "base_branch": base_branch,
+    }
+
+
+def get_registered_repos() -> dict[str, dict]:
+    """Return the registry of all available repos."""
+    return dict(_repo_registry)
+
+
 def set_guardrail_state(gs) -> None:
     """Store the GuardrailState on thread-local so tools can read files_read."""
     _tls._guardrail_state = gs
@@ -2139,6 +2166,81 @@ def write_brt() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Multi-repo: switch_repo tool
+# ---------------------------------------------------------------------------
+
+@tool
+def switch_repo(repo_name: str) -> str:
+    """Switch the active repo context to a different registered repo.
+
+    Use this when a bug spans multiple repos and you need to read/edit
+    files in a different codebase. All subsequent tool calls (read_file,
+    grep_repo, string_replace, run_tests, etc.) will operate on the
+    switched repo until you switch again.
+
+    The system pre-registers all repos listed in the work order. Call
+    this tool with the repo name to switch.
+
+    Args:
+        repo_name: Name of the repo to switch to (must be pre-registered).
+
+    Returns:
+        OK with the new repo path and sandbox, or ERROR if repo not found.
+    """
+    registry = get_registered_repos()
+    if not registry:
+        return "ERROR: No repos registered. This is a single-repo run."
+
+    if repo_name not in registry:
+        available = ", ".join(registry.keys())
+        return f"ERROR: Repo '{repo_name}' not found. Available: {available}"
+
+    info = registry[repo_name]
+    repo_path = info["repo_path"]
+    sandbox_path = info.get("sandbox_path")
+    branch_name = info.get("branch_name", "")
+    base_branch = info.get("base_branch", "main")
+
+    # Switch thread-local context — all tools now point to the new repo
+    _tls.repo_name = repo_name
+    _tls.repo_path = repo_path
+
+    if sandbox_path and Path(sandbox_path).exists():
+        set_sandbox_path(Path(sandbox_path), branch_name, base_branch)
+        # Also update explore_tools context
+        try:
+            from agent.explore_tools import set_context
+            data_dir = getattr(_tls, "data_dir", None)
+            set_context(repo_name, repo_path, data_dir)
+        except Exception:
+            pass
+        return (
+            f"OK: Switched to repo '{repo_name}'\n"
+            f"repo_path={repo_path}\n"
+            f"sandbox_path={sandbox_path}\n"
+            f"branch={branch_name}\n"
+            f"All tools now operate on this repo."
+        )
+    else:
+        # No sandbox for this repo — agent can create one
+        _tls.sandbox_path = None
+        _tls.branch_name = ""
+        _tls.base_branch = base_branch
+        try:
+            from agent.explore_tools import set_context
+            data_dir = getattr(_tls, "data_dir", None)
+            set_context(repo_name, repo_path, data_dir)
+        except Exception:
+            pass
+        return (
+            f"OK: Switched to repo '{repo_name}'\n"
+            f"repo_path={repo_path}\n"
+            f"No sandbox yet — call create_sandbox() to create one.\n"
+            f"All tools now operate on this repo."
+        )
+
+
+# ---------------------------------------------------------------------------
 # v4 Tool collections
 # ---------------------------------------------------------------------------
 # 10 react tools total. Exploration tools are added separately in react_loop.py
@@ -2161,6 +2263,9 @@ PLAN_TOOLS = [produce_plan]
 # (dirty repo, git error), the agent needs a way to create one itself.
 SANDBOX_TOOLS = [create_sandbox]
 TEST_TOOLS = [run_tests, run_shell, write_brt]
+# switch_repo: multi-repo support — agent can switch between repos within one run.
+# Only useful when work_order has repos: [{name, path}]. Harmless in single-repo runs.
+MULTI_REPO_TOOLS = [switch_repo]
 COMPLETION_TOOLS = [verify_fix, submit_fix, escalate]
 
 # Legacy collections kept for backward compat (tests, old code paths)
@@ -2170,4 +2275,4 @@ _LEGACY_SANDBOX_TOOLS = [create_sandbox, run_tests, run_brt]  # renamed to avoid
 MULTI_FILE_TOOLS = [get_callers]
 
 # All react-specific tools (exploration tools are added from explore_tools.py)
-REACT_TOOLS = EDIT_TOOLS + PLAN_TOOLS + SANDBOX_TOOLS + TEST_TOOLS + COMPLETION_TOOLS
+REACT_TOOLS = EDIT_TOOLS + PLAN_TOOLS + SANDBOX_TOOLS + TEST_TOOLS + MULTI_REPO_TOOLS + COMPLETION_TOOLS

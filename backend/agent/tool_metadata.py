@@ -140,6 +140,10 @@ def _register_all() -> None:
         ToolMeta("run_shell", is_read_only=False, is_concurrent_safe=False,
                  max_output_chars=8000, activity_description="Running shell",
                  phase="test"),
+        # Multi-repo: switch between repos within one run
+        ToolMeta("switch_repo", is_read_only=False, is_concurrent_safe=False,
+                 max_output_chars=500, activity_description="Switching repo",
+                 phase="explore"),
     ]:
         register_tool_meta(meta)
 
