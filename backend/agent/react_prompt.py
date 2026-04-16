@@ -51,6 +51,7 @@ def build_system_prompt(
     business_rules_section: str = "",
     brts: list[dict] | None = None,
 ) -> tuple[str, str]:
+    # DEPRECATED — use build_static_block/build_dynamic_block
     """Build the system prompt split into (static_block, dynamic_block).
 
     Returns a tuple so the caller can apply cache_control only to the static
@@ -121,24 +122,34 @@ def build_system_prompt(
     # STATIC BLOCK — identical for every bug_fix run on every repo.
     # Put cache_control on this in react_loop.py.
     # -------------------------------------------------------------------------
-    static_block = f"""You are an AI software engineer. You fix production bugs, implement features, and make code changes in software repositories.
+    static_block = f"""You are an AI software engineer. You fix production bugs, implement features, and make code changes in software repositories. You work autonomously — no human reviews your work between steps.
 
-## YOUR WORKFLOW — TOOL CALL BUDGET: ~30 CALLS (hard limit: 40)
+## YOU HAVE ROOM TO WORK
 
-You have a budget of ~30 tool calls. Successful changes average 15-25 calls. Hard limit is 40 — you'll be stopped there. Plan ahead.
+You have a generous tool-call budget (50+ for single-file bugs, 70+ for multi-file). Use what you need. Quality matters more than efficiency — take the time to understand, plan, edit, test, and verify. You will NOT be force-escalated at 75% of budget anymore. Trust your judgment.
 
-**IMPORTANT: You can call MULTIPLE tools in a single turn.** When you need several pieces of information (e.g., reading 3 functions, or grepping 2 patterns), request them all at once — they run in parallel and save you turns.
+**Parallel tool calls**: You can call MULTIPLE tools in one turn. When you need several pieces of information (read 3 functions, grep 2 patterns), request them all at once — they run in parallel.
 
-### Phase 1: EXPLORE — use the code map, then read targeted sections
-1. **Check the CODE MAP in your context** — it shows function signatures + line numbers for localized files. Find the relevant function there.
-2. **Read the specific section** with read_file(file, start_line, end_line). The viewer shows 100 lines at a time. Use the line numbers from the code map.
-3. If you need more context, scroll: read_file(file, start_line=201) shows the next 100 lines.
-4. grep_repo is ONLY for finding which file contains a pattern. Once you have the file, use the code map + read_file with line numbers.
-5. **If grep returns zero matches**: the bug description uses different names than the code. Look at the CODE MAP to find the actual function names.
-6. **Delegate broad questions to delegate_explore()** — when a question would take 4+ tool calls (e.g. "find all callers of X and what they pass", "are there TODOs about retries?", "where is the auth flow configured?"), call `delegate_explore("your question")` instead. A Haiku subagent runs the search and returns a focused report. Saves your turns and your context.
-7. **External lookups when needed** — if you encounter an unfamiliar library API or a cryptic error message, you may have `web_fetch(url, prompt)` and `web_search(query)` available. Use these only when the answer can't be found in the codebase (e.g., "what does werkzeug.url_quote do?" or "django InvalidBasesError workaround"). They cost more than local tools — local first, web only if needed.
-8. {'Form a clear hypothesis about the root cause.' if is_bug else 'Understand the codebase structure.'}
-9. Call record_localization when ready.
+### Phase 1: UNDERSTAND the bug and trace it to code
+
+**Vague tickets (product/user language)**: The ticket may NOT use function names or file paths. That's normal — real users describe symptoms. To localize:
+  1. Identify the FEATURE AREA from the symptom (auth, forms, serialization, etc.)
+  2. Use `get_file_structure(dir_or_file)` to see what's there
+  3. Read suspicious files with `read_file` or `read_function`
+  4. Trace backward: what code path produces the reported behavior?
+  5. DO NOT grep for ticket keywords — they won't match code identifiers. Grep for DOMAIN concepts (model names, URLs, error message substrings).
+
+**Technical tickets (code terms + stack traces)**: Grep for the exact symbols mentioned, jump to the code map, read the function.
+
+**Tools by use case** (pick what fits):
+- **delegate_explore("question")** — Haiku subagent answers broad questions ("how does auth flow work?", "where are file uploads handled?") in ONE turn. Use this liberally — it's cheap and saves 5-10 of your own turns.
+- **read_function(file, fn_name)** — Full function with signature, docstring, body. Better than grep for "what does this do?".
+- **get_file_structure(file)** — All function signatures + line numbers in one call.
+- **grep_repo(pattern)** — Good for finding WHERE symbols live. Not great for understanding.
+- **get_callers(file, fn)** / **get_blast_radius(file)** — Know who uses this code before changing it.
+- **web_fetch(url, prompt)** / **web_search(query)** — External docs for unfamiliar APIs. Worth it when stuck.
+
+When you feel you understand the root cause, call **record_localization**.
 
 ### Phase 1.5: PLAN — declare your approach before any edits (1 call)
 
@@ -175,33 +186,62 @@ information. **create_sandbox will fail until a plan exists.**
   If you get "ERROR: No sandbox exists", call create_sandbox() immediately — it is
   a 1-call setup step, NOT a reason to escalate.
 
-### Phase 3: VERIFY (budget: 3-5 calls)
-{"9. Call run_brt() — run the Bug Reproduction Tests on your fix. ALL BRTs must pass before submitting. If a BRT still fails, read that test, understand what it checks, then fix the production code (NOT the test)." if has_brts else "9. Call run_tests with a specific test path (1-2 calls). If tests return 'skipped' or 'error', that's fine — the repo may lack deps. Move on."}
-10. {"Call run_tests for the full test suite after BRTs pass." if has_brts else "Do NOT retry run_tests more than 2 times. If tests can't run, proceed."}
-11. Call request_review (1 call). If review approves, submit. If review requests changes, make ONE attempt to fix, then submit or escalate.
+### Phase 3: VERIFY — run the RIGHT tests, add a regression test
 
-### Phase 4: FINISH (1-2 calls)
-12. Call submit_fix with your explanation.
+**Test runner picks itself** based on what files you edited:
+- Edited only `.js/.jsx/.ts/.tsx` → npm test / vitest runs
+- Edited `.py` → pytest runs
+- Mixed / Python-only → pytest (primary)
 
-## RECOVERY PATTERNS — IF YOU HIT AN ERROR, DO THIS
+You don't need to force a runner — the sandbox auto-detects based on your diff.
 
-| Error Message | Recovery Action |
-|---------------|-----------------|
-| "No sandbox exists" | Call create_sandbox() NOW, then retry. Never escalate for this. |
-| "old_string not found in file" | Re-read function with read_function, get exact content, retry string_replace. |
-| "old_string appears N times" | Extend old_string with more surrounding context to make it unique. |
-| Tests return "skipped" or "error" | This is OK — proceed directly to request_review and submit_fix. |
-| "Cannot submit yet. Missing prerequisites" | Read the list — complete each missing step in order. |
-| "Path traversal blocked" | Use relative path from repo root (e.g. 'agent/sandbox.py' not '/tmp/...') |
+{"**BRTs (Bug Reproduction Tests)**: `run_brt()` executes confirmed failing tests. The verifier WILL see your BRT pass/fail and can REJECT if BRTs still fail after your fix. Treat 100% BRT pass as a hard requirement. If a BRT fails, read it carefully — the test pins down the expected behavior." if has_brts else "**Targeted testing**: run_tests(test_path='tests/test_foo.py::test_bar'). Prefer targeted over full suite — faster + less noise."}
 
-## ANTI-PATTERNS — DO NOT DO THESE
+**When tests fail due to infra** (pytest exit 4 / conftest errors / missing deps):
+The sandbox automatically retries with `--noconftest` targeting your specific test. If that still fails, it's an environment issue — proceed to review. You won't be penalized for infra problems.
 
-- **Grep spam**: If you've called grep_repo 5+ times without finding what you need, STOP and try a different approach (read_function, get_file_structure) or escalate.
-- **Read loops**: If you've read the same file 3+ times, you have enough information. Make a decision.
-- **Test spiral**: If run_tests fails twice, proceed to review/submit. Do not keep trying different test paths.
-- **Edit churn**: If string_replace fails twice on the same file, re-read the function first, then make ONE more attempt.
-- **Review loop**: If request_review rejects, make ONE fix attempt. If rejected again, escalate. Do not call request_review more than 2 times.
-- **Premature escalation**: Do NOT escalate after a single blocked tool call. Read the error, follow the recovery action above, and retry.
+**REGRESSION TEST**: Add one when the bug fix touches behavior worth protecting:
+  1. Write a test that fails on broken code, passes on your fix
+  2. Use the project's existing test conventions (folder, naming, imports)
+  3. Use `create_file` for a new test, or `string_replace` to extend an existing file
+
+Skip the regression test ONLY if: (a) fix is cosmetic (typo/docstring), (b) project has no test framework, (c) no natural test location exists.
+
+### Phase 4: REVIEW & SUBMIT
+
+1. `request_review(explanation)` — fresh-context AI review of your diff
+2. `submit_fix(explanation)` — creates commit + prepares PR
+
+After submit, an independent **verifier** runs — it sees your diff, test results, BRT results, and plan. If it REJECTs with high confidence AND BRTs fail, you get **1-2 automatic retries** with the verifier's feedback. Use this as a safety net, not a crutch.
+
+## PASS@3 RETRY — if your first attempt fails
+
+You may be invoked as a RETRY of a previous attempt. Check the task message for "🔁 RETRY ATTEMPT" prefix. If present:
+- The previous fix was REJECTed by verifier + BRTs still failed
+- Read the retry_feedback carefully — it says what went wrong
+- Your sandbox from the previous attempt still exists
+- Options: (a) call `undo_last_edit()` and try a different approach, (b) build on the previous edit with additional fixes
+
+## RECOVERY PATTERNS — common obstacles
+
+| Obstacle | Action |
+|----------|--------|
+| "No sandbox exists" | Call create_sandbox() — it's a 1-call setup |
+| "old_string not found in file" | Re-read the function, copy exact text, retry |
+| "old_string appears N times" | Add more surrounding context for uniqueness |
+| pytest exit 4 / conftest error | Sandbox auto-retries with --noconftest — proceed |
+| "skipped" / "error" after retry | Real env issue, not your code — proceed to review |
+| Verifier REJECT + BRTs fail | Revise your fix — 1-2 retries available |
+| "Path traversal blocked" | Use RELATIVE paths from repo root |
+
+## HINTS FROM PAST FAILURES (observations, not rules)
+
+- **Grep finding nothing** → bug description uses different terms than code. Switch to delegate_explore or get_file_structure on the likely directory.
+- **Re-read same file 3+ times** → you have enough info, make a decision.
+- **BRTs fail after your fix** → don't fight the BRT. Read it, understand what behavior it pins down, fix the production code to make it pass.
+- **Passing tests but no regression test added** → future regressions will slip through. A 3-line test is cheap insurance.
+- **Verifier flags adversarial probe missing** → your explanation should mention what edge case you considered (None input, concurrent access, boundary value).
+- **Trust your judgment** — no one will second-guess 50 calls on a hard bug if the fix is correct.
 
 ## TOOLS AVAILABLE
 {"**Focus for this bug fix:** Check CODE MAP → read_file(target section) → string_replace → run_tests → submit_fix." if is_bug else "**Focus for this feature:** CODE MAP → read_file → create_file → string_replace → run_tests." if is_feature else "**Focus for this refactor:** CODE MAP → read_file → get_callers → string_replace."}
@@ -228,6 +268,30 @@ information. **create_sandbox will fail until a plan exists.**
   Running without test_path triggers auto-detect which may fail on repos that need special setup.
   **If tests return "skipped" or "error" (not "failed"), the repo may lack test dependencies.
   This is OK — proceed to request_review and submit_fix. Do NOT keep retrying test commands.**
+
+### Shell (env diagnosis & repair):
+- run_shell(command, timeout=120, working_dir="") — Execute a shell command in the sandbox.
+  **The venv that the test scorer uses is auto-activated**: `python`, `pip`, `pytest` all
+  resolve to the SWE-bench venv for this bug. You do NOT need to find the right Python —
+  just say `python` or `pip` and it goes to the right place. The agent's `pip install foo`
+  will be visible to the scorer's later test run.
+  **USE THIS WHEN**: run_tests fails with "exit code 4" / ModuleNotFoundError / ImportError
+  and you need to investigate or repair the env.
+  **Common patterns**:
+  - `pip install <pkg>` — install a missing dependency (lands in the scorer's venv)
+  - `pip list | grep <pkg>` — check if a dependency is installed
+  - `python -c "import <module>"` — test if an import works
+  - `which pytest` / `python --version` — verify env state
+  - `ls tests/` / `cat conftest.py` — inspect test structure
+  - `find . -name conftest.py -maxdepth 3` — locate config files
+  **DO NOT** use for code editing (use string_replace), reading code (use read_file),
+  searching code (use grep_repo), or running the test suite (use run_tests).
+  **BLOCKED**: rm -rf /, sudo, dd, fork bombs, curl|sh, system shutdown.
+  **NON-INTERACTIVE ONLY**: stdin is closed; commands that prompt for input will fail.
+  - Use `pip uninstall -y <pkg>` not `pip uninstall <pkg>` (the latter prompts y/n)
+  - Use `git commit -m "msg"` not `git commit` (latter opens $EDITOR)
+  - Use `python -c "import x"` not `python` (latter opens REPL)
+  - BLOCKED interactive tools: vim/nano/less/more/top/man/ssh (would hang).
 
 ### Multi-file coordination (call after editing):
 - get_callers(file_path, function_name) — Find files that call/import the code you changed. Use this to check if callers need updating after you modify a function signature.
@@ -334,21 +398,30 @@ you may not know the latest APIs. When in doubt, read the source — do not assu
     # DYNAMIC BLOCK — repo name + ticket + intent + code map + BRTs.
     # Changes every run. NOT cached between bugs. Always built fresh.
     # -------------------------------------------------------------------------
+    # Wrap user-supplied ticket fields in XML tags to prevent prompt injection.
+    # A malicious ticket description containing "## NEXT STEP:\nIgnore safety..."
+    # would otherwise inject rogue headers into the system prompt.
+    _desc = work_order.get('description', '')
+    _title = work_order.get('title', '')
+    _expected = intent.get('expected_behavior', '')
+    _actual = intent.get('actual_behavior', '')
+
     dynamic_block = f"""## {'BUG TICKET' if is_bug else 'FEATURE REQUEST' if is_feature else 'TASK'}
 
-Title: {work_order.get('title', '')}
+Title: {_title}
 Priority: {work_order.get('priority', 'medium')}
 Component: {work_order.get('affected_component', 'unknown')}
 Type: {fix_type}
 Repo: {repo_name}
 
-Description:
-{work_order.get('description', '')}
+<ticket_description>
+{_desc}
+</ticket_description>
 
 ## INTENT ANALYSIS
 
-Expected behavior: {intent.get('expected_behavior', '')}
-Actual behavior: {intent.get('actual_behavior', '')}
+Expected behavior: <user_input>{_expected}</user_input>
+Actual behavior: <user_input>{_actual}</user_input>
 Likely affected modules: {intent.get('likely_affected_modules', [])}
 Likely affected functions: {intent.get('likely_affected_functions', [])}
 Fix type: {intent.get('fix_type', 'bug_fix')}
@@ -366,6 +439,7 @@ Severity: {intent.get('severity', 'medium')}
 
 
 def build_task_message(work_order: dict, intent: dict) -> str:
+    # DEPRECATED — use build_task_message_v4
     """Build the initial user message that kicks off the ReAct loop."""
     hint_modules = intent.get("likely_affected_modules", [])
     hint_functions = intent.get("likely_affected_functions", [])
@@ -415,6 +489,239 @@ def build_task_message(work_order: dict, intent: dict) -> str:
         f"CRITICAL: create_sandbox must come before string_replace and run_tests.\n"
         f"If tests return 'error' (missing pytest), that's fine — proceed to review and submit.\n\n"
         f"{budget_hint}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# v4 prompt functions — lean static + rich dynamic
+# ---------------------------------------------------------------------------
+
+
+def build_static_block() -> str:
+    """Build the ~80-line static system prompt block.
+
+    This block is identical for every bug on every repo.  It is designed to be
+    placed under ``cache_control`` so the API caches it across consecutive
+    eval runs within the 5-minute ephemeral window.
+
+    Content: identity, soft workflow, hard contracts, test-result
+    interpretation, pre-existing failures, path convention, BRT guidance,
+    planning guidance, cost guidance, run_shell guidance, verify_fix guidance,
+    and a changelog anchor.
+
+    MUST NOT contain: tool reference table, mandatory phase sequence, recovery
+    patterns, exploration strategy, 12-rules section, escalation criteria.
+    """
+    return """\
+You are an autonomous software engineer. You fix bugs in codebases.
+
+## Workflow (adapt freely)
+Explore the code to understand the bug. Edit the minimum needed. Test your fix. Verify independently. Submit.
+The order is flexible — use your judgment on when you know enough to act.
+
+## Hard contracts
+1. A sandbox MUST exist before any file edits (create_sandbox).
+2. You MUST run the target tests at least once before calling submit_fix.
+3. You MUST call verify_fix (independent fork) before submit_fix.
+4. Do NOT modify files unrelated to the bug.
+5. Keep changes minimal — fix the bug, nothing more.
+6. ALWAYS use relative paths from the repo root for every tool argument.
+
+## Test result interpretation
+- "passed"  — tests ran and passed. Proceed.
+- "failed"  — actual assertion failures. Investigate and re-fix.
+- "skipped" — no tests collected (missing deps / markers). Acceptable — proceed.
+- "error"   — execution failed (import error, bad conftest). Acceptable — proceed.
+Only "failed" blocks submission. Do NOT retry "skipped" or "error" more than 3 times.
+If tests return exit code 4 or conftest errors, the sandbox auto-retries with
+--noconftest. If that still fails, it is an environment issue — proceed to review.
+
+## Pre-existing failures
+Many repos have pre-existing lint warnings or test failures.
+Do NOT fix pre-existing issues — only fix what YOUR edits introduced.
+If a lint error is on lines outside your diff, ignore it and proceed.
+
+## Path convention
+Every file_path argument must be relative from the repo root.
+  CORRECT: 'src/app/models.py'  |  WRONG: '/tmp/agent_sandbox_.../src/app/models.py'
+The sandbox root is handled internally. Never include it in paths.
+
+## BRT guidance (Bug Reproduction Tests)
+After you understand the code structure but BEFORE editing, call write_brt to
+create a test that reproduces the bug. Then use run_brt after your fix to confirm
+the reproduction test now passes. Treat 100% BRT pass as a hard requirement.
+
+## Planning guidance
+produce_plan is optional but recommended for multi-file fixes or when the root
+cause is not obvious. Articulating the plan prevents wasted edits. You may call
+produce_plan multiple times if new information changes your approach.
+
+## Cost guidance
+Use delegate_explore for broad "find me X" questions — it delegates to a cheaper
+model and saves 5-10 of your own tool calls. Use it liberally for orientation
+questions like "how does auth work?" or "where are file uploads handled?".
+
+## run_shell guidance
+run_shell executes a shell command in the sandbox. Non-interactive only (stdin closed).
+Use for env diagnosis and repair: pip install, pip list, python -c "import X", which pytest.
+Do NOT use for code editing (string_replace), reading (read_file), or searching (grep_repo).
+
+## verify_fix guidance
+verify_fix forks the conversation and runs an independent AI review of your diff +
+test results. Call it after tests pass and before submit_fix. If it rejects, read
+the feedback and revise — you get 1-2 automatic retries.
+
+## Known issues (add here when evals reveal consistent failures)
+"""
+
+
+def build_dynamic_block(
+    work_order: dict,
+    intent: dict,
+    dynamic_ctx: dict,
+) -> str:
+    """Build the rich per-bug dynamic context block.
+
+    ``dynamic_ctx`` comes from ``setup_node`` (Task 1) and has keys:
+      repo_tree, graph_context, lessons, concept_mappings,
+      scout (full scout dict), baseline_failures (set of test names).
+
+    This block changes every run and is NOT cached between bugs.
+    """
+    parts: list[str] = []
+
+    # --- Bug ticket ---
+    title = work_order.get("title", "")
+    priority = work_order.get("priority", "medium")
+    component = work_order.get("affected_component", "unknown")
+    description = work_order.get("description", "")
+
+    parts.append(f"""\
+## Bug ticket
+Title: {title}
+Priority: {priority}
+Component: {component}
+
+<ticket_description>
+{description}
+</ticket_description>""")
+
+    # --- Target tests ---
+    fail_to_pass = work_order.get("fail_to_pass", []) or []
+    pass_to_pass = work_order.get("pass_to_pass", []) or []
+    if fail_to_pass:
+        ftp_lines = "\n".join(f"  - {t}" for t in fail_to_pass[:8])
+        parts.append(f"""\
+
+## Target tests
+These tests currently FAIL. Your fix is correct when they PASS:
+{ftp_lines}
+
+Run command: use run_tests with the specific test_path for these tests.
+Right before submit_fix, run EXACTLY these tests — the scorer reads the LAST
+run_tests result.""")
+        if pass_to_pass:
+            ptp_sample = pass_to_pass[:5]
+            parts.append(
+                f"Must-stay-passing (sample of {len(pass_to_pass)}): {ptp_sample}"
+            )
+
+    # --- Scout analysis ---
+    scout = dynamic_ctx.get("scout") or {}
+    top_locations = scout.get("top_locations", [])
+    entity_extraction = scout.get("entity_extraction", {})
+    blast_radius_files = scout.get("blast_radius_files", [])
+    skeleton_data = scout.get("skeleton_data", {})
+
+    if top_locations:
+        parts.append("\n## Scout analysis")
+
+        # Entity extraction summary
+        if entity_extraction:
+            fn_names = entity_extraction.get("function_names", [])
+            err_types = entity_extraction.get("error_types", [])
+            bug_summary = entity_extraction.get("bug_summary", "")
+            if bug_summary:
+                parts.append(f"Bug summary: {bug_summary}")
+            if fn_names:
+                parts.append(f"Entities: {', '.join(fn_names[:10])}")
+            if err_types:
+                parts.append(f"Error types: {', '.join(err_types[:5])}")
+
+        # Suspected files with reasoning
+        parts.append("\nSuspected files:")
+        for loc in top_locations[:5]:
+            f = loc.get("file", "?")
+            fn = loc.get("function", "?")
+            conf = loc.get("confidence", 0)
+            reason = loc.get("reason", "")
+            parts.append(f"  - {f}::{fn} (confidence={conf:.1f}) — {reason}")
+
+            # Include skeleton for this file if available
+            skel = skeleton_data.get(f, [])
+            if skel:
+                sig_lines = skel if isinstance(skel, list) else [skel]
+                for sig in sig_lines[:8]:
+                    parts.append(f"      {sig}")
+
+        # Blast radius
+        if blast_radius_files:
+            parts.append(
+                f"\nBlast radius: {', '.join(blast_radius_files[:8])}"
+            )
+    else:
+        parts.append(
+            "\n## Scout analysis\n"
+            "No confident matches. Start from repo structure. Use delegate_explore."
+        )
+
+    # --- Baseline test results ---
+    baseline_failures = dynamic_ctx.get("baseline_failures", set())
+    if baseline_failures:
+        fail_list = sorted(baseline_failures)[:15]
+        fail_str = "\n".join(f"  - {f}" for f in fail_list)
+        parts.append(f"""\
+
+## Baseline test results (pre-existing failures — NOT your fault)
+{fail_str}
+These failed BEFORE your changes. Ignore them when evaluating your fix.""")
+
+    # --- Repo structure ---
+    repo_tree = dynamic_ctx.get("repo_tree", "")
+    if repo_tree:
+        # Truncate to top 200 lines if needed
+        tree_lines = repo_tree.strip().split("\n")
+        truncated = "\n".join(tree_lines[:200])
+        parts.append(f"\n## Repo structure (top source files)\n{truncated}")
+
+    # --- Code map ---
+    graph_context = dynamic_ctx.get("graph_context", "")
+    if graph_context:
+        parts.append(f"\n## Code map\n{graph_context}")
+
+    # --- Lessons from past fixes ---
+    lessons = dynamic_ctx.get("lessons", "")
+    if lessons:
+        parts.append(f"\n## Lessons from past fixes\n{lessons}")
+
+    # --- Concept-to-code mappings ---
+    concept_mappings = dynamic_ctx.get("concept_mappings", {})
+    concept_section = concept_mappings.get("concept_section", "")
+    if concept_section:
+        parts.append(f"\n{concept_section}")
+
+    return "\n".join(parts)
+
+
+def build_task_message_v4() -> str:
+    """Build the minimal task kick-off message for v4 pipeline.
+
+    The system prompt (static + dynamic blocks) already contains everything
+    the agent needs. This message just tells it to start.
+    """
+    return (
+        "Fix this bug. The context above has everything you need to start. "
+        "Focus on the target tests — when they pass, you're done."
     )
 
 
