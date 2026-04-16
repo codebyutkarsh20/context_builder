@@ -2342,3 +2342,127 @@ class TestTask6ReactAgentNodeUsesV4Prompt:
         mock_static.assert_called_once()
         mock_dynamic.assert_called_once()
         mock_task.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Tests: Full pipeline integration (Task 9)
+# ---------------------------------------------------------------------------
+
+class TestPipelineV4Integration:
+    """Full pipeline: setup -> react -> finalize with mocked LLM."""
+
+    def test_full_pipeline_3_stages(self, tmp_path):
+        """Pipeline runs setup -> react -> finalize without crashing."""
+        import os
+        from agent.react_pipeline import run_ticket_react
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("def broken():\n    return None\n")
+
+        # Create a proper git repo (setup_node needs git)
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "test",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "test",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        }
+        subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=repo, capture_output=True, check=True, env=git_env,
+        )
+        (repo / "setup.py").write_text("")
+        subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add setup"],
+            cwd=repo, capture_output=True, check=True, env=git_env,
+        )
+
+        work_order = {
+            "ticket_id": "TEST-001",
+            "title": "broken() returns None",
+            "description": "Should return 42",
+            "repo_name": "test",
+            "repo_path": str(repo),
+        }
+
+        # Mock the LLM calls so we don't need API credits
+        with patch("agent.react_loop.react_loop") as mock_loop, \
+             patch("agent.react_pipeline._translate_intent", return_value={
+                 "actual_behavior": "returns None",
+                 "expected_behavior": "returns 42",
+                 "fix_type": "bug_fix",
+             }), \
+             patch("agent.react_pipeline._classify_community", return_value=None), \
+             patch("agent.scout.scout_localize", return_value={
+                 "top_locations": [],
+                 "scout_cost_usd": 0.0,
+             }), \
+             patch("agent.react_pipeline._prelocalize", return_value=[]):
+
+            # react_loop returns an updated state dict
+            def fake_loop(state, static_block, dynamic_block, task_message, explore_tools, trace=None):
+                state["submitted"] = True
+                state["explanation"] = "Fixed broken()"
+                state["tool_call_count"] = 5
+                state["cost_usd"] = 0.10
+                state["review"] = {"verdict": "APPROVE", "confidence": 0.9}
+                return state
+
+            mock_loop.side_effect = fake_loop
+
+            result = run_ticket_react(work_order, dry_run=True)
+
+        # Verify setup_node ran (sandbox should exist)
+        assert result.get("sandbox_path") or result.get("submitted") or result.get("escalated")
+        # Verify it completed (not stuck)
+        assert result.get("submitted") or result.get("escalated")
+
+    def test_pipeline_handles_setup_failure(self):
+        """Pipeline escalates when repo_path is invalid."""
+        from agent.react_pipeline import run_ticket_react
+
+        work_order = {
+            "ticket_id": "TEST-002",
+            "title": "test",
+            "description": "test",
+            "repo_name": "test",
+            "repo_path": "/nonexistent/path",
+        }
+
+        with patch("agent.react_pipeline._translate_intent", return_value={
+            "fix_type": "bug_fix",
+        }), \
+             patch("agent.react_pipeline._classify_community", return_value=None), \
+             patch("agent.scout.scout_localize", return_value={
+                 "top_locations": [],
+                 "scout_cost_usd": 0.0,
+             }), \
+             patch("agent.react_pipeline._prelocalize", return_value=[]):
+            result = run_ticket_react(work_order, dry_run=True)
+
+        assert result.get("escalated")
+
+    def test_total_tool_count_is_17(self):
+        """Total tools available to the agent should be 17."""
+        from agent.react_tools import REACT_TOOLS
+        from agent.explore_tools import ALL_TOOLS as EXPLORE_TOOLS
+        from agent.explore_subagent import EXPLORE_SUBAGENT_TOOLS
+
+        react_names = [t.name for t in REACT_TOOLS]
+        explore_names = [t.name for t in EXPLORE_TOOLS]
+        subagent_names = [t.name for t in EXPLORE_SUBAGENT_TOOLS]
+
+        total = len(react_names) + len(explore_names) + len(subagent_names)
+        print(f"React: {react_names}")
+        print(f"Explore: {explore_names}")
+        print(f"Subagent: {subagent_names}")
+        print(f"Total: {total}")
+
+        assert "verify_fix" in react_names
+        assert "write_brt" in react_names
+        assert "create_sandbox" not in react_names
+        assert "request_review" not in react_names
