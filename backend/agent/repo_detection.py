@@ -95,13 +95,19 @@ def detect_project(repo_dir: str | Path) -> dict[str, Any]:
         result["has_monorepo"] = True
 
     # --------------- Language detection ---------------
+    # Check both root AND nested (backend/, src/) for project markers.
+    # Monorepos like aria-ats have backend/requirements.txt, not root-level.
+    _python_markers = {"pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "requirements.txt"}
+    _js_markers = {"package.json", "tsconfig.json", "jsconfig.json"}
 
-    has_python = any(f in files for f in (
-        "pyproject.toml", "setup.py", "setup.cfg", "Pipfile", "requirements.txt",
-    ))
-    has_js_ts = any(f in files for f in (
-        "package.json", "tsconfig.json", "jsconfig.json",
-    ))
+    has_python = any(
+        f in _python_markers or f.split("/", 1)[-1] in _python_markers
+        for f in files
+    )
+    has_js_ts = any(
+        f in _js_markers or f.split("/", 1)[-1] in _js_markers
+        for f in files
+    )
     has_go = "go.mod" in files
     has_rust = "Cargo.toml" in files
 
@@ -134,7 +140,7 @@ def detect_project(repo_dir: str | Path) -> dict[str, Any]:
         result["package_manager"] = "npm"
     elif any(f in files for f in ("Pipfile.lock", "Pipfile")):
         result["package_manager"] = "pipenv"
-    elif any(f in files for f in ("pyproject.toml", "setup.py", "requirements.txt")):
+    elif has_python:
         result["package_manager"] = "pip"
     elif has_go:
         result["package_manager"] = "go"
@@ -287,6 +293,10 @@ def _detect_setup_commands(repo: Path, files: set[str], result: dict) -> None:
     if lang in ("python", "mixed"):
         if "requirements.txt" in files:
             result["setup_commands"].append("pip install -r requirements.txt")
+        elif any(f.endswith("/requirements.txt") for f in files):
+            # Monorepo: backend/requirements.txt or src/requirements.txt
+            req_file = next(f for f in files if f.endswith("/requirements.txt"))
+            result["setup_commands"].append(f"pip install -r {req_file}")
         elif "pyproject.toml" in files:
             result["setup_commands"].append("pip install -e .")
         elif "setup.py" in files:
@@ -372,20 +382,34 @@ def write_agent_config_from_detection(
 
     detected = detect_project(repo)
 
-    # Merge: existing > overrides > detected
+    # Merge: existing > overrides > detected.
+    # Treat "unknown" and empty strings as unset so fresh detection can override
+    # stale configs written by earlier (buggy) detection runs.
+    def _is_set(val: Any) -> bool:
+        if not val:
+            return False
+        if isinstance(val, str) and val.strip().lower() in ("", "unknown", "(none)"):
+            return False
+        return True
+
     merged: dict = {}
     for key in ("test_command", "test_args", "lint_command", "setup_commands", "env"):
-        # Use existing if set and non-empty
-        if existing.get(key):
+        if _is_set(existing.get(key)):
             merged[key] = existing[key]
-        elif overrides and overrides.get(key):
+        elif overrides and _is_set(overrides.get(key)):
             merged[key] = overrides[key]
-        elif detected.get(key):
+        elif _is_set(detected.get(key)):
             merged[key] = detected[key]
 
     # Always include language + package_manager for downstream consumers
-    merged["language"] = existing.get("language") or detected.get("language", "unknown")
-    merged["package_manager"] = existing.get("package_manager") or detected.get("package_manager", "unknown")
+    merged["language"] = (
+        existing.get("language") if _is_set(existing.get("language"))
+        else detected.get("language", "unknown")
+    )
+    merged["package_manager"] = (
+        existing.get("package_manager") if _is_set(existing.get("package_manager"))
+        else detected.get("package_manager", "unknown")
+    )
 
     # Copy pytest_path if we detected pytest
     if merged.get("test_command", "").startswith("pytest"):

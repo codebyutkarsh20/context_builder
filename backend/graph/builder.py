@@ -60,18 +60,19 @@ class GraphBuilder:
 
         self._upsert_repo(structure)
 
-        for parsed_file in parsed:
-            self._upsert_file(parsed_file)
-            self._upsert_classes(parsed_file)
-            self._upsert_functions(parsed_file)
+        # Batch upserts — collect all nodes first, then write in bulk UNWIND
+        # queries. ~100x faster than individual MERGE calls for large repos.
+        self._batch_upsert_files(parsed)
+        self._batch_upsert_classes(parsed)
+        self._batch_upsert_functions(parsed)
 
-        self._upsert_edges(graph_data)
-        self._apply_pagerank(graph_data)
+        self._batch_upsert_edges(graph_data)
+        self._batch_apply_pagerank(graph_data)
 
         if decision_points:
-            self._upsert_decision_points(decision_points)
+            self._batch_upsert_decision_points(decision_points)
         if domain_concepts:
-            self._upsert_domain_concepts(domain_concepts)
+            self._batch_upsert_domain_concepts(domain_concepts)
 
         # Remove nodes that disappeared from the repo since the last ingest
         if incremental and snapshot:
@@ -199,6 +200,257 @@ class GraphBuilder:
             "readme": structure.get("readme_content", ""),
         }
         neo4j_client.run(query, params)
+
+    # --- Batched upserts (preferred for large repos) --------------------
+
+    _BATCH_SIZE = 500
+
+    def _batch_upsert_files(self, parsed: list[Any]) -> None:
+        """Batch-upsert all File nodes using UNWIND."""
+        batch: list[dict] = []
+        for pf in parsed:
+            pf_dict = pf if isinstance(pf, dict) else vars(pf)
+            file_id = pf_dict.get("id") or pf_dict.get("path")
+            batch.append({
+                "id": file_id,
+                "path": pf_dict.get("path", ""),
+                "language": pf_dict.get("language", ""),
+                "loc": pf_dict.get("loc", 0),
+                "docstring": (pf_dict.get("docstring") or "")[:500],
+            })
+            self._track_seen("File", file_id)
+
+        query = (
+            "UNWIND $batch AS row "
+            "MERGE (f:File {id: row.id}) "
+            "SET f.path = row.path, f.language = row.language, "
+            "    f.loc = row.loc, f.docstring = row.docstring, "
+            "    f.last_seen = datetime() "
+            "WITH f, row "
+            "MATCH (r:Repo {name: $repo_name}) "
+            "MERGE (r)-[:CONTAINS]->(f)"
+        )
+        for i in range(0, len(batch), self._BATCH_SIZE):
+            neo4j_client.run(query, {"batch": batch[i:i + self._BATCH_SIZE], "repo_name": self.repo_name})
+        logger.info("Batch-upserted %d files.", len(batch))
+
+    def _batch_upsert_classes(self, parsed: list[Any]) -> None:
+        """Batch-upsert all Class nodes using UNWIND."""
+        batch: list[dict] = []
+        for pf in parsed:
+            pf_dict = pf if isinstance(pf, dict) else vars(pf)
+            file_id = pf_dict.get("id") or pf_dict.get("path")
+            for cls in pf_dict.get("classes", []) or []:
+                cls_dict = cls if isinstance(cls, dict) else vars(cls)
+                class_id = cls_dict.get("id") or f"{file_id}::{cls_dict.get('name', '')}"
+                batch.append({
+                    "id": class_id,
+                    "name": cls_dict.get("name", ""),
+                    "file_id": file_id,
+                    "bases": cls_dict.get("bases", []),
+                    "docstring": (cls_dict.get("docstring") or "")[:500],
+                    "line_start": cls_dict.get("line_start", 0),
+                    "line_end": cls_dict.get("line_end", 0),
+                    "is_test": cls_dict.get("is_test", False),
+                })
+                self._track_seen("Class", class_id)
+
+        query = (
+            "UNWIND $batch AS row "
+            "MERGE (c:Class {id: row.id}) "
+            "SET c.name = row.name, c.file = row.file_id, "
+            "    c.bases = row.bases, c.docstring = row.docstring, "
+            "    c.line_start = row.line_start, c.line_end = row.line_end, "
+            "    c.is_test = row.is_test, c.last_seen = datetime() "
+            "WITH c, row "
+            "MATCH (f:File {id: row.file_id}) "
+            "MERGE (f)-[:CONTAINS]->(c)"
+        )
+        for i in range(0, len(batch), self._BATCH_SIZE):
+            neo4j_client.run(query, {"batch": batch[i:i + self._BATCH_SIZE]})
+        logger.info("Batch-upserted %d classes.", len(batch))
+
+    def _batch_upsert_functions(self, parsed: list[Any]) -> None:
+        """Batch-upsert all Function nodes (top-level + methods) using UNWIND."""
+        # Collect top-level functions
+        fn_batch: list[dict] = []
+        method_batch: list[dict] = []
+        for pf in parsed:
+            pf_dict = pf if isinstance(pf, dict) else vars(pf)
+            file_id = pf_dict.get("id") or pf_dict.get("path")
+            for fn in pf_dict.get("functions", []) or []:
+                fn_dict = fn if isinstance(fn, dict) else vars(fn)
+                fn_id = fn_dict.get("id") or f"{file_id}::{fn_dict.get('name', '')}"
+                fn_batch.append(self._fn_to_row(fn_dict, fn_id, file_id))
+                self._track_seen("Function", fn_id)
+            # Collect methods from classes
+            for cls in pf_dict.get("classes", []) or []:
+                cls_dict = cls if isinstance(cls, dict) else vars(cls)
+                class_id = cls_dict.get("id") or f"{file_id}::{cls_dict.get('name', '')}"
+                for method in cls_dict.get("methods", []) or []:
+                    m_dict = method if isinstance(method, dict) else vars(method)
+                    m_id = m_dict.get("id") or f"{class_id}::{m_dict.get('name', '')}"
+                    row = self._fn_to_row(m_dict, m_id, file_id)
+                    row["parent_id"] = class_id
+                    method_batch.append(row)
+                    self._track_seen("Function", m_id)
+
+        # Top-level functions → linked to File
+        fn_query = (
+            "UNWIND $batch AS row "
+            "MERGE (fn:Function {id: row.id}) "
+            "SET fn.name = row.name, fn.file = row.file_id, "
+            "    fn.params = row.params, fn.return_type = row.return_type, "
+            "    fn.docstring = row.docstring, fn.decorators = row.decorators, "
+            "    fn.line_start = row.line_start, fn.line_end = row.line_end, "
+            "    fn.is_test = row.is_test, fn.last_seen = datetime() "
+            "WITH fn, row "
+            "MATCH (f:File {id: row.file_id}) "
+            "MERGE (f)-[:CONTAINS]->(fn)"
+        )
+        for i in range(0, len(fn_batch), self._BATCH_SIZE):
+            neo4j_client.run(fn_query, {"batch": fn_batch[i:i + self._BATCH_SIZE]})
+
+        # Methods → linked to Class
+        method_query = (
+            "UNWIND $batch AS row "
+            "MERGE (fn:Function {id: row.id}) "
+            "SET fn.name = row.name, fn.file = row.file_id, "
+            "    fn.params = row.params, fn.return_type = row.return_type, "
+            "    fn.docstring = row.docstring, fn.decorators = row.decorators, "
+            "    fn.line_start = row.line_start, fn.line_end = row.line_end, "
+            "    fn.is_test = row.is_test, fn.last_seen = datetime() "
+            "WITH fn, row "
+            "MATCH (c:Class {id: row.parent_id}) "
+            "MERGE (c)-[:CONTAINS]->(fn)"
+        )
+        for i in range(0, len(method_batch), self._BATCH_SIZE):
+            neo4j_client.run(method_query, {"batch": method_batch[i:i + self._BATCH_SIZE]})
+
+        logger.info("Batch-upserted %d functions + %d methods.", len(fn_batch), len(method_batch))
+
+    @staticmethod
+    def _fn_to_row(fn_dict: dict, fn_id: str, file_id: str) -> dict:
+        return {
+            "id": fn_id,
+            "name": fn_dict.get("name", ""),
+            "file_id": file_id,
+            "params": fn_dict.get("params", []),
+            "return_type": fn_dict.get("return_type", ""),
+            "docstring": (fn_dict.get("docstring") or "")[:500],
+            "decorators": fn_dict.get("decorators", []),
+            "line_start": fn_dict.get("line_start", 0),
+            "line_end": fn_dict.get("line_end", 0),
+            "is_test": fn_dict.get("is_test", False),
+        }
+
+    def _batch_upsert_edges(self, graph_data: dict[str, Any]) -> None:
+        """Batch-upsert edges using UNWIND, grouped by type."""
+        edges = graph_data.get("edges", []) or []
+        by_type: dict[str, list[dict]] = {}
+        for edge in edges:
+            etype = (edge.get("type") or "").upper()
+            if etype == "CONTAINS":
+                continue  # Handled during node upserts
+            source = edge.get("source")
+            target = edge.get("target")
+            if source and target:
+                by_type.setdefault(etype, []).append({"source": source, "target": target})
+
+        type_to_rel = {"IMPORTS": "IMPORTS", "CALLS": "CALLS", "INHERITS": "INHERITS", "TESTED_BY": "TESTED_BY"}
+        for etype, items in by_type.items():
+            rel = type_to_rel.get(etype)
+            if not rel:
+                continue
+            query = (
+                f"UNWIND $batch AS row "
+                f"MATCH (a {{id: row.source}}), (b {{id: row.target}}) "
+                f"MERGE (a)-[:{rel}]->(b)"
+            )
+            for i in range(0, len(items), self._BATCH_SIZE):
+                neo4j_client.run(query, {"batch": items[i:i + self._BATCH_SIZE]})
+            logger.info("Batch-upserted %d %s edges.", len(items), etype)
+
+    def _batch_apply_pagerank(self, graph_data: dict[str, Any]) -> None:
+        """Write pre-computed pagerank scores using UNWIND."""
+        raw = graph_data.get("hotspots") or []
+        if isinstance(raw, dict):
+            scores = [{"id": k, "score": float(v)} for k, v in raw.items()]
+        elif isinstance(raw, list) and raw:
+            scores = [{"id": e["id"], "score": float(e.get("pagerank", 0))} for e in raw if "id" in e]
+        else:
+            nodes = graph_data.get("nodes") or []
+            scores = [{"id": n["id"], "score": float(n.get("pagerank", 0))}
+                      for n in nodes if "id" in n and n.get("pagerank") is not None]
+        if not scores:
+            return
+        query = "UNWIND $batch AS row MATCH (n {id: row.id}) SET n.pagerank = row.score"
+        for i in range(0, len(scores), self._BATCH_SIZE):
+            neo4j_client.run(query, {"batch": scores[i:i + self._BATCH_SIZE]})
+        logger.info("Batch-applied pagerank to %d nodes.", len(scores))
+
+    def _batch_upsert_decision_points(self, decision_points: list[dict]) -> None:
+        """Batch-upsert DecisionPoint nodes using UNWIND."""
+        batch = [{
+            "id": dp["id"],
+            "line": dp.get("line", 0),
+            "condition": dp.get("condition", ""),
+            "condition_type": dp.get("condition_type", ""),
+            "explanation": dp.get("explanation", ""),
+            "question": dp.get("question_for_human", ""),
+            "file": dp.get("file", ""),
+            "function_id": dp.get("function_id", ""),
+        } for dp in decision_points]
+
+        query = (
+            "UNWIND $batch AS row "
+            "MERGE (dp:DecisionPoint {id: row.id}) "
+            "SET dp.line = row.line, dp.condition = row.condition, "
+            "    dp.condition_type = row.condition_type, dp.explanation = row.explanation, "
+            "    dp.question_for_human = row.question, dp.file = row.file "
+            "WITH dp, row "
+            "MATCH (fn:Function {id: row.function_id}) "
+            "MERGE (fn)-[:HAS_DECISION]->(dp)"
+        )
+        for i in range(0, len(batch), self._BATCH_SIZE):
+            neo4j_client.run(query, {"batch": batch[i:i + self._BATCH_SIZE]})
+        logger.info("Batch-upserted %d decision points.", len(batch))
+
+    def _batch_upsert_domain_concepts(self, domain_concepts: list[dict]) -> None:
+        """Batch-upsert DomainConcept nodes using UNWIND."""
+        batch = [{
+            "id": dc["id"],
+            "name": dc.get("name", ""),
+            "type": dc.get("type", "entity"),
+            "description": dc.get("description", ""),
+        } for dc in domain_concepts]
+
+        query = (
+            "UNWIND $batch AS row "
+            "MERGE (dc:DomainConcept {id: row.id}) "
+            "SET dc.name = row.name, dc.type = row.type, dc.description = row.description"
+        )
+        for i in range(0, len(batch), self._BATCH_SIZE):
+            neo4j_client.run(query, {"batch": batch[i:i + self._BATCH_SIZE]})
+
+        # Link to classes separately
+        link_batch: list[dict] = []
+        for dc in domain_concepts:
+            for cls_name in dc.get("related_classes", []):
+                link_batch.append({"dc_id": dc["id"], "class_name": cls_name})
+        if link_batch:
+            link_query = (
+                "UNWIND $batch AS row "
+                "MATCH (dc:DomainConcept {id: row.dc_id}), (c:Class) "
+                "WHERE c.name = row.class_name "
+                "MERGE (dc)-[:REPRESENTS]->(c)"
+            )
+            for i in range(0, len(link_batch), self._BATCH_SIZE):
+                neo4j_client.run(link_query, {"batch": link_batch[i:i + self._BATCH_SIZE]})
+
+        logger.info("Batch-upserted %d domain concepts.", len(batch))
+
+    # --- Legacy single-item upserts (kept for compatibility) -----------
 
     # --- Files ---------------------------------------------------------
 

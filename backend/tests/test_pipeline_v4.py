@@ -153,7 +153,7 @@ class TestSetupThreadRepo:
         assert result["branch_name"] == ""
 
     def test_handles_dirty_repo(self, tmp_path):
-        """Returns empty result when repo has uncommitted changes."""
+        """Auto-cleans dirty repo and still creates sandbox."""
         repo = _make_git_repo(tmp_path)
         # Make repo dirty (modified tracked file)
         (repo / "hello.py").write_text("print('modified')\n")
@@ -162,7 +162,8 @@ class TestSetupThreadRepo:
 
         result = _setup_thread_repo(repo, "test_repo")
 
-        assert result["sandbox_path"] == "", "should not create sandbox with dirty repo"
+        # v4: auto-reset dirty repos instead of aborting
+        assert result["sandbox_path"] != "", "should auto-clean and create sandbox"
 
     def test_captures_baseline_test_failures(self, tmp_path):
         """Captures pre-existing test failures as set[str]."""
@@ -2088,7 +2089,7 @@ class TestTask6ToolCollections:
     def test_react_tools_has_10_tools(self):
         """REACT_TOOLS should have exactly 10 tools."""
         from agent.react_tools import REACT_TOOLS
-        assert len(REACT_TOOLS) == 10
+        assert len(REACT_TOOLS) == 11  # +1 for create_sandbox fallback
 
     def test_edit_tools_composition(self):
         """EDIT_TOOLS: string_replace, create_file, undo_last_edit."""
@@ -2118,12 +2119,11 @@ class TestTask6ToolCollections:
         """Tools removed in v4 must NOT be in REACT_TOOLS."""
         from agent.react_tools import REACT_TOOLS
         tool_names = {t.name for t in REACT_TOOLS}
+        # create_sandbox kept as fallback for setup_node failures
         removed = {
-            "create_sandbox",
             "check_syntax",
             "get_blast_radius",
             "request_review",
-            "run_brt",
             "record_localization",
         }
         overlap = tool_names & removed
@@ -2464,5 +2464,6 @@ class TestPipelineV4Integration:
 
         assert "verify_fix" in react_names
         assert "write_brt" in react_names
-        assert "create_sandbox" not in react_names
+        # create_sandbox kept as fallback for when setup_node fails
+        assert "create_sandbox" in react_names
         assert "request_review" not in react_names

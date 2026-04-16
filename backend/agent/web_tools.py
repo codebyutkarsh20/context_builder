@@ -56,32 +56,59 @@ WEB_TOOLS_ENABLED = os.environ.get("ENABLE_WEB_TOOLS", "0") not in ("0", "", "fa
 # ---------------------------------------------------------------------------
 
 _cache_lock = threading.Lock()
-_url_cache: dict[str, tuple[float, str]] = {}  # url → (timestamp, markdown)
+# Cache keyed by URL for raw page content (shared across prompts)
+_page_cache: dict[str, tuple[float, str]] = {}  # url → (timestamp, markdown)
+# Cache keyed by (url, prompt_hash) for extractor answers
+_answer_cache: dict[str, tuple[float, str]] = {}  # "url|hash" → (timestamp, answer)
 
 
-def _cache_get(url: str) -> Optional[str]:
-    """Return cached markdown for url if still fresh, else None."""
+def _cache_get_page(url: str) -> Optional[str]:
+    """Return cached page markdown for url if still fresh, else None."""
     now = time.time()
     with _cache_lock:
-        entry = _url_cache.get(url)
+        entry = _page_cache.get(url)
         if entry is None:
             return None
         ts, md = entry
         if now - ts > WEB_FETCH_CACHE_TTL_SECONDS:
-            _url_cache.pop(url, None)
+            _page_cache.pop(url, None)
             return None
         return md
 
 
-def _cache_put(url: str, markdown: str) -> None:
+def _cache_put_page(url: str, markdown: str) -> None:
     with _cache_lock:
-        _url_cache[url] = (time.time(), markdown)
+        _page_cache[url] = (time.time(), markdown)
+
+
+def _cache_get_answer(url: str, prompt: str) -> Optional[str]:
+    """Return cached extractor answer for (url, prompt) if still fresh."""
+    import hashlib
+    key = f"{url}|{hashlib.md5(prompt.encode()).hexdigest()}"
+    now = time.time()
+    with _cache_lock:
+        entry = _answer_cache.get(key)
+        if entry is None:
+            return None
+        ts, ans = entry
+        if now - ts > WEB_FETCH_CACHE_TTL_SECONDS:
+            _answer_cache.pop(key, None)
+            return None
+        return ans
+
+
+def _cache_put_answer(url: str, prompt: str, answer: str) -> None:
+    import hashlib
+    key = f"{url}|{hashlib.md5(prompt.encode()).hexdigest()}"
+    with _cache_lock:
+        _answer_cache[key] = (time.time(), answer)
 
 
 def clear_web_cache() -> None:
-    """Clear the URL cache — useful for tests."""
+    """Clear all URL caches — useful for tests."""
     with _cache_lock:
-        _url_cache.clear()
+        _page_cache.clear()
+        _answer_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +190,16 @@ def web_fetch(url: str, prompt: str) -> str:
     if not fetch_url.startswith("https://"):
         return f"ERROR: url must be HTTP/HTTPS — got '{url[:80]}'"
 
-    # Cache check
-    markdown = _cache_get(fetch_url)
+    # SSRF protection — block requests to internal/private networks
+    if _is_private_url(fetch_url):
+        return f"ERROR: URL targets a private/internal network address — blocked for security."
+
+    # Check answer cache first (keyed by url+prompt), then page cache (url only)
+    cached_answer = _cache_get_answer(fetch_url, prompt)
+    if cached_answer is not None:
+        return f"=== WebFetch result for {fetch_url} [cached] ===\n\n{cached_answer}"
+
+    markdown = _cache_get_page(fetch_url)
     cache_hit = markdown is not None
 
     if not cache_hit:
@@ -206,7 +241,7 @@ def web_fetch(url: str, prompt: str) -> str:
         # Cap markdown too — extractor doesn't need 1MB of text
         if len(markdown) > 60_000:
             markdown = markdown[:60_000] + "\n[... page truncated to 60K chars]"
-        _cache_put(fetch_url, markdown)
+        _cache_put_page(fetch_url, markdown)
 
     # Run the extractor LLM
     extractor_prompt = (
@@ -235,7 +270,9 @@ def web_fetch(url: str, prompt: str) -> str:
     except Exception as e:
         return f"ERROR: extractor LLM failed: {type(e).__name__}: {e}"
 
-    cache_note = " [cached]" if cache_hit else ""
+    # Cache the extractor answer keyed by (url, prompt)
+    _cache_put_answer(fetch_url, prompt, answer)
+    cache_note = " [cached page]" if cache_hit else ""
     return f"=== WebFetch result for {fetch_url}{cache_note} ===\n\n{answer}"
 
 
@@ -245,6 +282,37 @@ def _host(url: str) -> str:
         return ""
     rest = url.split("://", 1)[1]
     return rest.split("/", 1)[0].lower()
+
+
+def _is_private_url(url: str) -> bool:
+    """Check if a URL targets a private/internal network (SSRF protection).
+
+    Blocks: localhost, 127.x.x.x, 10.x.x.x, 172.16-31.x.x, 192.168.x.x,
+    169.254.x.x (AWS metadata), [::1], 0.0.0.0.
+    """
+    import ipaddress
+    host = _host(url)
+    # Strip port if present
+    if ":" in host and not host.startswith("["):
+        host = host.rsplit(":", 1)[0]
+    host = host.strip("[]").lower()
+
+    # Direct hostname checks
+    if host in ("localhost", "0.0.0.0", "[::]", ""):
+        return True
+
+    # Try parsing as IP address
+    try:
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+    except ValueError:
+        pass
+
+    # Hostname-based checks (e.g., "metadata.google.internal")
+    if host.endswith(".internal") or host.endswith(".local"):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------

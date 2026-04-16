@@ -56,3 +56,11 @@ GEMINI.md
 
 # SWE-bench raw download (large, regenerated via CLI)
 backend/eval/swe_bugs.json
+
+# Eval subset datasets (generated per-session, not source)
+eval/next*.json
+eval/sympy_only.json
+
+# Temporary analysis docs (not project docs)
+REMAINING_BUGS.md
+SWE_BENCH_UI_TEST_BUGS.md

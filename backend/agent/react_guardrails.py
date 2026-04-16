@@ -130,7 +130,6 @@ def check_tool_call(
         return limit_error
 
     # Submit gate — require sandbox + at least attempted tests.
-    # Review is recommended but NOT required — the reviewer can be wrong.
     if tool_name == "submit_fix":
         hard_missing = []
         if not gs.sandbox_created:
@@ -142,6 +141,14 @@ def check_tool_call(
                 "ERROR: Cannot submit yet. Missing prerequisites:\n"
                 + "\n".join(f"  - {m}" for m in hard_missing)
             )
+        # Nudge: verify_fix before submit (checked before test warning —
+        # getting verification feedback is more actionable than a generic
+        # "tests failed" warning)
+        if not getattr(gs, "_verify_fix_called", False):
+            return (
+                "SUGGESTION: Call verify_fix(explanation) before submit_fix. "
+                "It gives you independent verification feedback you can act on."
+            )
         # Soft warnings — inform but don't block
         warnings = []
         if not gs.tests_passed and not gs.tests_skipped:
@@ -151,13 +158,6 @@ def check_tool_call(
 
     # ── Soft guidance (warnings only — never block exploration) ─────────
     # The agent needs freedom to explore. These are nudges, not walls.
-
-    # Nudge: verify_fix before submit — independent verification catches mistakes
-    if tool_name == "submit_fix" and not getattr(gs, "_verify_fix_called", False):
-        return (
-            "SUGGESTION: Call verify_fix(explanation) before submit_fix. "
-            "It gives you independent verification feedback you can act on."
-        )
 
     explore_tools = {"grep_repo", "read_file", "read_function", "list_files",
                      "get_file_structure", "get_function_info", "get_blast_radius"}

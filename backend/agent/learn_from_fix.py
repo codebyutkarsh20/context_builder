@@ -55,11 +55,17 @@ def _derive_tests_passed(state: dict) -> bool:
 
     The ReAct loop emits `run_outcome.tests_passed` as a trace event, but
     it's not stored on the state dict. So we check multiple fields:
-    test_result starts with "passed", OR verifier_verdict == APPROVE, OR
-    the eval scorer's full_pass flag (when available).
+    test_result starts with "passed"/"PASSED"/"PASS"/"passing", OR
+    verifier_verdict == APPROVE, OR the eval scorer's full_pass flag.
     """
-    test_result = str(state.get("test_result", "") or "")
-    if test_result.startswith("passed"):
+    test_result = str(state.get("test_result", "") or "").strip().lower()
+    # Handle multiple test runner output formats:
+    #   pytest: "passed" / "PASSED"
+    #   jest:   "PASS" / "Tests: X passed"
+    #   mocha:  "passing"
+    if test_result.startswith(("passed", "pass")):
+        return True
+    if "passing" in test_result[:50]:
         return True
     # Fallback: verifier approved with high confidence counts as "tests passed"
     # since the verifier assesses the full diff + test evidence
@@ -291,26 +297,37 @@ def record_lesson(state: dict) -> str | None:
     header = f"## [{ticket_id}] {date_str} {status_label}"
     entry_text = f"{header}\n{lesson_body.strip()}\n"
 
-    # Load existing lessons, append, trim, write back
+    # Load existing lessons, append, trim, write back.
+    # Use file locking to prevent concurrent writes from losing data
+    # (parallel eval runs on the same repo).
+    import fcntl
     lessons_path = _lessons_path(repo_name)
     try:
         lessons_path.parent.mkdir(parents=True, exist_ok=True)
-        existing = _parse_lessons(
-            lessons_path.read_text(encoding="utf-8") if lessons_path.exists() else ""
-        )
-        # Add the new entry at the tail
-        new_entry = {
-            "ticket_id": ticket_id,
-            "date": date_str,
-            "status": status_label,
-            "header": header,
-            "body": lesson_body.strip(),
-        }
-        existing.append(new_entry)
-        # Trim to MAX_LESSONS_STORED (keep the newest)
-        if len(existing) > MAX_LESSONS_STORED:
-            existing = existing[-MAX_LESSONS_STORED:]
-        lessons_path.write_text(_format_lessons(existing), encoding="utf-8")
+        # Open in append mode to create if needed, then lock
+        with open(lessons_path, "a+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                existing_text = f.read()
+                existing = _parse_lessons(existing_text)
+                # Add the new entry at the tail
+                new_entry = {
+                    "ticket_id": ticket_id,
+                    "date": date_str,
+                    "status": status_label,
+                    "header": header,
+                    "body": lesson_body.strip(),
+                }
+                existing.append(new_entry)
+                # Trim to MAX_LESSONS_STORED (keep the newest)
+                if len(existing) > MAX_LESSONS_STORED:
+                    existing = existing[-MAX_LESSONS_STORED:]
+                f.seek(0)
+                f.truncate()
+                f.write(_format_lessons(existing))
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
         logger.info(
             "Recorded lesson for %s/%s (%s), %d lessons total in %s",
             repo_name, ticket_id, status_label, len(existing), lessons_path,

@@ -698,8 +698,13 @@ def _setup_thread_repo(
                     l for l in porcelain.splitlines() if l and not l.startswith("??")
                 ).strip()
                 if dirty:
-                    logger.error("setup_thread_repo: repo has uncommitted changes")
-                    return result
+                    # Auto-clean dirty repos (common in eval — previous runs
+                    # may leave changes). Reset to HEAD so worktree creation works.
+                    logger.warning("setup_thread_repo: repo has uncommitted changes — auto-resetting")
+                    subprocess.run(
+                        ["git", "checkout", "."],
+                        cwd=repo_path, capture_output=True, timeout=30,
+                    )
 
                 # Prune stale worktrees
                 subprocess.run(
@@ -1149,10 +1154,21 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
 
     # Set tool context
     from agent.explore_tools import set_context, ALL_TOOLS as EXPLORE_TOOLS
-    from agent.react_tools import set_react_context, _tls as _react_tls
+    from agent.react_tools import set_react_context, set_sandbox_path, _tls as _react_tls
     set_context(repo_name, repo_path, DATA_DIR)
     fix_type = intent.get("fix_type", "bug_fix") if intent else "bug_fix"
     set_react_context(repo_name, repo_path, DATA_DIR, fix_type=fix_type)
+
+    # v4: setup_node already created the sandbox — propagate to thread-local
+    # so tools (string_replace, run_tests, write_brt, etc.) can find it.
+    sandbox_path = state.get("sandbox_path", "")
+    branch_name = state.get("branch_name", "")
+    base_branch = state.get("base_branch", "main")
+    if sandbox_path and Path(sandbox_path).exists():
+        set_sandbox_path(Path(sandbox_path), branch_name, base_branch)
+        logger.info("v4: sandbox propagated to tools: %s", sandbox_path)
+    else:
+        logger.warning("v4: no sandbox in state — agent will need to create one")
 
     # Make BRTs accessible to the run_brt tool via thread-local
     _react_tls.brts = state.get("brts", [])
@@ -1511,6 +1527,28 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
     base_branch = state.get("base_branch", "main")
     repo_path = _resolve_repo_path(work_order)
     dry_run = state.get("dry_run", False)
+
+    # Capture the git diff for observability — the actual patch the agent produced.
+    # Stored in trace so you can review the fix without checking out the branch.
+    if sandbox_path and Path(sandbox_path).exists() and trace:
+        try:
+            diff_result = subprocess.run(
+                ["git", "diff", "HEAD"],
+                cwd=sandbox_path, capture_output=True, text=True, timeout=30,
+            )
+            diff_text = diff_result.stdout[:20000]  # Cap at 20KB
+            state["_diff"] = diff_text
+            trace.emit("submission_diff", "finalize", {
+                "diff": diff_text,
+                "diff_lines": len(diff_text.splitlines()),
+                "diff_bytes": len(diff_text),
+                "files_changed": [
+                    l.split(" b/")[-1] for l in diff_text.splitlines()
+                    if l.startswith("diff --git")
+                ],
+            })
+        except Exception as e:
+            logger.debug("Diff capture failed: %s", e)
 
     if state.get("escalated") or not state.get("submitted"):
         reason = state.get("escalate_reason", "Agent did not submit or escalate")

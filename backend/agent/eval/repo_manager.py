@@ -17,8 +17,8 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = Path(os.environ.get("EVAL_REPOS_DIR", "eval/repos"))
-CLONE_TIMEOUT = 300  # 5 minutes
-CHECKOUT_TIMEOUT = 60
+CLONE_TIMEOUT = int(os.environ.get("EVAL_CLONE_TIMEOUT", "900"))  # 15 min — large repos (sympy, matplotlib)
+CHECKOUT_TIMEOUT = int(os.environ.get("EVAL_CHECKOUT_TIMEOUT", "180"))  # 3 min — fetch missing objects
 
 
 class RepoManager:
@@ -129,8 +129,70 @@ class RepoManager:
             self._clone(repo_url, repo_sha, repo_dir)
             return repo_dir.resolve()
 
+    def _get_base_clone(self, repo_url: str) -> Path | None:
+        """Return an existing clone of the same repo URL, if any.
+
+        Scans the cache dir for directories cloned from the same origin.
+        Used by _clone to do a cheap local clone (hardlinks) instead of
+        re-downloading from GitHub when we already have a copy at a
+        different SHA.  This turns 19 Django clones into 1 network clone
+        + 18 local copies (~5s each vs ~3min each).
+        """
+        for entry in self.cache_dir.iterdir():
+            if not entry.is_dir():
+                continue
+            git_dir = entry / ".git"
+            if not git_dir.exists():
+                continue
+            try:
+                result = subprocess.run(
+                    ["git", "remote", "get-url", "origin"],
+                    cwd=entry, capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip() == repo_url:
+                    logger.info("Found existing base clone: %s", entry.name)
+                    return entry
+            except Exception:
+                continue
+        return None
+
     def _clone(self, repo_url: str, sha: str, target_dir: Path) -> None:
-        """Clone repo with partial clone and checkout specific SHA."""
+        """Clone repo with partial clone and checkout specific SHA.
+
+        Optimization: if we already have ANY clone of the same repo URL
+        in the cache (at a different SHA), do a fast local clone from that
+        instead of re-downloading from GitHub. This saves ~3 min per bug
+        for repos with many bugs (Django: 19 bugs, Sympy: 12 bugs).
+        """
+        # --- Try local clone from existing base first ---------------------
+        base = self._get_base_clone(repo_url)
+        if base is not None:
+            logger.info(
+                "Local clone from %s → %s (skipping network)",
+                base.name, target_dir.name,
+            )
+            try:
+                subprocess.run(
+                    ["git", "clone", "--quiet", "--no-hardlinks",
+                     str(base), str(target_dir)],
+                    check=True, capture_output=True, text=True,
+                    timeout=120,  # local clone is fast (< 30s for Django)
+                )
+                # Point origin back to GitHub (not the local base) so that
+                # fetch fallback for missing SHAs still works.
+                subprocess.run(
+                    ["git", "remote", "set-url", "origin", repo_url],
+                    cwd=target_dir, capture_output=True, text=True, timeout=10,
+                )
+                # Jump to checkout below
+                self._checkout_sha(target_dir, sha, repo_url)
+                return
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                logger.warning("Local clone failed (%s), falling back to network", e)
+                if target_dir.exists():
+                    shutil.rmtree(target_dir, ignore_errors=True)
+
+        # --- Network clone (first bug for this repo) ---------------------
         logger.info("Cloning %s at %s → %s", repo_url, sha[:8], target_dir)
 
         # Partial clone (blobless) — downloads tree objects but fetches blobs on demand.
@@ -156,7 +218,10 @@ class RepoManager:
                 timeout=CLONE_TIMEOUT,
             )
 
-        # Checkout buggy SHA
+        self._checkout_sha(target_dir, sha, repo_url)
+
+    def _checkout_sha(self, target_dir: Path, sha: str, repo_url: str = "") -> None:
+        """Checkout a specific SHA, with fetch fallback for partial clones."""
         try:
             subprocess.run(
                 ["git", "checkout", "--quiet", sha],
@@ -167,9 +232,45 @@ class RepoManager:
                 timeout=CHECKOUT_TIMEOUT,
             )
         except subprocess.CalledProcessError as e:
+            err = (e.stderr or "").lower()
+            # Partial clones may not have all refs — fetch the specific SHA
+            if "did not match" in err or "unknown revision" in err or "pathspec" in err:
+                logger.info("SHA not present, fetching %s from origin", sha[:12])
+                try:
+                    subprocess.run(
+                        ["git", "fetch", "--quiet", "origin", sha, "--depth", "10"],
+                        cwd=target_dir, check=True, capture_output=True, text=True,
+                        timeout=CLONE_TIMEOUT,
+                    )
+                    subprocess.run(
+                        ["git", "checkout", "--quiet", sha],
+                        cwd=target_dir, check=True, capture_output=True, text=True,
+                        timeout=CHECKOUT_TIMEOUT,
+                    )
+                except subprocess.CalledProcessError:
+                    # Last resort: unshallow + retry
+                    logger.warning("Fetch-specific-SHA failed, attempting unshallow")
+                    try:
+                        subprocess.run(
+                            ["git", "fetch", "--quiet", "--unshallow"],
+                            cwd=target_dir, capture_output=True, text=True,
+                            timeout=CLONE_TIMEOUT,
+                        )
+                    except Exception:
+                        pass
+                    subprocess.run(
+                        ["git", "checkout", "--quiet", sha],
+                        cwd=target_dir, check=True, capture_output=True, text=True,
+                        timeout=CHECKOUT_TIMEOUT,
+                    )
+            else:
+                raise RuntimeError(
+                    f"Failed to checkout SHA {sha}: {e.stderr}"
+                ) from e
+        except subprocess.TimeoutExpired:
             raise RuntimeError(
-                f"Failed to checkout SHA {sha}: {e.stderr}"
-            ) from e
+                f"Checkout of {sha[:12]} timed out after {CHECKOUT_TIMEOUT}s — repo may be too large"
+            )
 
         logger.info("Cloned %s at %s", repo_url, sha[:8])
 
@@ -342,10 +443,15 @@ class RepoManager:
             )
 
         def _pip_install(spec: str) -> None:
-            subprocess.run(
+            result = subprocess.run(
                 [pip, "install", "--quiet", spec],
-                capture_output=True, timeout=90,
+                capture_output=True, text=True, timeout=90,
             )
+            if result.returncode != 0:
+                logger.warning(
+                    "pip install %s failed (rc=%d): %s",
+                    spec, result.returncode, (result.stderr or "")[:200],
+                )
 
         import_check = _import_check()
         err = import_check.stderr if import_check.returncode != 0 else ""
@@ -582,6 +688,50 @@ class RepoManager:
         stamp.write_text("ok")
 
         self._write_agent_config(repo_dir, venv_pytest, bug)
+
+        # Preflight health check — verify pytest can COLLECT tests before we
+        # spend 5 minutes running the agent. If conftest imports crash,
+        # exit_code=4 and we bail immediately instead of wasting LLM budget.
+        fail_to_pass = bug.get("fail_to_pass") or []
+        preflight_target = None
+        if fail_to_pass:
+            # Target the first FAIL_TO_PASS test file specifically — avoid full collection
+            first_test = fail_to_pass[0]
+            if "::" in first_test:
+                preflight_target = first_test.split("::")[0]
+            elif " " in first_test:
+                # Django unittest format: "test_name (module.Class.test_name)"
+                import re as _re
+                m = _re.search(r"\(([a-zA-Z0-9_.]+)\)", first_test)
+                if m:
+                    preflight_target = m.group(1).split(".")[0].replace(".", "/") + ".py"
+        try:
+            preflight_cmd = [str(venv_pytest), "--collect-only", "-q", "--no-header"]
+            if preflight_target and (repo_dir / preflight_target).exists():
+                preflight_cmd.append(preflight_target)
+            result = subprocess.run(
+                preflight_cmd, cwd=str(repo_dir),
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 4:
+                stderr_snippet = (result.stderr or "")[:300]
+                logger.warning(
+                    "PREFLIGHT FAIL (exit=4): pytest cannot collect tests in %s. "
+                    "Likely conftest import error. stderr: %s",
+                    repo_dir.name, stderr_snippet,
+                )
+                # Mark on the bug dict so the runner / pipeline can adapt.
+                # Don't remove stamp — we tried our best. The agent will be
+                # informed via work-order hint and can use --noconftest.
+                bug["_preflight_failed"] = True
+                bug["_preflight_stderr"] = stderr_snippet
+            else:
+                logger.info("Preflight OK for %s (collected tests successfully)", repo_dir.name)
+        except subprocess.TimeoutExpired:
+            logger.warning("Preflight check timed out for %s", repo_dir.name)
+        except Exception as e:
+            logger.debug("Preflight check skipped (%s)", e)
+
         logger.info("Venv ready: %s", venv_dir)
         return venv_dir
 

@@ -250,14 +250,32 @@ def react_loop(
     # on first string_replace (editing/recovery benefits from thinking). Once ON, stays ON.
     llm = llm_fast
 
-    # Two-block prompt caching strategy:
-    #   Block 1 (static_block): workflow, tools, rules, strategy — same for all bugs of the
-    #     same fix_type. cache_control applied here. Cached across consecutive eval bugs
-    #     that run within the 5-min Anthropic ephemeral window.
-    #   Block 2 (dynamic_block): repo name, ticket, intent, code map, BRTs — changes per bug.
-    #     No cache_control. Always fresh.
-    # Within one run (30+ LLM calls): both blocks are identical → both cached after call 1.
-    # Across eval bugs: block 1 cache hit saves ~3500 tokens × 0.9 per call.
+    # Prompt caching strategy — ORDER MATTERS for Anthropic's prefix cache.
+    #
+    # The cache matches the LONGEST byte-identical prefix. If any byte in the
+    # prefix changes, everything after it is uncached. So we put content in
+    # order of stability:
+    #
+    #   1. static_block (60 lines) — NEVER changes. Same for every bug.
+    #      cache_control breakpoint here → cached across ALL bugs in an eval
+    #      run (within the 5-min TTL window).
+    #
+    #   2. dynamic_block (~200 lines) — changes BETWEEN bugs but is STABLE
+    #      within one bug run (30+ LLM calls, all identical).
+    #      cache_control breakpoint here → cached for all calls within one bug.
+    #
+    #   3. task_message (2 lines) — identical within one bug (no breakpoint needed,
+    #      it's part of the prefix that's already covered by #2).
+    #
+    #   4. conversation messages — GROW every call. Never cached.
+    #
+    # Two breakpoints = two cache tiers:
+    #   - Tier 1 (static): hit rate ~100% across bugs in same eval batch
+    #   - Tier 2 (static+dynamic): hit rate ~100% within one bug (30+ calls)
+    #
+    # Previous bug: only static had cache_control → only 4,931 tokens cached
+    # out of 12K+ system prompt → 30% cache ratio. With both breakpoints →
+    # 90%+ cache ratio within a bug run.
     messages: list = [
         SystemMessage(
             content=[
@@ -269,6 +287,7 @@ def react_loop(
                 {
                     "type": "text",
                     "text": dynamic_block,
+                    "cache_control": {"type": "ephemeral"},
                 },
             ]
         ),
@@ -290,6 +309,10 @@ def react_loop(
             difficulty = "single-file"
     call_budget = budget_for_difficulty(difficulty)
     gs = GuardrailState(max_tool_calls=call_budget)
+    # Wire GuardrailState to thread-local so tools (write_brt, etc.) can
+    # access gs.files_read and gs.file_cache for context-aware generation.
+    from agent.react_tools import set_guardrail_state
+    set_guardrail_state(gs)
     # Per-run microcompact state — tracks which tool_call_ids have been
     # replaced with placeholders. Idempotent: same tool_call_id always maps
     # to the same placeholder string, so the message prefix stays byte-stable
@@ -419,11 +442,18 @@ def react_loop(
         # read_file) — fast LLM is sufficient.  Once editing starts, decisions
         # get hard (right fix? revert? edge cases?) — thinking helps.
         # Once ON, stays ON for the rest of the run.
-        if llm is llm_fast and gs.string_replace_count >= 1:
+        # v4 thinking triggers: first edit OR test failure OR verify_fix rejection
+        _should_think = (
+            gs.string_replace_count >= 1
+            or (gs.tests_attempted and not gs.tests_passed and not gs.tests_skipped)
+            or getattr(gs, "_verify_fix_called", False)
+        )
+        if llm is llm_fast and _should_think:
             llm = llm_thinking
+            trigger = "edit" if gs.string_replace_count >= 1 else "test_failure" if gs.tests_attempted else "verify_fix"
             logger.info(
-                "Switched main loop to thinking LLM after first edit at call %d",
-                gs.tool_call_count,
+                "Switched to thinking LLM (trigger=%s) at call %d",
+                trigger, gs.tool_call_count,
             )
             if trace:
                 trace.emit("llm_mode_switch", "react_loop", {

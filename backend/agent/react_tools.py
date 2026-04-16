@@ -2093,6 +2093,36 @@ def write_brt() -> str:
 
     _tls.brts = confirmed_brts
 
+    # --- Emit BRT test code to trace for observability ---
+    # Stores the actual generated test code so reviewers can see what was tested
+    try:
+        from agent.react_loop import _get_trace
+        _trace = _get_trace() if callable(_get_trace) else None
+        if _trace is None:
+            # Fallback: try thread-local
+            import threading
+            _tl = threading.local()
+            _trace = getattr(_tl, "trace", None)
+    except Exception:
+        _trace = None
+    if _trace:
+        try:
+            _trace.emit("brt_generated", "react_loop", {
+                "total_candidates": candidate_count,
+                "confirmed_count": len(confirmed_brts),
+                "confirmed_brts": [
+                    {
+                        "description": b["description"],
+                        "target_function": b["target_function"],
+                        "test_code": b["test_code"][:2000],
+                        "fail_reason": b.get("fail_reason", ""),
+                    }
+                    for b in confirmed_brts
+                ],
+            })
+        except Exception:
+            pass
+
     # --- Format return message ---
     lines = [
         f"BRTs generated: {candidate_count} candidates, {len(confirmed_brts)} confirmed failing on original code.",
@@ -2127,14 +2157,17 @@ from agent.shell_tools import SHELL_TOOLS, run_shell  # noqa: E402
 
 EDIT_TOOLS = [string_replace, create_file, undo_last_edit]
 PLAN_TOOLS = [produce_plan]
+# create_sandbox kept as fallback — setup_node creates it, but if setup fails
+# (dirty repo, git error), the agent needs a way to create one itself.
+SANDBOX_TOOLS = [create_sandbox]
 TEST_TOOLS = [run_tests, run_shell, write_brt]
 COMPLETION_TOOLS = [verify_fix, submit_fix, escalate]
 
 # Legacy collections kept for backward compat (tests, old code paths)
 VERIFY_TOOLS = [verify_fix]
 BRT_TOOLS = [write_brt]
-SANDBOX_TOOLS = [create_sandbox, run_tests, run_brt]
+_LEGACY_SANDBOX_TOOLS = [create_sandbox, run_tests, run_brt]  # renamed to avoid overwrite
 MULTI_FILE_TOOLS = [get_callers]
 
 # All react-specific tools (exploration tools are added from explore_tools.py)
-REACT_TOOLS = EDIT_TOOLS + PLAN_TOOLS + TEST_TOOLS + COMPLETION_TOOLS
+REACT_TOOLS = EDIT_TOOLS + PLAN_TOOLS + SANDBOX_TOOLS + TEST_TOOLS + COMPLETION_TOOLS

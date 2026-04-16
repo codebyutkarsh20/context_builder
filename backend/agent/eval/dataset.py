@@ -29,12 +29,15 @@ OPTIONAL_FIELDS = {
     "swe_bench_id", "setup_commands", "test_command", "tags", "comments",
     "estimated_cost_usd", "local_repo_path", "fail_to_pass", "pass_to_pass",
     "nl_description",  # Business-language variant for natural-language eval
+    # SWE-bench Lite specific fields
+    "gold_patch", "test_patch", "version", "environment_setup_commit",
+    "hints_text",
 }
 
 VALID_DIFFICULTIES = {"single-file", "multi-file"}
 VALID_CATEGORIES = {
     "logic-error", "type-error", "missing-check", "regression",
-    "api-misuse", "config", "data-handling", "unknown",
+    "api-misuse", "config", "data-handling", "bug-fix", "unknown",
 }
 VALID_PRIORITIES = {"low", "medium", "high", "critical"}
 

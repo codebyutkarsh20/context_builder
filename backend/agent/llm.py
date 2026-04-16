@@ -79,12 +79,42 @@ def structured_call(model: str, max_tokens: int, schema: type, prompt: str, retr
     except Exception as first_err:
         if retries <= 0:
             raise
-        logger.warning("Structured output failed (%s), retrying", first_err)
-        error_msg = str(first_err)[:1000]
+        err_str = str(first_err)
+        is_truncation = "max_tokens" in err_str.lower() or "incomplete" in err_str.lower()
+        logger.warning("Structured output failed (%s), retrying%s",
+                        first_err, " (truncation — increasing max_tokens)" if is_truncation else "")
+
+        # If truncated, retry with more tokens and a shorter prompt
+        retry_llm = llm
+        if is_truncation:
+            retry_llm = ChatAnthropic(
+                model=model, max_tokens=max_tokens + 1000, timeout=120.0, max_retries=1,
+            )
+            structured = retry_llm.with_structured_output(schema)
+            # Trim the prompt to leave room for the response
+            if len(prompt) > 20000:
+                prompt = prompt[:20000] + "\n[... prompt trimmed for retry]"
+
+        error_msg = err_str[:500]
         retry_prompt = (
-            f"Your previous response failed: {error_msg}\n"
-            "Please try again. Respond with the exact structured data requested.\n\n"
+            f"Your previous response was incomplete: {error_msg}\n"
+            "Please respond with ALL required fields. Be concise.\n\n"
             + prompt
         )
         result = structured.invoke(retry_prompt)
         return result
+
+
+def simple_call(model: str, prompt: str, max_tokens: int = 500) -> str:
+    """Simple text-in, text-out LLM call (no structured output).
+
+    Used for lightweight tasks like skeleton narrowing, ensemble voting,
+    and vague-description generation where we just need free-form text.
+    """
+    global ChatAnthropic
+    if ChatAnthropic is None:
+        ChatAnthropic = _get_chat_anthropic()
+
+    llm = ChatAnthropic(model=model, max_tokens=max_tokens, timeout=60.0, max_retries=1)
+    result = llm.invoke(prompt)
+    return result.content if hasattr(result, "content") else str(result)

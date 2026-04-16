@@ -113,6 +113,98 @@ def get_eval_results(repo: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Trace browsing — historical eval traces
+# ---------------------------------------------------------------------------
+
+@router.get("/traces")
+def list_trace_runs() -> list[dict]:
+    """List all eval runs that have traces, newest first."""
+    from pathlib import Path
+    import json
+
+    traces_dir = Path("eval/results/traces")
+    if not traces_dir.exists():
+        return []
+
+    runs = []
+    for run_dir in sorted(traces_dir.iterdir(), key=lambda d: d.stat().st_mtime, reverse=True):
+        if not run_dir.is_dir():
+            continue
+        bug_files = list(run_dir.glob("*.json"))
+        # Read first trace for summary metadata
+        summary = {}
+        if bug_files:
+            try:
+                with open(bug_files[0]) as f:
+                    first = json.load(f)
+                summary = {
+                    "started_at": first.get("started_at", ""),
+                    "total_duration_ms": first.get("total_duration_ms", 0),
+                }
+            except Exception:
+                pass
+        runs.append({
+            "run_id": run_dir.name,
+            "bug_count": len(bug_files),
+            "bugs": [f.stem.replace("_react", "") for f in sorted(bug_files)],
+            **summary,
+        })
+    return runs
+
+
+@router.get("/traces/{run_id}")
+def list_trace_bugs(run_id: str) -> list[dict]:
+    """List bugs in a specific trace run with summary metrics."""
+    from pathlib import Path
+    import json
+
+    trace_dir = Path("eval/results/traces") / run_id
+    if not trace_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Trace run '{run_id}' not found")
+
+    bugs = []
+    for tf in sorted(trace_dir.glob("*.json")):
+        try:
+            with open(tf) as f:
+                t = json.load(f)
+            outcome = {}
+            for e in t.get("events", []):
+                if e.get("event_type") == "run_outcome":
+                    outcome = e.get("data", {})
+                    break
+            bugs.append({
+                "bug_id": tf.stem.replace("_react", ""),
+                "outcome": outcome.get("outcome", "unknown"),
+                "tool_calls": outcome.get("tool_call_count", 0),
+                "cost_usd": outcome.get("cost_usd", 0),
+                "elapsed_s": outcome.get("elapsed_seconds", 0),
+                "submitted": outcome.get("submitted", False),
+                "tests_passed": outcome.get("tests_passed", False),
+                "review_verdict": outcome.get("review_verdict", ""),
+            })
+        except Exception:
+            bugs.append({"bug_id": tf.stem, "outcome": "error"})
+    return bugs
+
+
+@router.get("/traces/{run_id}/{bug_id}")
+def get_trace_detail(run_id: str, bug_id: str) -> dict:
+    """Get full trace for a specific bug in a run."""
+    from pathlib import Path
+    import json
+
+    trace_file = Path("eval/results/traces") / run_id / f"{bug_id}_react.json"
+    if not trace_file.exists():
+        # Try without _react suffix
+        trace_file = Path("eval/results/traces") / run_id / f"{bug_id}.json"
+    if not trace_file.exists():
+        raise HTTPException(status_code=404, detail=f"Trace '{bug_id}' not found in run '{run_id}'")
+
+    with open(trace_file) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
 # Background runner
 # ---------------------------------------------------------------------------
 

@@ -528,6 +528,12 @@ def _bug_to_work_order(bug: dict, repo_path: Path, natural_lang: bool = False) -
         wo["setup_commands"] = bug["setup_commands"]
     if bug.get("test_timeout"):
         wo["test_timeout"] = bug["test_timeout"]
+    # Surface preflight failure to the pipeline so it can warn the agent
+    # and adapt scoring (test failures here are mostly infra noise, not
+    # fix-quality signal).
+    if bug.get("_preflight_failed"):
+        wo["_preflight_failed"] = True
+        wo["_preflight_stderr"] = bug.get("_preflight_stderr", "")
     return wo
 
 

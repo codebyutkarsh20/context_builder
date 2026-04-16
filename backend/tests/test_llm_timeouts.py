@@ -33,7 +33,7 @@ class TestStructuredCallConfig:
 
     def test_error_truncation_in_source(self):
         src = inspect.getsource(_structured_call)
-        assert "[:1000]" in src
+        assert "[:500]" in src
 
 
 class TestStructuredCallRetry:
@@ -86,10 +86,10 @@ class TestStructuredCallRetry:
         # Check the retry prompt
         retry_call = mock_structured.invoke.call_args_list[1]
         retry_prompt = retry_call[0][0]
-        # Error should be truncated to 1000 chars (increased from 300 to preserve
-        # more of ValidationError detail without blowing up context window)
-        assert "x" * 1000 in retry_prompt
-        assert "x" * 1001 not in retry_prompt
+        # Error should be truncated to 500 chars (keeps retry prompt concise
+        # while preserving enough detail for the LLM to understand the issue)
+        assert "x" * 500 in retry_prompt
+        assert "x" * 501 not in retry_prompt
 
     @patch("agent.llm.ChatAnthropic")
     def test_both_calls_fail_raises(self, mock_cls):

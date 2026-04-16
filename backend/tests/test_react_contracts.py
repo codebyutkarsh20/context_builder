@@ -116,6 +116,7 @@ class TestGuardrailSubmitGate:
         gs.tests_passed = False
         gs.tests_skipped = False  # Not skipped — actually failed
         gs.review_approved = True
+        gs._verify_fix_called = True  # v4: verify_fix nudge fires before test warning
         result = check_tool_call("submit_fix", {}, gs)
         assert result is not None
         assert "tests failed" in result.lower() or "run_tests" in result

@@ -26,6 +26,7 @@ def run_tests(
     repo_path: "str | Path | None" = None,
     agent_config: "AgentConfig | None" = None,
     test_path: str = "",
+    edited_langs: "set[str] | None" = None,
 ) -> str:
     """Auto-detect test runner and execute tests.
 
@@ -44,6 +45,10 @@ def run_tests(
             the config is loaded automatically.
         test_path: Optional specific test file/dir/node to run. When provided,
             this overrides test_pattern from config and auto-detection.
+        edited_langs: Optional set of language tags for edited files
+            ({'python', 'js', 'ts', 'go', 'rust'}). Used to prefer the matching
+            test runner when auto-detection finds multiple options — avoids
+            running pytest on a JS-only change.
 
     Returns:
         A human-readable string starting with "passed", "failed", "skipped",
@@ -75,6 +80,32 @@ def run_tests(
         setup_commands = agent_config.setup_commands
         test_pattern = agent_config.test_pattern
 
+        # Override: if the agent edited ONLY JS/TS files but config says pytest,
+        # switch to npm test. The config was configured for the default language
+        # but agent-modified files trump that preference.
+        _edited = edited_langs or set()
+        _js_only = bool(_edited & {"js", "ts"}) and not (_edited & {"python"})
+        _py_config = any(
+            kw in (test_cmd_base or "").lower()
+            for kw in ("pytest", "python", "tox", "unittest", "nose")
+        )
+        if _js_only and _py_config:
+            # Look for package.json in worktree or one level deep to pick npm test
+            _pkg_json_dir = None
+            for candidate in [worktree_path] + sorted(worktree_path.iterdir()):
+                if candidate.is_dir() and (candidate / "package.json").exists():
+                    _pkg_json_dir = candidate
+                    break
+            if _pkg_json_dir:
+                logger.info(
+                    "Agent edited only JS/TS — overriding config's pytest with npm test in %s",
+                    _pkg_json_dir.name,
+                )
+                test_cmd_base = "npm test --silent"
+                test_args = []
+                agent_config._cfg = dict(agent_config._cfg)
+                agent_config._cfg["test_cwd"] = str(_pkg_json_dir.relative_to(worktree_path)) or "."
+
         env = {**os.environ, **extra_env}
         # Prepend worktree source so modified code takes precedence over installed pkg.
         # Only inject PYTHONPATH for Python test runners — npm/go/cargo ignore it,
@@ -93,12 +124,36 @@ def run_tests(
         for cmd in setup_commands:
             logger.info("Running setup command: %s", cmd)
             try:
-                subprocess.run(
+                result = subprocess.run(
                     shlex.split(cmd), cwd=str(worktree_path),
-                    env=env, timeout=120, capture_output=True,
+                    env=env, timeout=180, capture_output=True, text=True,
                 )
+                if result.returncode != 0:
+                    logger.warning(
+                        "Setup command failed (rc=%d): %s\nstderr: %s",
+                        result.returncode, cmd, (result.stderr or "")[:300],
+                    )
+                else:
+                    logger.info("Setup command OK: %s", cmd)
             except Exception as e:
-                logger.warning("Setup command failed: %s — %s", cmd, e)
+                logger.warning("Setup command exception: %s — %s", cmd, e)
+
+        # Ensure pytest is available if the test command needs it
+        if _is_python_runner and "pytest" in (test_cmd_base or "").lower():
+            try:
+                check = subprocess.run(
+                    [sys.executable, "-m", "pytest", "--version"],
+                    capture_output=True, timeout=10,
+                )
+                if check.returncode != 0:
+                    logger.info("pytest not found — installing as fallback")
+                    subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "pytest", "-q"],
+                        cwd=str(worktree_path), env=env, timeout=60,
+                        capture_output=True,
+                    )
+            except Exception:
+                pass
 
         # Determine working directory (test_cwd lets frontend/subproject configs work)
         test_cwd = agent_config.test_cwd
@@ -133,6 +188,37 @@ def run_tests(
                 timeout=timeout,
             )
             raw_output = (result.stdout + "\n" + result.stderr).strip()
+
+            # Exit 4 = pytest usage error, often conftest import failure.
+            # Retry with --noconftest to bypass broken conftest, targeting only
+            # the specific test path. Saves bugs where agent's fix is correct
+            # but conftest has unrelated import issues.
+            is_pytest = "pytest" in (cmd_parts[0] if cmd_parts else "") or (
+                len(cmd_parts) >= 2 and "pytest" in cmd_parts[1]
+            )
+            if result.returncode == 4 and is_pytest:
+                # Drop trailing test_path/test_pattern arg (if present) so we can
+                # rebuild the command with --noconftest before re-appending.
+                base_cmd = list(cmd_parts)
+                appended = test_path or test_pattern
+                if appended and base_cmd and base_cmd[-1] == appended:
+                    base_cmd = base_cmd[:-1]
+                retry_cmd = base_cmd + ["--noconftest"]
+                if appended:
+                    retry_cmd.append(appended)
+                logger.info("pytest exit 4 — retrying with --noconftest: %s", " ".join(retry_cmd))
+                try:
+                    retry = subprocess.run(
+                        retry_cmd, cwd=str(run_dir), env=env,
+                        capture_output=True, text=True, timeout=timeout,
+                    )
+                    retry_output = (retry.stdout + "\n" + retry.stderr).strip()
+                    if retry.returncode in (0, 1):  # passed or real test failure
+                        logger.info("--noconftest retry succeeded (rc=%d)", retry.returncode)
+                        return _format_test_output(retry.returncode, retry_output, timeout)
+                except Exception as e:
+                    logger.debug("--noconftest retry failed: %s", e)
+
             return _format_test_output(result.returncode, raw_output, timeout)
         except subprocess.TimeoutExpired:
             logger.warning("Tests timed out after %ds", timeout)
@@ -148,15 +234,41 @@ def run_tests(
 
     test_cwd = worktree_path
     cmd = None
+
+    # If edited_langs tells us what the agent touched, prefer the matching runner.
+    # Prevents running pytest when the agent only edited .js/.ts files.
+    _edited = edited_langs or set()
+    _prefer_js = bool(_edited & {"js", "ts"}) and not (_edited & {"python"})
+    _prefer_py = bool(_edited & {"python"}) and not (_edited & {"js", "ts"})
+    _prefer_go = "go" in _edited and not (_edited & {"python", "js", "ts"})
+    _prefer_rust = "rust" in _edited and not (_edited & {"python", "js", "ts"})
+
     for search_dir in [worktree_path] + sorted(worktree_path.iterdir()):
         if not search_dir.is_dir():
             continue
+        # JS first when agent edited JS/TS
+        if _prefer_js and (search_dir / "package.json").exists() and cmd is None:
+            cmd = ["npm", "test", "--silent"]
+            test_cwd = search_dir
+            break
+        if _prefer_go and (search_dir / "go.mod").exists() and cmd is None:
+            cmd = ["go", "test", "./..."]
+            test_cwd = search_dir
+            break
+        if _prefer_rust and (search_dir / "Cargo.toml").exists() and cmd is None:
+            cmd = ["cargo", "test"]
+            test_cwd = search_dir
+            break
+        # Default precedence: pytest first (most common), then npm/go/cargo/make
         if any((search_dir / m).exists() for m in pytest_markers):
+            # Skip pytest if agent edited ONLY frontend files
+            if _prefer_js:
+                continue
             cmd = [sys.executable, "-m", "pytest", "--tb=short", "-q"]
             test_cwd = search_dir
             break
         if (search_dir / "package.json").exists() and cmd is None:
-            cmd = ["npm", "test"]
+            cmd = ["npm", "test", "--silent"]
             test_cwd = search_dir
         if (search_dir / "go.mod").exists() and cmd is None:
             cmd = ["go", "test", "./..."]
@@ -264,6 +376,15 @@ def _format_test_output(returncode: int, raw_output: str, timeout: int) -> str:
         "command not found",
         "no such file or directory",
         "modulenotfounderror: no module named",
+        # New markers — conftest.py import failures, cython compile errors,
+        # collection errors. These were previously mis-classified as real failures.
+        "error in conftest",
+        "failed to import test module",
+        "errors while collecting",
+        "no matching distribution found",
+        "cython",
+        "compilation error",
+        "usage: pytest",  # pytest exit 4 usage error
     ]
     # Only treat as infra error if these appear in the FIRST few lines (top-level import failure)
     # not in test assertion output (which might mention ModuleNotFoundError as expected behavior)

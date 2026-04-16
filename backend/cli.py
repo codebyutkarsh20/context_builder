@@ -9,6 +9,19 @@ Usage:
 import os
 import sys
 from pathlib import Path
+
+# Load .env from project root so DATA_DIR, ANTHROPIC_API_KEY, GH_TOKEN etc.
+# are consistent between CLI runs and the backend container. Without this,
+# CLI eval writes lessons to /tmp/context_builder (default) while the backend
+# writes to /data — splitting learnings across two locations.
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass  # dotenv is optional; env vars may come from the shell
+
 import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn

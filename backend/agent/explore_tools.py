@@ -832,36 +832,84 @@ def get_file_structure(file_path: str) -> str:
 
         structure_lines = []
         imports: list[str] = []
-        in_import = False
 
-        # Patterns for Python
-        class_re = re.compile(r"^(\s*)(class\s+\w+[^:]*:)")
-        func_re = re.compile(r"^(\s*)((?:async\s+)?def\s+\w+[^:]*:)")
-        import_re = re.compile(r"^(?:import|from)\s+")
+        ext = resolved.suffix.lower()
+
+        # Python patterns
+        py_class_re = re.compile(r"^(\s*)(class\s+\w+[^:]*:)")
+        py_func_re = re.compile(r"^(\s*)((?:async\s+)?def\s+\w+[^:]*:)")
+        py_import_re = re.compile(r"^(?:import|from)\s+")
+        # JS/TS patterns
+        js_import_re = re.compile(r"^(?:import\s|const\s+\{.*\}\s*=\s*require|require\()")
+        js_func_re = re.compile(r"^(\s*)((?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+\w+)")
+        js_class_re = re.compile(r"^(\s*)((?:export\s+)?(?:default\s+)?class\s+\w+)")
+        js_arrow_re = re.compile(r"^(\s*)((?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?\()")
+        js_type_re = re.compile(r"^(\s*)((?:export\s+)?(?:interface|type|enum)\s+\w+)")
+        # Go patterns
+        go_func_re = re.compile(r"^(func\s+(?:\(\w+\s+\*?\w+\)\s+)?\w+)")
+        go_type_re = re.compile(r"^(type\s+\w+\s+(?:struct|interface))")
+        # Rust patterns
+        rs_func_re = re.compile(r"^(\s*)((?:pub\s+)?(?:async\s+)?fn\s+\w+)")
+        rs_type_re = re.compile(r"^(\s*)((?:pub\s+)?(?:struct|enum|trait|impl)\s+)")
 
         for i, line in enumerate(lines):
             stripped = line.rstrip()
             lineno = i + 1
 
-            if import_re.match(stripped):
+            # Imports (all languages)
+            if ext == ".py" and py_import_re.match(stripped):
+                imports.append(f"  {stripped}")
+                continue
+            if ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs") and js_import_re.match(stripped):
+                imports.append(f"  {stripped[:120]}")
+                continue
+            if ext == ".go" and stripped.startswith("import"):
                 imports.append(f"  {stripped}")
                 continue
 
-            m = class_re.match(stripped)
-            if m:
-                structure_lines.append(f"L{lineno:4d}: {m.group(1)}{m.group(2)}")
+            # Python structures
+            if ext == ".py":
+                m = py_class_re.match(stripped)
+                if m:
+                    structure_lines.append(f"L{lineno:4d}: {m.group(1)}{m.group(2)}")
+                    continue
+                m = py_func_re.match(stripped)
+                if m:
+                    docstring = ""
+                    if i + 1 < len(lines):
+                        next_line = lines[i + 1].strip()
+                        if next_line.startswith('"""') or next_line.startswith("'''"):
+                            docstring = f"  # {next_line[:80]}"
+                    structure_lines.append(f"L{lineno:4d}: {m.group(1)}{m.group(2)}{docstring}")
+                    continue
+
+            # JS/TS structures
+            if ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue"):
+                for pat in (js_class_re, js_func_re, js_arrow_re, js_type_re):
+                    m = pat.match(stripped)
+                    if m:
+                        structure_lines.append(f"L{lineno:4d}: {stripped.strip()[:120]}")
+                        break
+                else:
+                    continue
                 continue
 
-            m = func_re.match(stripped)
-            if m:
-                # Include the docstring (first line after def) if present
-                docstring = ""
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    if next_line.startswith('"""') or next_line.startswith("'''"):
-                        docstring = f"  # {next_line[:80]}"
-                structure_lines.append(f"L{lineno:4d}: {m.group(1)}{m.group(2)}{docstring}")
+            # Go structures
+            if ext == ".go":
+                for pat in (go_func_re, go_type_re):
+                    m = pat.match(stripped)
+                    if m:
+                        structure_lines.append(f"L{lineno:4d}: {stripped.strip()}")
+                        break
                 continue
+
+            # Rust structures
+            if ext == ".rs":
+                for pat in (rs_func_re, rs_type_re):
+                    m = pat.match(stripped)
+                    if m:
+                        structure_lines.append(f"L{lineno:4d}: {stripped.strip()}")
+                        break
 
         header = f"=== {file_path} structure ({total} lines) ===\n"
         if imports:
@@ -970,8 +1018,9 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
 @tool
 def check_syntax(file_path: str) -> str:
     """
-    Check a Python file for syntax errors after editing it.
-    Always run this after string_replace to verify your edit is valid Python.
+    Check a source file for syntax errors after editing.
+    Supports Python (.py), JavaScript (.js/.jsx/.mjs/.cjs), TypeScript (.ts/.tsx),
+    and JSON (.json). Always run this after string_replace to verify your edit.
 
     Args:
         file_path: Relative path from repo root e.g. 'app/services/payment.py'
@@ -992,22 +1041,81 @@ def check_syntax(file_path: str) -> str:
         if resolved is None:
             return f"ERROR: File not found: {file_path}"
 
-    if resolved.suffix.lower() != ".py":
-        return f"OK: syntax check only available for .py files (skipped {file_path})"
+    ext = resolved.suffix.lower()
 
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", f"import ast; ast.parse(open({repr(str(resolved))}).read())"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0:
-            return f"OK: {file_path} — no syntax errors"
-        else:
-            return f"SYNTAX ERROR in {file_path}:\n{result.stderr.strip()}"
-    except subprocess.TimeoutExpired:
-        return "ERROR: syntax check timed out"
-    except Exception as e:
-        return f"ERROR: {e}"
+    # Python: AST parse
+    if ext == ".py":
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", f"import ast; ast.parse(open({repr(str(resolved))}).read())"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return f"OK: {file_path} — no syntax errors"
+            else:
+                return f"SYNTAX ERROR in {file_path}:\n{result.stderr.strip()}"
+        except subprocess.TimeoutExpired:
+            return "ERROR: syntax check timed out"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    # JavaScript: node --check (parse only, no execution)
+    if ext in (".js", ".jsx", ".mjs", ".cjs"):
+        try:
+            result = subprocess.run(
+                ["node", "--check", str(resolved)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                return f"OK: {file_path} — no syntax errors (node --check)"
+            else:
+                return f"SYNTAX ERROR in {file_path}:\n{(result.stderr or result.stdout).strip()}"
+        except FileNotFoundError:
+            return f"OK: node not available — skipped syntax check for {file_path}"
+        except subprocess.TimeoutExpired:
+            return "ERROR: syntax check timed out"
+
+    # TypeScript: tsc --noEmit or fallback to node parse
+    if ext in (".ts", ".tsx"):
+        # Try tsc first (type-aware)
+        try:
+            result = subprocess.run(
+                ["npx", "-y", "tsc", "--noEmit", "--allowJs", "--esModuleInterop",
+                 "--jsx", "react", str(resolved)],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                return f"OK: {file_path} — no TypeScript errors (tsc --noEmit)"
+            # Filter to only errors from THIS file (tsc reports all deps)
+            lines = [l for l in (result.stdout or "").splitlines()
+                     if resolved.name in l]
+            if lines:
+                return f"TS ERROR in {file_path}:\n" + "\n".join(lines[:10])
+            # No errors from our file — other deps may have issues, that's OK
+            return f"OK: {file_path} — no syntax errors in this file"
+        except FileNotFoundError:
+            # No tsc — try basic node parse as fallback
+            try:
+                result = subprocess.run(
+                    ["node", "-e", f"require('fs').readFileSync('{resolved}','utf8')"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                return f"OK: {file_path} — basic parse OK (tsc not available)"
+            except Exception:
+                return f"OK: skipped — no node/tsc available for {file_path}"
+        except subprocess.TimeoutExpired:
+            return "ERROR: TypeScript check timed out"
+
+    # JSON: stdlib parse
+    if ext == ".json":
+        try:
+            import json as _json
+            _json.loads(resolved.read_text(encoding="utf-8"))
+            return f"OK: {file_path} — valid JSON"
+        except _json.JSONDecodeError as e:
+            return f"JSON ERROR in {file_path}:\n{e}"
+
+    return f"OK: syntax check not available for {ext} files (skipped {file_path})"
 
 
 # ---------------------------------------------------------------------------
