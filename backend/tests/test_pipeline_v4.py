@@ -1181,6 +1181,7 @@ class TestLegacyGatesRemoved:
         gs.tests_attempted = True
         gs.tests_passed = True
         gs.review_approved = False
+        gs._verify_fix_called = True
         result = check_tool_call("submit_fix", {}, gs)
         # Should pass cleanly — no warning about review
         if result is not None:
@@ -1857,3 +1858,221 @@ class TestOldFunctionsStillWork:
         )
         assert isinstance(result, str)
         assert "Fix this bug" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests: verify_fix nudge in guardrails (Task 5b)
+# ---------------------------------------------------------------------------
+
+class TestVerifyFixNudge:
+    """Tests for the verify_fix soft nudge in check_tool_call."""
+
+    def test_submit_without_verify_fix_returns_suggestion(self):
+        """submit_fix without prior verify_fix returns a SUGGESTION nudge."""
+        from agent.react_guardrails import GuardrailState, check_tool_call
+
+        gs = GuardrailState()
+        gs.sandbox_created = True
+        gs.tests_attempted = True
+        gs.tests_passed = True
+
+        result = check_tool_call("submit_fix", {}, gs)
+        assert result is not None
+        assert "SUGGESTION" in result
+        assert "verify_fix" in result
+
+    def test_submit_after_verify_fix_returns_none(self):
+        """submit_fix after verify_fix has been called returns None (no nudge)."""
+        from agent.react_guardrails import GuardrailState, check_tool_call
+
+        gs = GuardrailState()
+        gs.sandbox_created = True
+        gs.tests_attempted = True
+        gs.tests_passed = True
+        gs._verify_fix_called = True
+
+        result = check_tool_call("submit_fix", {}, gs)
+        assert result is None
+
+    def test_update_from_tool_result_sets_verify_fix_called(self):
+        """update_from_tool_result sets _verify_fix_called when tool is verify_fix."""
+        from agent.react_guardrails import GuardrailState, update_from_tool_result
+
+        gs = GuardrailState()
+        assert gs._verify_fix_called is False
+
+        update_from_tool_result("verify_fix", {}, "APPROVED (0.92)", gs)
+        assert gs._verify_fix_called is True
+
+    def test_hard_gate_still_blocks_before_nudge(self):
+        """Hard submit gate (no sandbox/tests) still blocks even without verify_fix."""
+        from agent.react_guardrails import GuardrailState, check_tool_call
+
+        gs = GuardrailState()
+        # No sandbox, no tests — hard gate should fire, not the soft nudge
+        result = check_tool_call("submit_fix", {}, gs)
+        assert result is not None
+        assert "ERROR" in result
+        assert "SUGGESTION" not in result
+
+
+# ---------------------------------------------------------------------------
+# Tests: _is_test_file helper and _score_localization_hit v4 fallback (Task 7)
+# ---------------------------------------------------------------------------
+
+class TestIsTestFile:
+    """Tests for the _is_test_file helper in scoring.py."""
+
+    def test_test_prefix(self):
+        from agent.eval.scoring import _is_test_file
+        assert _is_test_file("test_utils.py") is True
+
+    def test_test_suffix(self):
+        from agent.eval.scoring import _is_test_file
+        assert _is_test_file("utils_test.py") is True
+
+    def test_tests_directory(self):
+        from agent.eval.scoring import _is_test_file
+        assert _is_test_file("mypackage/tests/conftest.py") is True
+
+    def test_test_directory(self):
+        from agent.eval.scoring import _is_test_file
+        assert _is_test_file("mypackage/test/helpers.py") is True
+
+    def test_test_dot_prefix(self):
+        from agent.eval.scoring import _is_test_file
+        assert _is_test_file("test.py") is True
+
+    def test_source_file_not_test(self):
+        from agent.eval.scoring import _is_test_file
+        assert _is_test_file("flask/wrappers.py") is False
+
+    def test_deep_source_file_not_test(self):
+        from agent.eval.scoring import _is_test_file
+        assert _is_test_file("src/utils/helpers.py") is False
+
+    def test_file_with_test_in_name_but_not_test_file(self):
+        from agent.eval.scoring import _is_test_file
+        # "contest.py" contains "test" but is not a test file
+        assert _is_test_file("contest.py") is False
+
+    def test_empty_string(self):
+        from agent.eval.scoring import _is_test_file
+        assert _is_test_file("") is False
+
+
+class TestLocalizationHitV4Fallback:
+    """Tests for _score_localization_hit with v4 patch-based fallback."""
+
+    def test_primary_path_still_works(self):
+        """When localization.fault_files is populated, use it (no fallback)."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {
+            "localization": {"fault_files": ["flask/wrappers.py"]},
+            "repair": {"patches": []},
+        }
+        bug = {"expected_files": ["flask/wrappers.py"]}
+        assert _score_localization_hit(result, bug) is True
+
+    def test_primary_path_miss(self):
+        """Primary path with wrong file returns False."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {
+            "localization": {"fault_files": ["flask/app.py"]},
+            "repair": {"patches": []},
+        }
+        bug = {"expected_files": ["flask/wrappers.py"]}
+        assert _score_localization_hit(result, bug) is False
+
+    def test_fallback_from_patches(self):
+        """When fault_files is empty, infer from patches."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {
+            "localization": {},
+            "repair": {"patches": [
+                {"file_path": "flask/wrappers.py", "diff": "..."},
+            ]},
+        }
+        bug = {"expected_files": ["flask/wrappers.py"]}
+        assert _score_localization_hit(result, bug) is True
+
+    def test_fallback_filters_test_files(self):
+        """Fallback should ignore test files and still match source files."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {
+            "localization": {},
+            "repair": {"patches": [
+                {"file_path": "test_wrappers.py", "diff": "..."},
+                {"file_path": "flask/wrappers.py", "diff": "..."},
+            ]},
+        }
+        bug = {"expected_files": ["flask/wrappers.py"]}
+        assert _score_localization_hit(result, bug) is True
+
+    def test_fallback_only_test_files_returns_false(self):
+        """If all edited files are test files, fallback returns False."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {
+            "localization": {},
+            "repair": {"patches": [
+                {"file_path": "tests/test_wrappers.py", "diff": "..."},
+            ]},
+        }
+        bug = {"expected_files": ["flask/wrappers.py"]}
+        assert _score_localization_hit(result, bug) is False
+
+    def test_fallback_no_patches_returns_false(self):
+        """No localization and no patches -> False."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {"localization": {}, "repair": {"patches": []}}
+        bug = {"expected_files": ["flask/wrappers.py"]}
+        assert _score_localization_hit(result, bug) is False
+
+    def test_fallback_no_expected_files_any_edit_counts(self):
+        """When bug has no expected_files, any source edit counts as a hit."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {
+            "localization": {},
+            "repair": {"patches": [
+                {"file_path": "flask/app.py", "diff": "..."},
+            ]},
+        }
+        bug = {"expected_files": []}
+        assert _score_localization_hit(result, bug) is True
+
+    def test_fallback_no_expected_no_patches(self):
+        """No expected files AND no patches -> False (nothing to score)."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {"localization": {}, "repair": {"patches": []}}
+        bug = {}
+        assert _score_localization_hit(result, bug) is False
+
+    def test_fallback_missing_localization_key(self):
+        """result has no 'localization' key at all — should fall back to patches."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {
+            "repair": {"patches": [
+                {"file_path": "flask/wrappers.py", "diff": "..."},
+            ]},
+        }
+        bug = {"expected_files": ["flask/wrappers.py"]}
+        assert _score_localization_hit(result, bug) is True
+
+    def test_fallback_missing_repair_key(self):
+        """result has no 'repair' key — should return False."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {}
+        bug = {"expected_files": ["flask/wrappers.py"]}
+        assert _score_localization_hit(result, bug) is False
+
+    def test_fallback_strips_leading_slashes(self):
+        """Paths with leading slashes should still match after strip('/')."""
+        from agent.eval.scoring import _score_localization_hit
+        result = {
+            "localization": {},
+            "repair": {"patches": [
+                {"file_path": "/flask/wrappers.py", "diff": "..."},
+            ]},
+        }
+        bug = {"expected_files": ["flask/wrappers.py"]}
+        assert _score_localization_hit(result, bug) is True

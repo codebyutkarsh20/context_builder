@@ -18,22 +18,60 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _is_test_file(path: str) -> bool:
+    """Return True if path looks like a test file."""
+    parts = path.lower().split("/")
+    basename = parts[-1] if parts else ""
+    return (
+        basename.startswith("test_")
+        or basename.endswith("_test.py")
+        or "tests/" in path.lower()
+        or "/test/" in path.lower()
+        or basename.startswith("test.")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Individual scoring functions (ported from eval_suite.py:59-101)
 # ---------------------------------------------------------------------------
 
-def _score_localization_hit(result: dict, expected_files: list[str]) -> bool:
-    """Did the agent find at least one of the expected files?
+def _score_localization_hit(result: dict, bug: dict) -> bool:
+    """Did the agent find the right file(s)?
 
-    Uses case-insensitive suffix matching (e.g. "wrappers.py" matches
-    "flask/wrappers.py") to tolerate path prefix differences.
+    Primary: reads result["localization"]["fault_files"] (set by record_localization).
+    v4 fallback: infers from edited files when record_localization not called.
     """
     localization = result.get("localization") or {}
-    found_files = [f.lower() for f in localization.get("fault_files", [])]
+    fault_files = localization.get("fault_files") or []
 
-    for expected in expected_files:
-        expected_lower = expected.lower()
-        for found in found_files:
-            if expected_lower in found or found.endswith(expected_lower):
+    # v4 fallback: infer from edited files when record_localization not called
+    if not fault_files:
+        patches = (result.get("repair") or {}).get("patches") or []
+        edited_files = [p.get("file_path", "") for p in patches if p.get("file_path")]
+        # Filter out test files — localization means finding the BUG, not the test
+        fault_files = [
+            f for f in edited_files
+            if not _is_test_file(f)
+        ]
+
+    if not fault_files:
+        return False
+
+    expected = bug.get("expected_files") or []
+    if not expected:
+        return bool(fault_files)  # If no expected files, any edit counts
+
+    # Check overlap: any fault file matches any expected file
+    # Uses suffix matching to tolerate path prefix differences
+    # (e.g. "full/path/to/src/module.py" matches "src/module.py")
+    for exp in expected:
+        exp_lower = exp.strip("/").lower()
+        for found in fault_files:
+            found_lower = found.strip("/").lower()
+            if exp_lower in found_lower or found_lower.endswith(exp_lower):
                 return True
     return False
 
@@ -68,9 +106,17 @@ def _score_review_approved(result: dict) -> bool:
 
 
 def _get_review_confidence(result: dict) -> float:
-    """Extract the review confidence score."""
+    """Extract the review confidence score.
+
+    Falls back to verifier_confidence (set by the pipeline forked verifier)
+    if the review dict's confidence is missing or 0 — this guards against
+    the request_review tool not parsing confidence into the review dict.
+    """
     review = result.get("review") or {}
-    return float(review.get("confidence", 0.0))
+    conf = float(review.get("confidence", 0.0) or 0.0)
+    if conf == 0.0:
+        conf = float(result.get("verifier_confidence", 0.0) or 0.0)
+    return conf
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +307,7 @@ def score_case(result: dict, bug: dict, pipeline: str) -> dict:
     """
     expected_files = bug.get("expected_files", [])
 
-    loc_hit = _score_localization_hit(result, expected_files)
+    loc_hit = _score_localization_hit(result, bug)
     fix_gen = _score_fix_generated(result)
     approved = _score_review_approved(result)
     patch_correctness = _score_patch_correctness(result, bug)
