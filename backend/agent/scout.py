@@ -1,15 +1,18 @@
 """
-scout.py — Scout tier: 3-agent Fault Localisation (FL) pipeline.
+scout.py — Scout tier: 2+1 agent Fault Localisation (FL) pipeline.
 
 Runs before the main ReAct fix loop to answer: "Where exactly is the bug?"
 
 Pipeline (LLM4FL-inspired):
-  Agent 1 — Context Extractor  (Haiku, cheap):   bug desc + snippets → key entities
-  Agent 2 — Graph-RAG Debugger (Sonnet):          entities + graph data → top-5 suspects
-  Agent 3 — Verbal RL Re-ranker (Opus):           top-5 suspects → ranked + annotated report
+  Agent 1   — Context Extractor     (Haiku, cheap): bug desc + snippets → key entities
+  Agent 2   — Graph-RAG Debugger    (Sonnet):       entities + graph data → top-5 suspects
+  Agent 2.5 — Skeleton Narrowing    (Haiku):        suspects → function-level specificity
+
+The Opus re-ranker (Agent 3) was removed — the downstream agent re-prioritises
+itself using the exported entity_extraction and skeleton_data reasoning.
 
 Each agent's output feeds directly into the next.
-Total target cost: < $0.50 per bug.
+Total target cost: < $0.10 per bug.
 """
 
 from __future__ import annotations
@@ -388,16 +391,158 @@ Keep each list short (≤ 6 items). Only include what you are confident about.""
 # ---------------------------------------------------------------------------
 
 
+def _build_repo_listing(repo_path: Path, max_files: int = 200) -> str:
+    """Build a compact directory listing to ground scout path predictions.
+
+    Returns up to `max_files` source files (relative paths), grouped/sorted
+    so the debugger can see the actual repo structure instead of inventing
+    plausible-but-wrong paths like "validation/dtype_handling.py".
+
+    Supports Python, JavaScript, TypeScript, Go, and Rust source files.
+    """
+    if not repo_path or not repo_path.exists():
+        return ""
+    try:
+        skip = {".git", ".venv", "venv", "env", "node_modules", "__pycache__",
+                ".tox", "build", "dist", ".eggs", "site-packages", ".next",
+                "coverage", ".nyc_output", ".parcel-cache"}
+        # Source file extensions (multi-language)
+        exts = (".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+                ".go", ".rs", ".vue", ".svelte")
+        files: list[str] = []
+        for p in repo_path.rglob("*"):
+            if not p.is_file() or p.suffix not in exts:
+                continue
+            parts = p.relative_to(repo_path).parts
+            if any(part in skip or part.startswith(".") for part in parts):
+                continue
+            files.append(str(p.relative_to(repo_path)))
+            if len(files) >= max_files * 3:  # collect more, will trim
+                break
+        # Prefer source files over tests, sort by depth then alphabetically
+        files.sort(key=lambda f: (
+            "test" in f.lower(),
+            "__test" in f,
+            ".spec." in f,
+            ".test." in f,
+            f.count("/"),
+            f,
+        ))
+        files = files[:max_files]
+        return "\n".join(f"  {f}" for f in files)
+    except Exception:
+        return ""
+
+
+def _extract_skeleton(file_path: Path) -> str:
+    """Extract class/function signatures from a file (no bodies).
+
+    This is the Agentless "skeleton format": shows WHAT is in a file
+    without the implementation details. ~5x cheaper in tokens than the
+    full file, and gives the LLM enough structure to narrow from
+    "which file?" to "which function?".
+    """
+    if not file_path.exists():
+        return ""
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        lines = content.split("\n")
+        ext = file_path.suffix.lower()
+        sigs = []
+        for i, line in enumerate(lines):
+            stripped = line.rstrip()
+            lineno = i + 1
+            # Python
+            if re.match(r"^\s*(class\s+\w+|(?:async\s+)?def\s+\w+)", stripped):
+                sigs.append(f"L{lineno}: {stripped}")
+            # JS/TS
+            elif ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"):
+                if re.match(r"^\s*(export\s+)?(default\s+)?(async\s+)?(function|class)\s+\w+", stripped):
+                    sigs.append(f"L{lineno}: {stripped}")
+                elif re.match(r"^\s*(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s+)?\(", stripped):
+                    sigs.append(f"L{lineno}: {stripped[:120]}")
+            # Go
+            elif ext == ".go" and re.match(r"^func\s+", stripped):
+                sigs.append(f"L{lineno}: {stripped}")
+            # Rust
+            elif ext == ".rs" and re.match(r"^\s*(pub\s+)?(async\s+)?fn\s+", stripped):
+                sigs.append(f"L{lineno}: {stripped}")
+        return "\n".join(sigs)
+    except Exception:
+        return ""
+
+
+def _narrow_with_skeletons(
+    suspects: list,
+    extracted: "ExtractedContext",
+    work_order: dict,
+    repo_path: Path,
+) -> dict[str, list[str]]:
+    """Agentless Stage 2: Use file skeletons to narrow to specific functions.
+
+    Takes the debugger's file-level suspects and asks Haiku which specific
+    classes/functions within those files are most likely to contain the bug.
+
+    Returns: {file_path: [function_names]} for each suspect file.
+    """
+    from agent.llm import simple_call
+
+    # Build skeletons for top suspect files
+    skeletons = {}
+    for suspect in suspects[:5]:
+        fpath = repo_path / suspect.file
+        skel = _extract_skeleton(fpath)
+        if skel:
+            skeletons[suspect.file] = skel
+
+    if not skeletons:
+        return {}
+
+    skeleton_text = "\n\n".join(
+        f"### {fname}\n{skel}" for fname, skel in skeletons.items()
+    )
+
+    bug_summary = extracted.bug_summary or work_order.get("title", "")
+    prompt = f"""Given these file skeletons (class/function signatures only), identify which specific functions or classes are most likely to contain the bug.
+
+BUG: {bug_summary}
+
+FILE SKELETONS:
+{skeleton_text}
+
+For each file, list 1-3 function/class names that are most suspicious. Output format:
+file_path: function1, function2
+file_path: function3
+
+Only list functions that appear in the skeletons above. Be specific."""
+
+    try:
+        response = simple_call(_EXTRACTOR_MODEL, prompt, max_tokens=300)
+        # Parse response into {file: [functions]}
+        result: dict[str, list[str]] = {}
+        for line in response.strip().splitlines():
+            if ":" in line:
+                fname, funcs = line.split(":", 1)
+                fname = fname.strip()
+                if fname in skeletons:
+                    result[fname] = [f.strip() for f in funcs.split(",") if f.strip()]
+        return result
+    except Exception as exc:
+        logger.debug("Skeleton narrowing LLM call failed: %s", exc)
+        return {}
+
+
 def _run_debugger(
     extracted: ExtractedContext,
     graph_summary: str,
     rules_summary: str,
     work_order: dict,
+    repo_listing: str = "",
 ) -> GraphDebuggerOutput:
     """
     Agent 2: Traverse graph context to identify top-5 suspicious locations.
 
-    Input:  ExtractedContext + compact graph/rules summaries
+    Input:  ExtractedContext + compact graph/rules summaries (+ optional repo file listing)
     Output: GraphDebuggerOutput Pydantic model
     """
     from agent.llm import structured_call
@@ -406,6 +551,11 @@ def _run_debugger(
     fn_list = ", ".join(extracted.function_names[:6]) or "(none)"
     err_list = ", ".join(extracted.error_types[:4]) or "(none)"
     mod_list = ", ".join(extracted.module_hints[:5]) or "(none)"
+
+    listing_section = (
+        f"\nREPO FILE LISTING (real paths — predict ONLY from these):\n{repo_listing}\n"
+        if repo_listing else ""
+    )
 
     prompt = f"""You are a fault localisation debugger. Given extracted entities and graph context, identify the top-5 most suspicious code locations.
 
@@ -419,14 +569,15 @@ GRAPH CONTEXT:
 
 BUSINESS RULES:
 {rules_summary}
-
+{listing_section}
 Instructions:
 1. Identify up to 5 file+function pairs most likely to contain the bug.
 2. For each suspect: set file (relative path), function name, confidence (0.0–1.0), and a one-sentence reason.
 3. List blast_radius_files: other files whose behaviour would change if you fix the suspect locations.
 4. List relevant_business_rule_ids: IDs or short descriptions of rules that constrain this area.
+5. {'IMPORTANT: Pick `file` ONLY from the REPO FILE LISTING above. Do NOT invent paths.' if repo_listing else 'Be specific — prefer exact function names over generic files.'}
 
-Rank suspects by confidence descending. Be specific — prefer exact function names over generic files."""
+Rank suspects by confidence descending."""
 
     return structured_call(_DEBUGGER_MODEL, 800, GraphDebuggerOutput, prompt)
 
@@ -538,12 +689,17 @@ def scout_localize(
     intent: dict,
     data_dir: Path,
     community_name: str | None = None,
+    repo_path: Path | None = None,
 ) -> dict:
     """
-    Run the 3-agent FL pipeline to produce a Localisation Report.
+    Run the 2+1 agent FL pipeline to produce a Localisation Report.
 
     Agents run sequentially; each failure falls back gracefully and passes
     partial results to the next stage rather than aborting.
+
+    Pipeline: Extractor (Haiku) -> Debugger (Sonnet) -> Skeleton narrowing (Haiku).
+    The Opus re-ranker (Agent 3) has been removed — the downstream agent
+    re-prioritises itself using the exported entity_extraction and skeleton_data.
 
     Returns:
         {
@@ -552,6 +708,8 @@ def scout_localize(
             "relevant_business_rules": [str],
             "relevant_failure_records": [str],
             "scout_cost_usd": float,
+            "entity_extraction": {"function_names": [...], "error_types": [...], "module_hints": [...], "bug_summary": str},
+            "skeleton_data": {file: [functions]},
         }
     """
     from agent.graph_utils import load_graph_data
@@ -578,6 +736,7 @@ def scout_localize(
     debugger_output: GraphDebuggerOutput = GraphDebuggerOutput()
     reranker_output: RerankerOutput = RerankerOutput()
     failure_records: list[str] = []
+    narrowed: dict = {}  # skeleton narrowing data: {file: [functions]}
 
     # -------------------------------------------------------------------
     # Aggregate timeout: abort the pipeline after _SCOUT_TIMEOUT_SECONDS
@@ -625,8 +784,15 @@ def scout_localize(
         graph_summary = _summarise_graph(graph_data, enriched, extracted)
         rules_summary = _summarise_business_rules(business_rules, extracted)
 
+        # Build a shallow repo file listing to ground the debugger's path
+        # predictions in reality (instead of guessing from semantics alone).
+        repo_listing = _build_repo_listing(repo_path) if repo_path else ""
+
         try:
-            debugger_output = _run_debugger(extracted, graph_summary, rules_summary, work_order)
+            debugger_output = _run_debugger(
+                extracted, graph_summary, rules_summary, work_order,
+                repo_listing=repo_listing,
+            )
             # Approximate cost: ~900 input tokens, ~300 output tokens for Sonnet
             total_cost += estimate_cost(_DEBUGGER_MODEL, 900, 300)
             logger.info(
@@ -670,51 +836,53 @@ def scout_localize(
             debugger_output = GraphDebuggerOutput(suspects=fallback_suspects[:5])
 
         # ---------------------------------------------------------------
-        # Agent 3 — Verbal RL Re-ranker (Opus)
+        # Agent 2.5 — Skeleton narrowing (Agentless Stage 2)
+        # For each file the debugger found, extract class/function
+        # skeletons and ask Haiku to narrow to specific functions.
+        # This bridges the gap between "which file?" (Agent 2) and
+        # "which function?" (Agent 3). Agentless found this hierarchical
+        # approach gets 32% pass rate at $0.70/bug.
+        # ---------------------------------------------------------------
+        if debugger_output.suspects and repo_path:
+            try:
+                narrowed = _narrow_with_skeletons(
+                    debugger_output.suspects, extracted, work_order, repo_path,
+                )
+                if narrowed:
+                    for suspect in debugger_output.suspects:
+                        for n_file, n_funcs in narrowed.items():
+                            if suspect.file == n_file and n_funcs:
+                                # Upgrade function specificity from skeleton analysis
+                                if not suspect.function or suspect.function == "":
+                                    suspect.function = n_funcs[0]
+                                    suspect.reason += f" (narrowed to {n_funcs[0]} via skeleton)"
+                    logger.info("scout[2.5]: skeleton narrowing refined %d suspects", len(narrowed))
+            except Exception as exc:
+                logger.debug("scout[2.5]: skeleton narrowing skipped: %s", exc)
+
+        # ---------------------------------------------------------------
+        # Build ranked output directly from debugger (Opus re-ranker removed —
+        # the agent re-prioritises itself using the exported reasoning).
         # ---------------------------------------------------------------
         failure_records = _extract_failure_records(graph_data, extracted)
 
-        if debugger_output.suspects:
-            try:
-                reranker_output = _run_reranker(
-                    debugger_output,
-                    extracted,
-                    business_rules,
-                    failure_records,
-                    graph_data,
-                    work_order,
+        reranker_output = RerankerOutput(
+            ranked_locations=[
+                RankedLocation(
+                    file=s.file,
+                    function=s.function,
+                    confidence=s.confidence,
+                    reason=s.reason,
                 )
-                # Approximate cost: ~1000 input tokens, ~400 output tokens for Opus
-                total_cost += estimate_cost(_RERANKER_MODEL, 1000, 400)
-                logger.info(
-                    "scout[3/3]: Re-ranker produced %d ranked locations",
-                    len(reranker_output.ranked_locations),
+                for s in sorted(
+                    debugger_output.suspects,
+                    key=lambda s: s.confidence,
+                    reverse=True,
                 )
-            except Exception as exc:
-                logger.error("scout[3/3]: Re-ranker failed (using debugger output as-is): %s", exc)
-                # Demote to ranked from debugger output unchanged
-                reranker_output = RerankerOutput(
-                    ranked_locations=[
-                        RankedLocation(
-                            file=s.file,
-                            function=s.function,
-                            confidence=s.confidence,
-                            reason=s.reason,
-                        )
-                        for s in sorted(
-                            debugger_output.suspects,
-                            key=lambda s: s.confidence,
-                            reverse=True,
-                        )
-                    ],
-                    relevant_failure_records=failure_records,
-                    additional_blast_radius=[],
-                )
-        else:
-            logger.warning("scout: no suspects from Agent 2 — skipping re-ranker")
-            reranker_output = RerankerOutput(
-                relevant_failure_records=failure_records,
-            )
+            ],
+            relevant_failure_records=failure_records,
+            additional_blast_radius=[],
+        )
 
     except _ScoutTimeout:
         logger.warning(
@@ -771,6 +939,13 @@ def scout_localize(
         "relevant_business_rules": relevant_business_rules,
         "relevant_failure_records": relevant_failure_records,
         "scout_cost_usd": round(total_cost, 6),
+        "entity_extraction": {
+            "function_names": extracted.function_names,
+            "error_types": extracted.error_types,
+            "module_hints": extracted.module_hints,
+            "bug_summary": extracted.bug_summary,
+        },
+        "skeleton_data": narrowed,
     }
 
     logger.info(

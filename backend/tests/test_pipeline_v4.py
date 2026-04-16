@@ -1052,6 +1052,7 @@ class TestScoutLocalizeNoReranker:
                 work_order={"ticket_id": "T-1", "title": "Bug"},
                 intent={"actual_behavior": "crashes"},
                 data_dir=Path("/tmp"),
+                repo_path=Path("/tmp/fake_repo"),
             )
 
         assert result["skeleton_data"] == skel
