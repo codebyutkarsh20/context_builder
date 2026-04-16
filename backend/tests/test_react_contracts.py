@@ -54,14 +54,12 @@ class TestGuardrailSandboxGate:
         })
 
     @pytest.mark.parametrize("tool_name", list(SANDBOX_REQUIRED_TOOLS))
-    def test_sandbox_required_tools_blocked_without_sandbox(self, tool_name):
-        """Each sandbox-required tool returns ERROR when no sandbox exists."""
+    def test_sandbox_required_tools_allowed_without_sandbox(self, tool_name):
+        """Sandbox-gate removed in v4 — tools pass without a sandbox."""
         gs = GuardrailState()
         assert gs.sandbox_created is False
         result = check_tool_call(tool_name, {}, gs)
-        assert result is not None
-        assert "ERROR" in result
-        assert "create_sandbox" in result
+        assert result is None
 
     @pytest.mark.parametrize("tool_name", list(SANDBOX_REQUIRED_TOOLS))
     def test_sandbox_required_tools_allowed_with_sandbox(self, tool_name):
@@ -382,8 +380,13 @@ class TestPromptGuardrailAlignment:
     wasting tool calls and hitting the limit.
     """
 
-    def test_prompt_tool_budget_matches_guardrail(self):
-        """Prompt says '30' tool call budget, guardrail limit is 40."""
+    def test_prompt_tool_budget_mentions_generous_budget(self):
+        """Prompt tells agent it has room to work — generous budget, no aggressive forcing.
+
+        After unconstraining the agent (removed phase_nudge + force-escalation),
+        budgets are 50/70/90 for single/multi/complex. Prompt emphasizes quality
+        over efficiency. MAX_TOOL_CALLS legacy default is now 70 (was 40).
+        """
         from agent.react_prompt import build_system_prompt
         static_block, dynamic_block = build_system_prompt(
             {"repo_name": "test", "title": "bug", "description": "desc"},
@@ -391,9 +394,10 @@ class TestPromptGuardrailAlignment:
             "",
         )
         prompt = static_block + "\n\n" + dynamic_block
-        # Prompt says budget of 30 (guidance), guardrail enforces 40 (hard limit)
-        assert "30" in prompt
-        assert MAX_TOOL_CALLS == 40  # Hard limit is higher than soft budget
+        # Prompt should mention the generous budget
+        assert "50" in prompt or "70" in prompt
+        # Legacy MAX_TOOL_CALLS is now 70 (was 40)
+        assert MAX_TOOL_CALLS >= 50
 
     def test_prompt_includes_fail_to_pass_tests_when_available(self):
         """When the bug's work_order has fail_to_pass tests, they MUST appear
@@ -525,12 +529,12 @@ class TestPromptGuardrailAlignment:
 class TestAntiPatternThresholds:
     """Anti-pattern warnings at documented thresholds."""
 
-    def test_grep_warning_at_8(self):
+    def test_grep_no_warning_at_8(self):
+        """Grep count warning removed in v4 — no nudge at 8."""
         gs = GuardrailState()
         gs.grep_count = 8
         result = check_tool_call("grep_repo", {}, gs)
-        assert result is not None
-        assert "WARNING" in result
+        assert result is None
 
     def test_grep_ok_at_7(self):
         gs = GuardrailState()
@@ -545,13 +549,14 @@ class TestAntiPatternThresholds:
         result = check_tool_call("read_file", {}, gs)
         assert result is None  # No block, no warning — let the agent read
 
-    def test_run_tests_warning_at_3(self):
+    def test_run_tests_no_warning_at_3(self):
+        """Run_tests retry warning removed in v4 — no nudge at 3."""
         gs = GuardrailState()
         gs.sandbox_created = True
         gs.run_tests_count = 3
+        gs.string_replace_count = 1  # bypass "tests on unmodified code" nudge
         result = check_tool_call("run_tests", {}, gs)
-        assert result is not None
-        assert "WARNING" in result
+        assert result is None
 
     def test_string_replace_no_hard_block(self):
         """string_replace should never be hard-blocked — agent needs to iterate."""

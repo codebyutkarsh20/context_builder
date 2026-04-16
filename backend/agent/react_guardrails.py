@@ -12,21 +12,21 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Limits
-MAX_TOOL_CALLS = 40          # Legacy default — use budget_for_difficulty() for new code
-MAX_WALL_TIME = 900          # 15 minutes
-MAX_COST_USD = 5.00
-MAX_TEST_FAILURES = 3
+# Limits — generous, prefer letting the agent work vs forcing early termination.
+MAX_TOOL_CALLS = 70          # Legacy default — use budget_for_difficulty() for new code
+MAX_WALL_TIME = 1800         # 30 minutes — allow larger repos to finish
+MAX_COST_USD = 15.00         # $15 cap — plenty of room, never cut off a near-win
+MAX_TEST_FAILURES = 5        # allow more fix attempts
 
 # Adaptive tool call budget based on task complexity.
-# Research: most bugs resolve in 15-25 calls; calls 30-40 are usually stuck loops.
-# Giving a tighter budget to simple bugs saves cost and forces better focus.
+# Giving the agent room to explore + iterate tends to beat forced early termination.
+# We tightened budgets too aggressively before and saw bugs die right before the finish line.
 _CALL_BUDGET = {
-    "single-file": 30,  # one file, one function — agent should finish in 15-25
-    "multi-file":  45,  # cross-module changes — callers, tests, imports need updating
-    "complex":     55,  # architecture changes, 5+ files, new abstractions
+    "single-file": 50,  # one file, one function — easy but let it verify thoroughly
+    "multi-file":  70,  # cross-module changes — callers, tests, imports need updating
+    "complex":     90,  # architecture changes, 5+ files, new abstractions
 }
-_DEFAULT_BUDGET = 40   # unknown complexity — safe middle ground
+_DEFAULT_BUDGET = 60   # unknown complexity — generous middle ground
 
 
 def budget_for_difficulty(difficulty: str) -> int:
@@ -69,6 +69,7 @@ class GuardrailState:
         self.grep_count: int = 0
         self.read_file_count: int = 0
         self.run_tests_count: int = 0
+        self.run_shell_count: int = 0
         self.string_replace_count: int = 0
         # File state cache — tracks files read for read-before-edit enforcement
         # {relative_path: content_snippet} — snippet is first 200 chars for identity
@@ -77,6 +78,11 @@ class GuardrailState:
         # {relative_path: full_content} — top N files injected into EDIT phase
         self.file_cache: dict[str, str] = {}
         self.FILE_CACHE_MAX = 5
+        # Real token tracking from API responses (replaces broken char-based estimates)
+        self.real_input_tokens: int = 0   # last LLM call's input_tokens
+        self.real_output_tokens: int = 0  # last LLM call's output_tokens
+        self.cumulative_input_tokens: int = 0
+        self.cumulative_output_tokens: int = 0
 
     @property
     def elapsed(self) -> float:
@@ -121,40 +127,6 @@ def check_tool_call(
     if limit_error and tool_name not in TERMINAL_TOOLS:
         return limit_error
 
-    # Plan-mode gate — must declare a plan before creating a sandbox.
-    # This forces structured thinking ("what am I about to do?") before
-    # any code change. Borrowed from Claude Code's plan-mode pattern,
-    # but autonomous: the agent self-validates by producing a plan
-    # rather than waiting for human approval.
-    if tool_name == "create_sandbox" and not gs.plan_produced:
-        return (
-            "ERROR: No plan declared yet — create_sandbox requires a plan first.\n"
-            "NEXT STEP: Call produce_plan(root_cause, target_files, approach, "
-            "success_criteria, risk) to declare what you intend to do, "
-            "then retry create_sandbox.\n"
-            "The plan is a self-commitment device — it forces you to articulate "
-            "the root cause and your approach before editing. You may revise "
-            "the plan later by calling produce_plan again."
-        )
-
-    # Sandbox gate
-    if tool_name in SANDBOX_REQUIRED_TOOLS and not gs.sandbox_created:
-        return (
-            f"ERROR: No sandbox exists — {tool_name} requires one.\n"
-            "NEXT STEP: Call create_sandbox() right now, then retry.\n"
-            "This is a required setup step, NOT a reason to escalate."
-        )
-
-    # Read-before-edit gate — you must read a file before editing it
-    if tool_name == "string_replace":
-        edit_path = tool_args.get("file_path", "")
-        if edit_path and edit_path not in gs.files_read:
-            return (
-                f"WARNING: You haven't read '{edit_path}' yet. "
-                "Call read_file or read_function first to see the current content, "
-                "then retry string_replace with the exact old_string from the file."
-            )
-
     # Submit gate — require sandbox + at least attempted tests.
     # Review is recommended but NOT required — the reviewer can be wrong.
     if tool_name == "submit_fix":
@@ -172,8 +144,6 @@ def check_tool_call(
         warnings = []
         if not gs.tests_passed and not gs.tests_skipped:
             warnings.append("Tests failed — double-check your fix is correct.")
-        if not gs.review_approved:
-            warnings.append("Review not yet approved — submitting without review approval.")
         if warnings:
             return "WARNING: " + " ".join(warnings) + " Proceeding with submit."
 
@@ -183,15 +153,6 @@ def check_tool_call(
     explore_tools = {"grep_repo", "read_file", "read_function", "list_files",
                      "get_file_structure", "get_function_info", "get_blast_radius"}
 
-    # Nudge: prefer read_function over grep after several greps
-    if tool_name == "grep_repo" and gs.grep_count >= 8:
-        return (
-            f"WARNING: grep_repo called {gs.grep_count} times. "
-            "Consider using read_function(file, function_name) instead — "
-            "it gives you the complete function with full context. "
-            "grep finds WHERE things are; read_function shows you WHAT they do."
-        )
-
     # Nudge: tests on unmodified code
     if tool_name in ("run_tests", "run_brt") and gs.sandbox_created and gs.string_replace_count == 0:
         return (
@@ -200,12 +161,15 @@ def check_tool_call(
             "Call string_replace() first to apply your fix, THEN run tests."
         )
 
-    # Nudge: test infra issues — don't keep retrying
-    if tool_name == "run_tests" and gs.run_tests_count >= 3:
+    # Nudge: shell calls — if the agent is grinding on env diagnosis, force forward.
+    # 6 calls is generous (3 to investigate, 3 to install/verify). Beyond that,
+    # the env is likely truly broken and the agent should submit anyway.
+    if tool_name == "run_shell" and gs.run_shell_count >= 6:
         return (
-            f"WARNING: run_tests called {gs.run_tests_count} times. "
-            "If tests can't run (missing deps/pytest), that's an environment issue, "
-            "not your code. Proceed to request_review and submit_fix."
+            f"WARNING: run_shell called {gs.run_shell_count} times. "
+            "If the env can't be fixed in a few commands, it likely won't be. "
+            "Proceed to request_review and submit_fix — environment issues do "
+            "not block submission, the verifier judges code correctness."
         )
 
     # Nudge: review loop — if reviewer keeps rejecting, submit anyway
@@ -246,6 +210,8 @@ def update_from_tool_result(
         gs.read_file_count += 1
     elif tool_name == "run_tests":
         gs.run_tests_count += 1
+    elif tool_name == "run_shell":
+        gs.run_shell_count += 1
     elif tool_name == "string_replace":
         gs.string_replace_count += 1
         if not result.startswith("ERROR"):

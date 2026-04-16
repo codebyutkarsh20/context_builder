@@ -186,12 +186,11 @@ class TestPlanRevision:
 # ---------------------------------------------------------------------------
 
 class TestPlanGuardrail:
-    def test_create_sandbox_blocked_without_plan(self):
+    def test_create_sandbox_allowed_without_plan(self):
         gs = GuardrailState()
-        # Plan not produced → create_sandbox should be blocked
+        # Plan-gate removed in v4 — create_sandbox is no longer blocked
         err = check_tool_call("create_sandbox", {}, gs)
-        assert err is not None
-        assert "produce_plan" in err
+        assert err is None
 
     def test_create_sandbox_allowed_after_plan(self):
         gs = GuardrailState()
@@ -218,9 +217,9 @@ class TestPlanGuardrail:
             gs,
         )
         assert not gs.plan_produced
+        # Plan-gate removed in v4 — create_sandbox allowed regardless
         err = check_tool_call("create_sandbox", {}, gs)
-        assert err is not None
-        assert "produce_plan" in err
+        assert err is None
 
     def test_plan_revision_tracked(self):
         gs = GuardrailState()

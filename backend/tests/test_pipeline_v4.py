@@ -1493,3 +1493,367 @@ class TestWriteBrt:
 
         assert _tls._guardrail_state is gs
         assert _tls._guardrail_state.files_read == {"foo.py": "content"}
+
+
+# ---------------------------------------------------------------------------
+# Tests: v4 prompt functions (Task 4)
+# build_static_block, build_dynamic_block, build_task_message_v4
+# ---------------------------------------------------------------------------
+
+class TestBuildStaticBlock:
+    """Tests for build_static_block — lean ~80-line cacheable block."""
+
+    def test_returns_nonempty_string(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert isinstance(result, str)
+        assert len(result) > 100, "static block should have substantial content"
+
+    def test_contains_identity(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "autonomous software engineer" in result
+        assert "fix bugs" in result.lower()
+
+    def test_contains_hard_contracts(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "sandbox" in result.lower()
+        assert "submit_fix" in result
+        assert "verify_fix" in result
+
+    def test_contains_test_result_interpretation(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        for keyword in ["passed", "failed", "skipped", "error"]:
+            assert keyword in result.lower(), f"missing test result type: {keyword}"
+
+    def test_contains_pre_existing_failures_note(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "pre-existing" in result.lower()
+
+    def test_contains_path_convention(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "relative" in result.lower()
+        assert "repo root" in result.lower()
+
+    def test_contains_brt_guidance(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "write_brt" in result or "BRT" in result
+
+    def test_contains_planning_guidance(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "produce_plan" in result
+
+    def test_contains_cost_guidance(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "delegate_explore" in result
+
+    def test_contains_run_shell_guidance(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "run_shell" in result
+
+    def test_contains_verify_fix_guidance(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "verify_fix" in result
+
+    def test_contains_changelog_anchor(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "Known issues" in result
+
+    def test_must_not_contain_tool_reference_table(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        # The old prompt had a full tools table with numbered items and descriptions
+        assert "### Exploration" not in result
+        assert "### Editing" not in result
+        assert "### Sandbox & Testing" not in result
+        assert "### Shell" not in result
+        assert "### Multi-file coordination" not in result
+        assert "### Localization" not in result
+        assert "### Completion" not in result
+
+    def test_must_not_contain_mandatory_phase_sequence(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "Phase 1:" not in result
+        assert "Phase 2:" not in result
+        assert "Phase 3:" not in result
+        assert "Phase 4:" not in result
+        assert "MANDATORY ORDER" not in result
+
+    def test_must_not_contain_recovery_patterns(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "RECOVERY PATTERNS" not in result
+
+    def test_must_not_contain_exploration_strategy(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "EXPLORATION STRATEGY" not in result
+
+    def test_must_not_contain_12_rules(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "## RULES" not in result
+
+    def test_must_not_contain_escalation_criteria(self):
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        assert "WHEN TO ESCALATE" not in result
+
+    def test_is_deterministic(self):
+        """Static block should be identical across calls (cacheable)."""
+        from agent.react_prompt import build_static_block
+        a = build_static_block()
+        b = build_static_block()
+        assert a == b
+
+    def test_line_count_under_100(self):
+        """Static block should be lean — under 100 lines."""
+        from agent.react_prompt import build_static_block
+        result = build_static_block()
+        lines = result.strip().split("\n")
+        assert len(lines) <= 100, f"static block has {len(lines)} lines, expected <= 100"
+
+
+class TestBuildDynamicBlock:
+    """Tests for build_dynamic_block — rich per-bug context."""
+
+    def _minimal_work_order(self):
+        return {
+            "title": "check_gate crashes on empty input",
+            "priority": "high",
+            "affected_component": "gates",
+            "description": "When calling check_gate(''), a ValueError is raised.",
+            "fail_to_pass": ["tests/test_gates.py::test_empty_input"],
+            "pass_to_pass": ["tests/test_gates.py::test_normal", "tests/test_gates.py::test_boundary"],
+        }
+
+    def _minimal_dynamic_ctx(self):
+        return {
+            "repo_tree": "src/gates.py\nsrc/validate.py\ntests/test_gates.py",
+            "graph_context": "def check_gate(value: str) -> bool: ...\ndef validate(x): ...",
+            "lessons": "## Lessons\n- check_gate is fragile with empty strings",
+            "concept_mappings": {
+                "matched_rules": [{"rule_text": "gate validation"}],
+                "concept_section": "## Concept Mapping\ngate -> check_gate in src/gates.py",
+            },
+            "scout": {
+                "top_locations": [
+                    {"file": "src/gates.py", "function": "check_gate", "confidence": 0.9, "reason": "direct match"},
+                ],
+                "blast_radius_files": ["src/api.py", "src/handler.py"],
+                "entity_extraction": {
+                    "function_names": ["check_gate", "validate"],
+                    "error_types": ["ValueError"],
+                    "module_hints": ["src/gates.py"],
+                    "bug_summary": "check_gate raises ValueError on empty input",
+                },
+                "skeleton_data": {
+                    "src/gates.py": ["def check_gate(value: str) -> bool", "def _inner_validate(x)"],
+                },
+            },
+            "baseline_failures": {"tests/test_old.py::test_flaky", "tests/test_perf.py::test_slow"},
+        }
+
+    def test_contains_bug_ticket_section(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "check_gate crashes on empty input" in result
+        assert "high" in result
+        assert "gates" in result
+        assert "ValueError" in result
+
+    def test_contains_target_tests(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "tests/test_gates.py::test_empty_input" in result
+        assert "Target tests" in result
+
+    def test_contains_pass_to_pass_sample(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "Must-stay-passing" in result
+        assert "test_normal" in result
+
+    def test_contains_scout_analysis_with_locations(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "Scout analysis" in result
+        assert "src/gates.py::check_gate" in result
+        assert "confidence=0.9" in result
+        assert "direct match" in result
+
+    def test_contains_entity_extraction(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "check_gate raises ValueError" in result
+        assert "check_gate" in result
+
+    def test_contains_skeleton_data(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "def check_gate(value: str) -> bool" in result
+
+    def test_contains_blast_radius(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "Blast radius" in result
+        assert "src/api.py" in result
+
+    def test_contains_baseline_failures(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "Baseline test results" in result
+        assert "test_flaky" in result
+        assert "NOT your fault" in result
+
+    def test_contains_repo_structure(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "Repo structure" in result
+        assert "src/gates.py" in result
+
+    def test_contains_code_map(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "Code map" in result
+        assert "def check_gate" in result
+
+    def test_contains_lessons(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "Lessons from past fixes" in result
+        assert "fragile with empty strings" in result
+
+    def test_contains_concept_mappings(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        result = build_dynamic_block(wo, {}, self._minimal_dynamic_ctx())
+        assert "Concept Mapping" in result
+
+    def test_fallback_when_no_scout_locations(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        ctx = self._minimal_dynamic_ctx()
+        ctx["scout"] = {"top_locations": [], "entity_extraction": {}}
+        result = build_dynamic_block(wo, {}, ctx)
+        assert "No confident matches" in result
+        assert "delegate_explore" in result
+
+    def test_fallback_when_no_scout_at_all(self):
+        from agent.react_prompt import build_dynamic_block
+        wo = self._minimal_work_order()
+        ctx = self._minimal_dynamic_ctx()
+        ctx["scout"] = None
+        result = build_dynamic_block(wo, {}, ctx)
+        assert "No confident matches" in result
+
+    def test_empty_dynamic_ctx(self):
+        """Handles completely empty dynamic_ctx without crashing."""
+        from agent.react_prompt import build_dynamic_block
+        wo = {"title": "Bug", "description": "broken"}
+        result = build_dynamic_block(wo, {}, {})
+        assert "Bug" in result
+        assert isinstance(result, str)
+
+    def test_empty_fail_to_pass(self):
+        """No target tests section when fail_to_pass is empty."""
+        from agent.react_prompt import build_dynamic_block
+        wo = {"title": "Bug", "description": "broken", "fail_to_pass": []}
+        result = build_dynamic_block(wo, {}, {})
+        assert "Target tests" not in result
+
+    def test_empty_baseline_failures(self):
+        """No baseline section when there are no pre-existing failures."""
+        from agent.react_prompt import build_dynamic_block
+        wo = {"title": "Bug", "description": "broken"}
+        ctx = {"baseline_failures": set()}
+        result = build_dynamic_block(wo, {}, ctx)
+        assert "Baseline test results" not in result
+
+    def test_repo_tree_truncated_to_200_lines(self):
+        """Repo tree is truncated to 200 lines."""
+        from agent.react_prompt import build_dynamic_block
+        wo = {"title": "Bug", "description": "broken"}
+        big_tree = "\n".join(f"src/file_{i}.py" for i in range(300))
+        ctx = {"repo_tree": big_tree}
+        result = build_dynamic_block(wo, {}, ctx)
+        # Should contain file_0 through file_199 but not file_200
+        assert "file_199" in result
+        assert "file_200" not in result
+
+
+class TestBuildTaskMessageV4:
+    """Tests for build_task_message_v4 — minimal kick-off message."""
+
+    def test_returns_nonempty_string(self):
+        from agent.react_prompt import build_task_message_v4
+        result = build_task_message_v4()
+        assert isinstance(result, str)
+        assert len(result) > 10
+
+    def test_mentions_fix_and_target_tests(self):
+        from agent.react_prompt import build_task_message_v4
+        result = build_task_message_v4()
+        assert "fix" in result.lower() or "Fix" in result
+        assert "target tests" in result.lower()
+
+    def test_is_concise(self):
+        """Task message v4 should be a single short statement."""
+        from agent.react_prompt import build_task_message_v4
+        result = build_task_message_v4()
+        assert len(result) < 200, f"task message too long: {len(result)} chars"
+
+    def test_does_not_contain_sequence_steps(self):
+        """v4 message should NOT list numbered steps like old build_task_message."""
+        from agent.react_prompt import build_task_message_v4
+        result = build_task_message_v4()
+        assert "SEQUENCE" not in result
+        assert "Step 1" not in result
+        assert "1. " not in result
+
+
+class TestOldFunctionsStillWork:
+    """Verify deprecated build_system_prompt and build_task_message still function."""
+
+    def test_build_system_prompt_returns_tuple(self):
+        from agent.react_prompt import build_system_prompt
+        static, dynamic = build_system_prompt(
+            work_order={"title": "Bug", "description": "broken", "repo_name": "test"},
+            intent={"fix_type": "bug_fix"},
+            kickstart_context="code map here",
+        )
+        assert isinstance(static, str)
+        assert isinstance(dynamic, str)
+        assert len(static) > 100
+        assert "Bug" in dynamic
+
+    def test_build_task_message_returns_string(self):
+        from agent.react_prompt import build_task_message
+        result = build_task_message(
+            work_order={"title": "Bug"},
+            intent={"fix_type": "bug_fix"},
+        )
+        assert isinstance(result, str)
+        assert "Fix this bug" in result
