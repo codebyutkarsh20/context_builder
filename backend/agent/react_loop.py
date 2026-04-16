@@ -463,6 +463,40 @@ def react_loop(
                     "reason": "first_edit_landed",
                 })
 
+        # ── Conversation-level prompt caching ────────────────────────────
+        # The system prompt (tools + static + dynamic) is cached (~8K tokens).
+        # But without this, the CONVERSATION messages (growing 350 → 50K+)
+        # are sent fresh every call. By marking the last message with
+        # cache_control, we cache the entire prefix: tools + system + all
+        # prior conversation turns. Each new call only processes the newest
+        # tool results (~500 tokens fresh instead of ~10K+).
+        #
+        # From Anthropic docs: "Cache writes happen only at your breakpoint."
+        # We move the breakpoint forward each turn, caching more of the
+        # conversation as it grows. This turns 46% cache ratio at call 17
+        # into ~90%+ cache ratio.
+        #
+        # The last message should be a ToolMessage or HumanMessage.
+        # We convert its content to block format with cache_control.
+        if len(messages) >= 3:  # system + at least 1 exchange
+            last_msg = messages[-1]
+            if isinstance(last_msg, (ToolMessage, HumanMessage)):
+                content = last_msg.content
+                if isinstance(content, str):
+                    # Convert string content to block format with cache_control
+                    last_msg.content = [
+                        {
+                            "type": "text",
+                            "text": content,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ]
+                elif isinstance(content, list) and content:
+                    # Already block format — add cache_control to last block
+                    last_block = content[-1]
+                    if isinstance(last_block, dict) and "cache_control" not in last_block:
+                        last_block["cache_control"] = {"type": "ephemeral"}
+
         # Call the LLM — with multi-stage recovery for context overflow + transient errors
         response = None
         for _recovery_attempt in range(5):  # raised from 3 to 5 for transient retries
