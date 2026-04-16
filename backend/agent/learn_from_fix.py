@@ -36,8 +36,10 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 LESSONS_FILENAME = "agent_lessons.md"
+GLOBAL_LESSONS_DIR = "_global"  # cross-repo lessons stored here
 MAX_LESSONS_STORED = 25
 MAX_LESSONS_INJECTED = 5
+MAX_GLOBAL_LESSONS_INJECTED = 3
 LESSON_MAX_CHARS = 600
 
 # Feature flag — enabled by default, disable via env var for tests / comparison
@@ -337,56 +339,207 @@ def record_lesson(state: dict) -> str | None:
         logger.warning("record_lesson failed (non-fatal): %s", exc)
         return None
 
+    # Cross-repo: check if this lesson is generalizable (applies beyond this repo).
+    # If yes, also store in _global/agent_lessons.md so OTHER repos benefit.
+    try:
+        _maybe_record_global_lesson(repo_name, ticket_id, date_str, status_label, lesson_body)
+    except Exception as exc:
+        logger.debug("Global lesson recording failed (non-fatal): %s", exc)
+
+    return entry_text
+
+
+def _maybe_record_global_lesson(
+    repo_name: str, ticket_id: str, date_str: str,
+    status_label: str, lesson_body: str,
+) -> None:
+    """Check if a lesson is generalizable and store it in the global tier.
+
+    A lesson is generalizable if it's about a PATTERN (regex, API design,
+    test strategy) rather than a repo-specific detail (Django's ORM,
+    Flask's blueprint system). Haiku makes the call — cheap ($0.005).
+
+    Global lessons are injected into ALL future runs (from any repo),
+    giving the agent cross-repo wisdom like "always check regex DOTALL
+    for multiline strings" even when working on a new repo.
+    """
+    if not LEARN_FROM_FIX_ENABLED or status_label != "SUCCESS":
+        return  # Only promote successful lessons to global
+
+    # Ask Haiku: is this lesson generalizable?
+    try:
+        from langchain_anthropic import ChatAnthropic
+        from langchain_core.messages import HumanMessage
+
+        prompt = f"""Is this lesson GENERALIZABLE to other codebases, or is it specific to this one repo ({repo_name})?
+
+LESSON:
+{lesson_body}
+
+Answer ONLY "GENERAL" or "SPECIFIC".
+- GENERAL: the lesson is about a universal pattern (regex, testing, API design, error handling, concurrency) that applies to any codebase
+- SPECIFIC: the lesson is about this particular codebase's internal structure, naming, or conventions
+
+One word answer:"""
+
+        llm = ChatAnthropic(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            timeout=15.0,
+            max_retries=1,
+        )
+        resp = llm.invoke([HumanMessage(content=prompt)])
+        answer = str(resp.content).strip().upper()
+
+        if "GENERAL" not in answer:
+            logger.debug("Lesson for %s/%s classified as SPECIFIC — not promoting", repo_name, ticket_id)
+            return
+    except Exception:
+        return  # Can't classify → don't promote
+
+    # Append to global lessons file
+    import fcntl
+    global_path = DATA_DIR / GLOBAL_LESSONS_DIR / LESSONS_FILENAME
+    global_path.parent.mkdir(parents=True, exist_ok=True)
+
+    header = f"## [{ticket_id}] {date_str} {status_label} (from {repo_name})"
+    entry_text = f"{header}\n{lesson_body.strip()}\n"
+
+    try:
+        with open(global_path, "a+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                f.seek(0)
+                existing_text = f.read()
+                existing = _parse_lessons(existing_text)
+
+                # Dedup: skip if a lesson from the same ticket already exists
+                existing_tickets = {e.get("ticket_id", "") for e in existing}
+                if ticket_id in existing_tickets:
+                    return
+
+                new_entry = {
+                    "ticket_id": ticket_id,
+                    "date": date_str,
+                    "status": status_label,
+                    "header": header,
+                    "body": lesson_body.strip(),
+                }
+                existing.append(new_entry)
+                if len(existing) > MAX_LESSONS_STORED:
+                    existing = existing[-MAX_LESSONS_STORED:]
+                f.seek(0)
+                f.truncate()
+                f.write(_format_lessons(existing))
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        logger.info("Promoted lesson %s to global tier (from %s)", ticket_id, repo_name)
+    except Exception as exc:
+        logger.debug("Global lesson write failed: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Loading — read + filter for next run
 # ---------------------------------------------------------------------------
 
+def _load_global_lessons(
+    repo_name: str,
+    max_entries: int = MAX_GLOBAL_LESSONS_INJECTED,
+    exclude_tickets: set | None = None,
+) -> list[dict]:
+    """Load cross-repo lessons from the global tier.
+
+    Excludes lessons that originated from the current repo (those are
+    already in per-repo lessons) and any specific ticket IDs in
+    exclude_tickets (to avoid duplication).
+    """
+    global_path = DATA_DIR / GLOBAL_LESSONS_DIR / LESSONS_FILENAME
+    if not global_path.exists():
+        return []
+    try:
+        text = global_path.read_text(encoding="utf-8")
+        entries = _parse_lessons(text)
+        # Filter: skip lessons from the same repo (already in per-repo)
+        # The header contains "(from {repo_name})" — check for it.
+        filtered = []
+        for e in entries:
+            if f"from {repo_name})" in e.get("header", ""):
+                continue  # Same repo — skip, already in per-repo
+            if exclude_tickets and e.get("ticket_id") in exclude_tickets:
+                continue  # Already included from per-repo
+            filtered.append(e)
+        return filtered[-max_entries:]  # Most recent N
+    except Exception as exc:
+        logger.debug("load_global_lessons: read failed (%s)", exc)
+        return []
+
+
 def load_lessons(repo_name: str, max_entries: int = MAX_LESSONS_INJECTED) -> str:
     """Load relevant past lessons for injection into the next run's prompt.
 
-    Returns a markdown section (starting with `## LESSONS FROM PAST RUNS`)
-    or empty string if no lessons exist / feature is disabled.
+    Two tiers:
+      1. Per-repo lessons (5 most recent from this repo's agent_lessons.md)
+      2. Global lessons (3 most recent from _global/agent_lessons.md, from OTHER repos)
 
-    Strategy: take the N most recent lessons. The file is already sorted
-    newest-last (by append order), and stale lessons were evicted at write
-    time. No cross-repo leakage: only reads the file for this specific repo.
+    Global lessons are generalizable patterns (regex, testing, API design)
+    that Haiku classified as cross-repo transferable. They give the agent
+    wisdom from Django when working on Sympy, for example.
+
+    Returns a markdown section or empty string if no lessons exist.
     """
     if not LEARN_FROM_FIX_ENABLED or not repo_name:
         return ""
 
+    parts = []
+    per_repo_tickets = set()
+
+    # --- Tier 1: Per-repo lessons ---
     lessons_path = _lessons_path(repo_name)
-    if not lessons_path.exists():
-        return ""
+    if lessons_path.exists():
+        try:
+            text = lessons_path.read_text(encoding="utf-8")
+            entries = _parse_lessons(text)
+            if entries:
+                selected = entries[-max_entries:]
+                per_repo_tickets = {e.get("ticket_id", "") for e in selected}
+                parts.append("## LESSONS FROM PAST RUNS IN THIS REPO")
+                parts.append("")
+                parts.append(
+                    f"{len(selected)} most recent lesson(s) from this repo. "
+                    "Each is a transferable pattern from a prior fix attempt."
+                )
+                parts.append("")
+                for e in selected:
+                    parts.append(e["header"])
+                    if e.get("body"):
+                        parts.append(e["body"])
+                    parts.append("")
+        except Exception as exc:
+            logger.debug("load_lessons: per-repo read failed (%s)", exc)
 
-    try:
-        text = lessons_path.read_text(encoding="utf-8")
-    except Exception as exc:
-        logger.debug("load_lessons: read failed (%s)", exc)
-        return ""
-
-    entries = _parse_lessons(text)
-    if not entries:
-        return ""
-
-    # Take newest-first, limit to max_entries
-    selected = entries[-max_entries:]
-    # Render compactly
-    parts = [
-        "## LESSONS FROM PAST RUNS IN THIS REPO",
-        "",
-        f"{len(selected)} most recent lesson(s). Each is a transferable pattern "
-        "from a prior fix attempt — use them to avoid re-discovering gotchas.",
-        "",
-    ]
-    for e in selected:
-        parts.append(e["header"])
-        if e.get("body"):
-            parts.append(e["body"])
+    # --- Tier 2: Global cross-repo lessons ---
+    global_entries = _load_global_lessons(
+        repo_name, MAX_GLOBAL_LESSONS_INJECTED, per_repo_tickets,
+    )
+    if global_entries:
+        parts.append("## CROSS-REPO PATTERNS (from other codebases)")
         parts.append("")
+        parts.append(
+            f"{len(global_entries)} universal pattern(s) learned from other repos. "
+            "These apply broadly — not specific to this codebase."
+        )
+        parts.append("")
+        for e in global_entries:
+            parts.append(e["header"])
+            if e.get("body"):
+                parts.append(e["body"])
+            parts.append("")
 
-    # Cap total length defensively — 3K chars max
+    if not parts:
+        return ""
+
     full = "\n".join(parts).rstrip() + "\n"
-    if len(full) > 3000:
-        full = full[:3000] + "\n[... older lessons truncated]\n"
+    # Cap total: 3K per-repo + 2K global = 5K max
+    if len(full) > 5000:
+        full = full[:5000] + "\n[... older lessons truncated]\n"
     return full
