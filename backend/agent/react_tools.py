@@ -77,6 +77,11 @@ def set_sandbox_path(sandbox_path: Path, branch_name: str, base_branch: str) -> 
     _tls.base_branch = base_branch
 
 
+def set_guardrail_state(gs) -> None:
+    """Store the GuardrailState on thread-local so tools can read files_read."""
+    _tls._guardrail_state = gs
+
+
 def get_sandbox_path() -> Path | None:
     """Get the current sandbox path."""
     return getattr(_tls, "sandbox_path", None)
@@ -1820,6 +1825,290 @@ def get_blast_radius(file_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# write_brt — context-aware BRT generation tool
+# ---------------------------------------------------------------------------
+
+
+def _find_test_template(sandbox_path: Path) -> str:
+    """Find an existing test file near suspected bug files and return its header.
+
+    Scans the sandbox for test files (test_*.py or *_test.py), reads the first
+    50 lines for imports, fixtures, and assertion patterns. This gives Haiku
+    a real template to emulate rather than hallucinating import paths.
+    """
+    test_patterns = list(sandbox_path.rglob("test_*.py"))[:20]
+    test_patterns += list(sandbox_path.rglob("*_test.py"))[:10]
+
+    # Prefer test files near the files the agent has read
+    gs = getattr(_tls, "_guardrail_state", None)
+    read_dirs: set[str] = set()
+    if gs and gs.files_read:
+        for fpath in gs.files_read:
+            parts = Path(fpath).parent.parts
+            read_dirs.update(str(Path(*parts[:i+1])) for i in range(len(parts)))
+
+    def _proximity_score(test_file: Path) -> int:
+        """Higher score = closer to files the agent read."""
+        rel = str(test_file.relative_to(sandbox_path))
+        for depth, part_prefix in enumerate(Path(rel).parent.parts):
+            partial = str(Path(*Path(rel).parent.parts[:depth+1]))
+            if partial in read_dirs:
+                return 100 - depth
+        return 0
+
+    # Sort by proximity, then by name (deterministic)
+    test_patterns.sort(key=lambda p: (-_proximity_score(p), p.name))
+
+    for test_file in test_patterns[:5]:
+        try:
+            lines = test_file.read_text(encoding="utf-8", errors="replace").splitlines()[:50]
+            header = "\n".join(lines)
+            if "import" in header or "def test_" in header:
+                rel_path = str(test_file.relative_to(sandbox_path))
+                return f"# Template from {rel_path}:\n{header}"
+        except (OSError, UnicodeDecodeError):
+            continue
+    return ""
+
+
+def _generate_brt_candidates(
+    files_context: str,
+    test_template: str,
+    work_order: dict,
+) -> list:
+    """Generate BRT candidates via Haiku structured call.
+
+    Returns list of BRTCandidate Pydantic objects, or empty list on failure.
+    """
+    from pydantic import BaseModel
+
+    class BRTCandidate(BaseModel):
+        test_code: str         # Complete pytest test (imports + def test_...)
+        description: str       # One sentence: what bug this reproduces
+        target_function: str   # Function name being tested
+
+    class BRTBatch(BaseModel):
+        candidates: list[BRTCandidate]
+
+    template_section = ""
+    if test_template:
+        template_section = (
+            "\n\n=== EXISTING TEST TEMPLATE (emulate imports and patterns) ===\n"
+            f"{test_template}\n"
+        )
+
+    title = work_order.get("title", "")
+    description = work_order.get("description", "")[:600]
+
+    prompt = (
+        f"BUG TITLE: {title}\n"
+        f"BUG DESCRIPTION: {description}\n\n"
+        f"=== CODE THE AGENT HAS READ (real source, not hallucinated) ===\n"
+        f"{files_context[:6000]}\n"
+        f"{template_section}\n"
+        "Generate 5-7 pytest test functions that:\n"
+        "1. FAIL on the CURRENT (broken) code — they catch the bug\n"
+        "2. Would PASS after a correct fix\n"
+        "3. Are self-contained with correct imports from the source files shown above\n"
+        "4. Use assert statements, NOT pytest.raises (unless the bug IS an unexpected exception)\n"
+        "5. Each test MUST start with 'def test_' and be a plain function (no class, no fixtures)\n"
+        "6. Include all necessary imports at the top of each test_code string\n\n"
+        "Use the import paths visible in the source code above. "
+        "Do NOT invent module paths."
+    )
+
+    try:
+        from agent.llm import structured_call as _structured_call, INTAKE_MODEL
+        batch = _structured_call(INTAKE_MODEL, 3500, BRTBatch, prompt)
+        return batch.candidates[:7]
+    except Exception as e:
+        logger.debug("BRT candidate generation failed: %s", e)
+        return []
+
+
+def _run_brt_candidate(sandbox: Path, test_code: str) -> dict:
+    """Run a single BRT candidate in the sandbox, return result dict.
+
+    Returns:
+        {"status": "confirmed"|"passed"|"error"|"timeout",
+         "exit_code": int|None,
+         "output": str}
+    """
+    import tempfile as _tempfile
+
+    code = test_code.strip()
+    if not code:
+        return {"status": "error", "exit_code": None, "output": "Empty test code"}
+
+    brt_python = _find_brt_python(sandbox)
+    tmp_path = None
+    try:
+        tmp_fd, tmp_path = _tempfile.mkstemp(
+            suffix=".py",
+            prefix=f"brt_gen_{uuid.uuid4().hex[:4]}_",
+            dir=str(sandbox),
+        )
+        os.close(tmp_fd)
+        Path(tmp_path).write_text(code, encoding="utf-8")
+
+        result = subprocess.run(
+            [brt_python, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
+            cwd=str(sandbox),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        output = (result.stdout + result.stderr).strip()
+
+        if result.returncode == 1:
+            # Test ran and FAILED = confirmed BRT (catches the bug)
+            return {"status": "confirmed", "exit_code": 1, "output": output[:500]}
+        elif result.returncode == 0:
+            # Test passed = does NOT catch the bug
+            return {"status": "passed", "exit_code": 0, "output": output[:300]}
+        else:
+            # Collection error, import error, etc.
+            return {"status": "error", "exit_code": result.returncode, "output": output[:500]}
+
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "exit_code": None, "output": "Test timed out (30s)"}
+    except Exception as e:
+        return {"status": "error", "exit_code": None, "output": str(e)[:300]}
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+@tool
+def write_brt() -> str:
+    """Generate Bug Reproduction Tests based on what you've learned.
+
+    Call AFTER exploring code and understanding the bug, BEFORE editing.
+    BRTs confirm the bug exists in the original code. After your fix,
+    run_tests includes BRTs automatically.
+    """
+    # --- Pre-condition checks ---
+    sandbox = getattr(_tls, "sandbox_path", None)
+    if not sandbox or not Path(sandbox).exists():
+        return "ERROR: No sandbox. BRTs need a sandbox to run against."
+
+    sandbox = Path(sandbox)
+
+    # Read files_read from guardrail state stored on _tls
+    gs = getattr(_tls, "_guardrail_state", None)
+    files_read = gs.files_read if gs else {}
+    if not files_read:
+        return "ERROR: No files read yet. Explore the code first, then call write_brt."
+
+    # --- Build context from agent's exploration ---
+    # files_read is {relative_path: content_snippet (first 200 chars)}
+    # Also pull full content from file_cache if available
+    file_cache = gs.file_cache if gs else {}
+    context_parts = []
+    for fpath, snippet in list(files_read.items())[:10]:
+        full_content = file_cache.get(fpath, "")
+        if full_content:
+            context_parts.append(f"# {fpath}\n{full_content}")
+        else:
+            # Read the file from sandbox if we only have the snippet
+            try:
+                full_path = sandbox / fpath
+                if full_path.exists():
+                    content = full_path.read_text(encoding="utf-8", errors="replace")[:4000]
+                    context_parts.append(f"# {fpath}\n{content}")
+                else:
+                    context_parts.append(f"# {fpath}\n{snippet}")
+            except OSError:
+                context_parts.append(f"# {fpath}\n{snippet}")
+
+    files_context = "\n\n".join(context_parts)
+
+    # --- Find test template ---
+    test_template = _find_test_template(sandbox)
+
+    # --- Get work order for bug description ---
+    work_order = {}
+    try:
+        # work_order is not on _tls, but we can reconstruct from ticket info
+        # The agent's messages contain the bug context; use what we have
+        repo_name = getattr(_tls, "repo_name", "unknown")
+        work_order = {"title": repo_name, "description": ""}
+    except Exception:
+        pass
+
+    # --- Generate candidates ---
+    candidates = _generate_brt_candidates(files_context, test_template, work_order)
+    if not candidates:
+        return "No BRT candidates generated. Proceed without BRTs."
+
+    # --- Run each candidate ---
+    confirmed_brts = []
+    candidate_count = len(candidates)
+    for cand in candidates:
+        if len(confirmed_brts) >= 3:
+            break
+
+        code = cand.test_code.strip()
+        if not code.startswith("def test_") and "def test_" not in code:
+            continue
+
+        run_result = _run_brt_candidate(sandbox, code)
+
+        if run_result["status"] == "confirmed":
+            # Extract short failure reason from output
+            output = run_result["output"]
+            # Find the assertion error line
+            fail_reason = ""
+            for line in output.splitlines():
+                if "AssertionError" in line or "AssertionError" in line or "assert" in line.lower():
+                    fail_reason = line.strip()[:100]
+                    break
+            if not fail_reason:
+                fail_reason = output.splitlines()[-1][:100] if output.splitlines() else "test failed"
+
+            confirmed_brts.append({
+                "code": code,
+                "description": cand.description[:200],
+                "target_function": cand.target_function,
+                "fail_output": output,
+                "fail_reason": fail_reason,
+            })
+            logger.info("BRT confirmed: '%s'", cand.description[:80])
+        else:
+            logger.debug(
+                "BRT candidate not confirmed (%s): %s",
+                run_result["status"], cand.description[:60],
+            )
+
+    # --- Store confirmed BRTs on _tls for run_tests/run_brt ---
+    if not confirmed_brts:
+        return (
+            f"Generated {candidate_count} BRT candidates, but none failed on original code. "
+            "Proceed without BRTs."
+        )
+
+    _tls.brts = confirmed_brts
+
+    # --- Format return message ---
+    lines = [
+        f"BRTs generated: {candidate_count} candidates, {len(confirmed_brts)} confirmed failing on original code.",
+        "Confirmed BRTs:",
+    ]
+    for i, brt in enumerate(confirmed_brts, 1):
+        lines.append(
+            f"  {i}. {brt['target_function']} — {brt['fail_reason']}"
+        )
+    lines.append("")
+    lines.append("run_tests will include these BRTs automatically after your fix.")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Tool collections
 # ---------------------------------------------------------------------------
 
@@ -1834,6 +2123,8 @@ MULTI_FILE_TOOLS = [get_callers]
 COMPLETION_TOOLS = [record_localization, request_review, submit_fix, escalate]
 # verify_fix is available but NOT wired into REACT_TOOLS yet (Task 6 will do that).
 VERIFY_TOOLS = [verify_fix]
+# write_brt is available but NOT wired into REACT_TOOLS yet (Task 6 will do that).
+BRT_TOOLS = [write_brt]
 
 # All react-specific tools (exploration tools are added from explore_tools.py)
 REACT_TOOLS = (

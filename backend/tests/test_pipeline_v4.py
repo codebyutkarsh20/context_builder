@@ -1112,3 +1112,384 @@ class TestScoutLocalizeNoReranker:
 
         # Only extractor + debugger models should appear, no opus
         assert "claude-opus-4-6" not in cost_calls
+
+
+# ---------------------------------------------------------------------------
+# Tests: Legacy gate removal (Task 5a)
+# Verifies that 6 legacy hard gates were removed from check_tool_call while
+# resource limits (tool budget, wall time, cost) and v4-era nudges remain.
+# ---------------------------------------------------------------------------
+
+class TestLegacyGatesRemoved:
+    """Verify that the 6 legacy gates are gone from check_tool_call."""
+
+    def _fresh_gs(self):
+        from agent.react_guardrails import GuardrailState
+        return GuardrailState()
+
+    # ── 1. Plan-gate removed ──────────────────────────────────────────────
+
+    def test_create_sandbox_allowed_without_plan(self):
+        """create_sandbox must NOT be blocked when plan_produced is False."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        assert gs.plan_produced is False, "precondition: no plan"
+        result = check_tool_call("create_sandbox", {}, gs)
+        assert result is None, f"plan-gate should be removed, got: {result}"
+
+    # ── 2. Sandbox-gate removed ───────────────────────────────────────────
+
+    def test_string_replace_allowed_without_sandbox(self):
+        """string_replace must NOT be blocked when sandbox_created is False."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        assert gs.sandbox_created is False, "precondition: no sandbox"
+        result = check_tool_call("string_replace", {"file_path": "foo.py"}, gs)
+        assert result is None, f"sandbox-gate should be removed, got: {result}"
+
+    def test_create_file_allowed_without_sandbox(self):
+        """create_file must NOT be blocked when sandbox_created is False."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        result = check_tool_call("create_file", {"file_path": "new.py"}, gs)
+        assert result is None, f"sandbox-gate should be removed, got: {result}"
+
+    def test_run_tests_allowed_without_sandbox(self):
+        """run_tests must NOT be blocked when sandbox_created is False."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        result = check_tool_call("run_tests", {}, gs)
+        assert result is None, f"sandbox-gate should be removed, got: {result}"
+
+    # ── 3. Read-before-edit gate removed ──────────────────────────────────
+
+    def test_string_replace_allowed_without_prior_read(self):
+        """string_replace must NOT warn when file hasn't been read first."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        assert "unread.py" not in gs.files_read, "precondition: file not read"
+        result = check_tool_call("string_replace", {"file_path": "unread.py"}, gs)
+        assert result is None, f"read-before-edit gate should be removed, got: {result}"
+
+    # ── 4. Review-before-submit gate removed ──────────────────────────────
+
+    def test_submit_no_review_warning(self):
+        """submit_fix must NOT mention review when review_approved is False."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        gs.sandbox_created = True
+        gs.tests_attempted = True
+        gs.tests_passed = True
+        gs.review_approved = False
+        result = check_tool_call("submit_fix", {}, gs)
+        # Should pass cleanly — no warning about review
+        if result is not None:
+            assert "review" not in result.lower(), (
+                f"review-before-submit gate should be removed, got: {result}"
+            )
+
+    # ── 5. Grep count warning at 8 removed ───────────────────────────────
+
+    def test_grep_allowed_at_high_count(self):
+        """grep_repo must NOT warn when grep_count >= 8."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        gs.grep_count = 10
+        result = check_tool_call("grep_repo", {}, gs)
+        assert result is None, f"grep count warning should be removed, got: {result}"
+
+    # ── 6. Run_tests retry warning at 3 removed ──────────────────────────
+
+    def test_run_tests_allowed_at_high_count(self):
+        """run_tests must NOT warn when run_tests_count >= 3."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        gs.run_tests_count = 5
+        result = check_tool_call("run_tests", {}, gs)
+        assert result is None, f"run_tests retry warning should be removed, got: {result}"
+
+    # ── Kept gates still work ─────────────────────────────────────────────
+
+    def test_tool_budget_still_enforced(self):
+        """Tool call limit must still block non-terminal tools."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        gs.tool_call_count = gs.max_tool_calls  # at limit
+        result = check_tool_call("grep_repo", {}, gs)
+        assert result is not None and "Tool call limit" in result
+
+    def test_tool_budget_allows_terminal_tools(self):
+        """Terminal tools (submit_fix, escalate) bypass tool call limit."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        gs.tool_call_count = gs.max_tool_calls
+        gs.sandbox_created = True
+        gs.tests_attempted = True
+        gs.tests_passed = True
+        result = check_tool_call("submit_fix", {}, gs)
+        # Should not get the tool-call-limit error
+        assert result is None or "Tool call limit" not in result
+
+    def test_run_shell_nudge_still_present(self):
+        """run_shell_count >= 6 nudge must still be present (v4-era, kept)."""
+        from agent.react_guardrails import check_tool_call
+        gs = self._fresh_gs()
+        gs.run_shell_count = 6
+        result = check_tool_call("run_shell", {}, gs)
+        assert result is not None and "run_shell" in result
+
+
+# ---------------------------------------------------------------------------
+# Tests: write_brt tool (Task 3)
+# Context-aware BRT generation — replaces blind brt_node pipeline stage.
+# ---------------------------------------------------------------------------
+
+class TestWriteBrt:
+    """Tests for the write_brt tool and its helpers."""
+
+    def _setup_tls(self, sandbox_path=None, files_read=None, brts=None):
+        """Configure _tls for write_brt tests."""
+        from agent.react_tools import _tls, set_guardrail_state
+        from agent.react_guardrails import GuardrailState
+
+        _tls.sandbox_path = sandbox_path
+        _tls.brts = brts or []
+
+        gs = GuardrailState()
+        if files_read:
+            gs.files_read = files_read
+        set_guardrail_state(gs)
+        return gs
+
+    # ── Error cases ───────────────────────────────────────────────────────
+
+    def test_no_sandbox_returns_error(self):
+        """write_brt must return ERROR when no sandbox exists."""
+        self._setup_tls(sandbox_path=None)
+        from agent.react_tools import write_brt
+        result = write_brt.invoke({})
+        assert "ERROR" in result
+        assert "sandbox" in result.lower()
+
+    def test_no_files_read_returns_error(self, tmp_path):
+        """write_brt must return ERROR when no files have been read."""
+        self._setup_tls(sandbox_path=tmp_path, files_read={})
+        from agent.react_tools import write_brt
+        result = write_brt.invoke({})
+        assert "ERROR" in result
+        assert "files read" in result.lower()
+
+    def test_no_candidates_generated(self, tmp_path):
+        """write_brt returns graceful message when Haiku returns nothing."""
+        self._setup_tls(
+            sandbox_path=tmp_path,
+            files_read={"src/app.py": "def broken(): return 1"},
+        )
+        from agent.react_tools import write_brt
+
+        with patch("agent.react_tools._generate_brt_candidates", return_value=[]):
+            result = write_brt.invoke({})
+        assert "No BRT candidates generated" in result
+
+    # ── Confirmed BRTs stored on _tls ─────────────────────────────────────
+
+    def test_confirmed_brts_stored_on_tls(self, tmp_path):
+        """Confirmed BRTs must be stored on _tls.brts for run_brt to find."""
+        from pydantic import BaseModel
+
+        class FakeCandidate(BaseModel):
+            test_code: str = "def test_bug():\n    assert 1 == 2"
+            description: str = "catches the bug"
+            target_function: str = "broken_func"
+
+        self._setup_tls(
+            sandbox_path=tmp_path,
+            files_read={"src/app.py": "def broken(): return 1"},
+        )
+
+        candidates = [FakeCandidate()]
+
+        with patch("agent.react_tools._generate_brt_candidates", return_value=candidates), \
+             patch("agent.react_tools._run_brt_candidate", return_value={
+                 "status": "confirmed",
+                 "exit_code": 1,
+                 "output": "FAILED test_bug - assert 1 == 2",
+             }):
+            from agent.react_tools import write_brt, _tls
+            result = write_brt.invoke({})
+
+        assert "confirmed" in result.lower()
+        assert len(_tls.brts) == 1
+        assert _tls.brts[0]["target_function"] == "broken_func"
+
+    def test_none_confirmed_returns_message(self, tmp_path):
+        """When all candidates pass, return informative message."""
+        from pydantic import BaseModel
+
+        class FakeCandidate(BaseModel):
+            test_code: str = "def test_ok():\n    assert 1 == 1"
+            description: str = "should pass"
+            target_function: str = "ok_func"
+
+        self._setup_tls(
+            sandbox_path=tmp_path,
+            files_read={"src/app.py": "def ok(): return 1"},
+        )
+
+        with patch("agent.react_tools._generate_brt_candidates", return_value=[FakeCandidate()]), \
+             patch("agent.react_tools._run_brt_candidate", return_value={
+                 "status": "passed",
+                 "exit_code": 0,
+                 "output": "1 passed",
+             }):
+            from agent.react_tools import write_brt
+            result = write_brt.invoke({})
+
+        assert "none failed" in result.lower() or "but none" in result.lower()
+
+    # ── Return format ─────────────────────────────────────────────────────
+
+    def test_return_format_includes_count_and_descriptions(self, tmp_path):
+        """Return string must list candidate count, confirmed count, and BRT names."""
+        from pydantic import BaseModel
+
+        class FakeCandidate(BaseModel):
+            test_code: str
+            description: str
+            target_function: str
+
+        cands = [
+            FakeCandidate(
+                test_code="def test_a():\n    assert False",
+                description="catches regression",
+                target_function="func_a",
+            ),
+            FakeCandidate(
+                test_code="def test_b():\n    assert False",
+                description="edge case",
+                target_function="func_b",
+            ),
+        ]
+
+        self._setup_tls(
+            sandbox_path=tmp_path,
+            files_read={"src/module.py": "def func_a(): pass"},
+        )
+
+        call_count = [0]
+        def mock_run(sandbox, code):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return {"status": "confirmed", "exit_code": 1, "output": "assert False"}
+            return {"status": "passed", "exit_code": 0, "output": "ok"}
+
+        with patch("agent.react_tools._generate_brt_candidates", return_value=cands), \
+             patch("agent.react_tools._run_brt_candidate", side_effect=mock_run):
+            from agent.react_tools import write_brt
+            result = write_brt.invoke({})
+
+        assert "2 candidates" in result
+        assert "1 confirmed" in result
+        assert "func_a" in result
+        assert "run_tests will include" in result
+
+    # ── Helper: _find_test_template ───────────────────────────────────────
+
+    def test_find_test_template_finds_nearby_test(self, tmp_path):
+        """_find_test_template should return header of a nearby test file."""
+        from agent.react_tools import _find_test_template, _tls, set_guardrail_state
+        from agent.react_guardrails import GuardrailState
+
+        # Create a test file in the sandbox
+        test_dir = tmp_path / "tests"
+        test_dir.mkdir()
+        test_file = test_dir / "test_example.py"
+        test_file.write_text(
+            "import pytest\nfrom mymodule import helper\n\n"
+            "def test_basic():\n    assert helper() == 42\n"
+        )
+
+        gs = GuardrailState()
+        gs.files_read = {"tests/test_example.py": "import pytest"}
+        set_guardrail_state(gs)
+        _tls.sandbox_path = tmp_path
+
+        result = _find_test_template(tmp_path)
+        assert "import pytest" in result
+        assert "test_example.py" in result
+
+    def test_find_test_template_returns_empty_when_no_tests(self, tmp_path):
+        """_find_test_template returns '' when no test files exist."""
+        from agent.react_tools import _find_test_template, set_guardrail_state
+        from agent.react_guardrails import GuardrailState
+
+        gs = GuardrailState()
+        set_guardrail_state(gs)
+
+        result = _find_test_template(tmp_path)
+        assert result == ""
+
+    # ── Helper: _run_brt_candidate ────────────────────────────────────────
+
+    def test_run_brt_candidate_confirmed(self, tmp_path):
+        """_run_brt_candidate returns 'confirmed' for exit code 1."""
+        from agent.react_tools import _run_brt_candidate, _tls
+
+        _tls.sandbox_path = tmp_path
+        # No original_repo_path — will use sys.executable
+        if hasattr(_tls, "original_repo_path"):
+            delattr(_tls, "original_repo_path")
+        _tls.repo_path = None
+
+        test_code = "import sys\ndef test_fail():\n    assert False, 'expected failure'\n"
+        result = _run_brt_candidate(tmp_path, test_code)
+        assert result["status"] == "confirmed"
+        assert result["exit_code"] == 1
+
+    def test_run_brt_candidate_passed(self, tmp_path):
+        """_run_brt_candidate returns 'passed' for exit code 0."""
+        from agent.react_tools import _run_brt_candidate, _tls
+
+        _tls.sandbox_path = tmp_path
+        if hasattr(_tls, "original_repo_path"):
+            delattr(_tls, "original_repo_path")
+        _tls.repo_path = None
+
+        test_code = "def test_pass():\n    assert True\n"
+        result = _run_brt_candidate(tmp_path, test_code)
+        assert result["status"] == "passed"
+        assert result["exit_code"] == 0
+
+    def test_run_brt_candidate_empty_code(self, tmp_path):
+        """_run_brt_candidate returns 'error' for empty test code."""
+        from agent.react_tools import _run_brt_candidate
+        result = _run_brt_candidate(tmp_path, "")
+        assert result["status"] == "error"
+
+    # ── BRT_TOOLS collection ──────────────────────────────────────────────
+
+    def test_brt_tools_collection_exists(self):
+        """BRT_TOOLS must be importable and contain write_brt."""
+        from agent.react_tools import BRT_TOOLS, write_brt
+        assert write_brt in BRT_TOOLS
+        assert len(BRT_TOOLS) == 1
+
+    def test_write_brt_not_in_react_tools(self):
+        """write_brt must NOT be in REACT_TOOLS yet (Task 6 wires it in)."""
+        from agent.react_tools import REACT_TOOLS, write_brt
+        tool_names = [t.name for t in REACT_TOOLS]
+        assert "write_brt" not in tool_names
+
+    # ── set_guardrail_state setter ────────────────────────────────────────
+
+    def test_set_guardrail_state_stores_on_tls(self):
+        """set_guardrail_state must store gs on _tls._guardrail_state."""
+        from agent.react_tools import _tls, set_guardrail_state
+        from agent.react_guardrails import GuardrailState
+
+        gs = GuardrailState()
+        gs.files_read = {"foo.py": "content"}
+        set_guardrail_state(gs)
+
+        assert _tls._guardrail_state is gs
+        assert _tls._guardrail_state.files_read == {"foo.py": "content"}
