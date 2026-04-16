@@ -54,10 +54,24 @@ def set_react_context(
     # Reset edit history — undo_last_edit must not see edits from prior runs
     if hasattr(_tls, "edit_history"):
         delattr(_tls, "edit_history")
+    # Reset BRTs — prevent stale BRTs from prior run on same thread
+    _tls.brts = []
+    # Reset original_repo_path — captured at sandbox creation, don't leak across runs
+    if hasattr(_tls, "original_repo_path"):
+        delattr(_tls, "original_repo_path")
 
 
 def set_sandbox_path(sandbox_path: Path, branch_name: str, base_branch: str) -> None:
-    """Update the sandbox path after creation (called from create_sandbox tool)."""
+    """Update the sandbox path after creation (called from create_sandbox tool).
+
+    Also snapshots original_repo_path before it gets overwritten — BRTs need
+    the original venv location, which lives as a sibling of the original repo.
+    """
+    # Snapshot original repo_path BEFORE we later overwrite _tls.repo_path with sandbox
+    if not hasattr(_tls, "original_repo_path"):
+        orig = getattr(_tls, "repo_path", None)
+        if orig:
+            _tls.original_repo_path = Path(orig)
     _tls.sandbox_path = sandbox_path
     _tls.branch_name = branch_name
     _tls.base_branch = base_branch
@@ -321,24 +335,32 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
         count = content.count(old_string)
 
         if count == 0:
-            # Try whitespace-normalized match
-            lines = content.splitlines()
-            old_lines = old_string.splitlines()
-            norm_content = [l.rstrip() for l in lines]
-            norm_old = [l.rstrip() for l in old_lines]
+            # Try whitespace-normalized match — use exact byte offsets to avoid
+            # replacing the wrong occurrence when duplicates with different
+            # trailing whitespace exist.
+            lines = content.splitlines(True)  # keepends=True to preserve line endings
+            old_lines_list = old_string.splitlines()
+            norm_content = [l.rstrip() for l in content.splitlines()]
+            norm_old = [l.rstrip() for l in old_lines_list]
+            match_found = False
             for i in range(len(norm_content) - len(norm_old) + 1):
                 if norm_content[i:i + len(norm_old)] == norm_old:
-                    actual_old = "\n".join(lines[i:i + len(norm_old)])
-                    new_ws_content = content.replace(actual_old, new_string, 1)
+                    # Calculate exact byte offset of the matched lines
+                    before_match = "".join(lines[:i])
+                    matched_text = "".join(lines[i:i + len(norm_old)])
+                    after_match = "".join(lines[i + len(norm_old):])
+                    new_ws_content = before_match + new_string + after_match
                     _record_edit_snapshot(file_path, content, new_ws_content, "string_replace")
                     resolved.write_text(new_ws_content, encoding="utf-8")
                     autofix_msg = _try_autofix(resolved)
                     result = f"OK: replaced (whitespace-normalized) in {file_path}"
+                    match_found = True
                     return f"{result}\n{autofix_msg}" if autofix_msg else result
-            return (
-                f"ERROR: old_string not found in {file_path}.\n"
-                f"Use read_file or read_function to get the current exact content."
-            )
+            if not match_found:
+                return (
+                    f"ERROR: old_string not found in {file_path}.\n"
+                    f"Use read_file or read_function to get the current exact content."
+                )
         elif count > 1:
             return (
                 f"ERROR: old_string appears {count} times in {file_path}. "
@@ -364,6 +386,99 @@ def string_replace(file_path: str, old_string: str, new_string: str) -> str:
         return result
     except Exception as e:
         return f"ERROR: {e}"
+
+
+def _format_commit_message(explanation: str) -> tuple[str, str]:
+    """Format an explanation into a proper commit subject + body.
+
+    Subject: ≤72 chars, word-break (no mid-word truncation), first sentence.
+    Body:    remaining text wrapped at 72 chars, or empty if subject covers it.
+
+    Returns (subject, body) — body may be empty.
+    """
+    MAX_SUBJECT = 72
+    text = (explanation or "Automated fix").strip()
+    # First sentence or first line
+    first = text.split("\n", 1)[0]
+    # Split on ". " boundary for subject if first line is too long
+    if ". " in first[:200]:
+        sentence = first.split(". ", 1)[0] + "."
+    else:
+        sentence = first
+
+    # Build subject: "fix: <sentence>" capped at 72 chars with word break
+    prefix = "fix: "
+    budget = MAX_SUBJECT - len(prefix)
+    if len(sentence) <= budget:
+        subject = prefix + sentence
+    else:
+        trimmed = sentence[:budget - 1]  # -1 for ellipsis
+        if " " in trimmed:
+            trimmed = trimmed.rsplit(" ", 1)[0]
+        subject = f"{prefix}{trimmed}…"
+
+    # Body: everything else, wrapped at 72 cols
+    remaining = text[len(sentence):].strip(". \n")
+    if not remaining:
+        return subject, ""
+    # Simple word-wrap at 72
+    import textwrap
+    body = "\n".join(
+        textwrap.fill(para, width=72) for para in remaining.split("\n\n")
+    )
+    return subject, body
+
+
+def _find_brt_python(sandbox: Path) -> str:
+    """Find the correct Python interpreter for running BRTs.
+
+    Priority:
+      1. Sandbox's own .venv / venv / env (if agent created one)
+      2. Original repo's sibling _venv (eval pattern: {repo}_venv/)
+      3. _tls.repo_path venv (stored before sandbox creation)
+      4. sys.executable as last resort
+
+    Without this, BRTs run with wrong package versions → ModuleNotFoundError
+    that looks like logic failure.
+    """
+    # 1. Sandbox-local venv
+    for venv_dir in (".venv", "venv", "env"):
+        candidate = sandbox / venv_dir / "bin" / "python"
+        if candidate.exists():
+            return str(candidate)
+
+    # 2. Eval pattern: sandbox name = agent_sandbox_{repo_stem}_{hex},
+    #    venv is at eval/repos/{repo_stem}_venv/bin/python
+    import re
+    sandbox_name = sandbox.name  # e.g. agent_sandbox_django_42e8cf47_abc123
+    m = re.match(r"agent_sandbox_(.+)_[a-f0-9]{6,}$", sandbox_name)
+    if m:
+        repo_stem = m.group(1)
+        # Search common eval repo parents
+        for parent in (
+            Path("eval/repos"),
+            Path("/Users/utkarshpatidar/Projects/personal/context_builder/backend/eval/repos"),
+            Path("/Users/utkarshpatidar/Projects/personal/context_builder/eval/repos"),
+        ):
+            venv_py = parent / f"{repo_stem}_venv" / "bin" / "python"
+            if venv_py.exists():
+                return str(venv_py.resolve())
+
+    # 3. Original repo_path from TLS (set before sandbox creation)
+    orig_repo = getattr(_tls, "original_repo_path", None) or getattr(_tls, "repo_path", None)
+    if orig_repo:
+        orig_repo = Path(orig_repo)
+        # Check sibling _venv dir
+        sibling_venv = orig_repo.parent / f"{orig_repo.name}_venv" / "bin" / "python"
+        if sibling_venv.exists():
+            return str(sibling_venv)
+        # Check in-repo venv
+        for venv_dir in (".venv", "venv", "env"):
+            candidate = orig_repo / venv_dir / "bin" / "python"
+            if candidate.exists():
+                return str(candidate)
+
+    return sys.executable
 
 
 def _try_autofix(file_path: Path) -> str:
@@ -408,7 +523,8 @@ def undo_last_edit() -> str:
     if not history:
         return "ERROR: No edits to undo (edit_history is empty)."
 
-    last = history.pop()
+    # Peek at last entry without popping — only pop after successful revert
+    last = history[-1]
     file_path = last["file_path"]
     before = last["before_content"]
     tool_name = last["tool"]
@@ -426,19 +542,19 @@ def undo_last_edit() -> str:
             # File was newly created — undoing means deleting it
             if resolved.exists():
                 resolved.unlink()
-                return f"OK: undone — deleted newly-created file {file_path}"
-            return f"OK: undone — file {file_path} already absent"
+            history.pop()  # Pop only after successful filesystem operation
+            return f"OK: undone — deleted newly-created file {file_path}"
         # File existed before — restore prior content
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(before, encoding="utf-8")
+        history.pop()  # Pop only after successful filesystem operation
         return (
             f"OK: undone {tool_name} on {file_path} — "
             f"restored {len(before)} chars of prior content. "
             f"({len(history)} earlier edit(s) still in history.)"
         )
     except Exception as e:
-        # Restore the history entry on failure so the agent can retry
-        history.append(last)
+        # History entry NOT popped — agent can retry
         return f"ERROR: failed to revert {file_path}: {e}"
 
 
@@ -707,6 +823,36 @@ def create_sandbox() -> str:
         # Update thread-local context
         set_sandbox_path(worktree_path, branch_name, base_branch)
 
+        # ------------------------------------------------------------------
+        # Baseline test snapshot: run tests BEFORE any edits so we can later
+        # distinguish pre-existing failures from regressions caused by the
+        # agent's fix. This is the Agentless/OpenHands technique that prevents
+        # false "tests failed" from broken test infra.
+        # ------------------------------------------------------------------
+        _tls.baseline_test_failures = set()  # default: empty (all failures are new)
+        try:
+            from agent.sandbox import run_tests as _sb_run_tests
+            baseline_out = _sb_run_tests(
+                worktree_path=worktree_path, repo_path=repo_path,
+                test_path="", timeout=120,
+            )
+            if baseline_out.startswith("failed"):
+                # Extract test names from baseline output for regression filtering
+                import re as _re
+                failed_tests = set(_re.findall(
+                    r"FAILED\s+([\w/.:]+)", baseline_out,
+                ))
+                _tls.baseline_test_failures = failed_tests
+                logger.info(
+                    "Baseline snapshot: %d pre-existing test failures captured",
+                    len(failed_tests),
+                )
+            else:
+                logger.info("Baseline snapshot: tests %s (no pre-existing failures)",
+                            baseline_out[:30])
+        except Exception as e:
+            logger.debug("Baseline test snapshot skipped: %s", e)
+
         logger.info("Sandbox created: %s (branch: %s)", worktree_path, branch_name)
         return (
             f"OK: Sandbox created at {worktree_path}\n"
@@ -756,14 +902,15 @@ def run_tests(test_path: str = "") -> str:
             ["git", "status", "--porcelain"],
             cwd=sandbox, capture_output=True, text=True, timeout=30,
         )
+        _lintable_exts = (".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go")
         for line in status_result.stdout.splitlines():
             if line.startswith("??"):
                 f = line[3:].strip()
-                if f.endswith(".py"):
+                if f.endswith(_lintable_exts):
                     new_files.append(f)
             elif line and line[0] in ("M", " ") and line[1] in ("M",):
                 f = line[3:].strip()
-                if f.endswith(".py"):
+                if f.endswith(_lintable_exts):
                     modified_files.append(f)
 
         # Also check staged modifications
@@ -773,7 +920,7 @@ def run_tests(test_path: str = "") -> str:
         )
         for f in diff_result.stdout.splitlines():
             f = f.strip()
-            if f.endswith(".py") and f not in modified_files and f not in new_files:
+            if f.endswith(_lintable_exts) and f not in modified_files and f not in new_files:
                 modified_files.append(f)
 
         # Lint new files fully (agent owns 100% of their content)
@@ -806,13 +953,133 @@ def run_tests(test_path: str = "") -> str:
     # - Auto-detection (pytest, npm test, make test)
     # - test_path targeting (appended to the discovered/configured command)
     try:
+        # Detect the language of edited files to pick the right test runner.
+        # Prevents running pytest on a frontend JS change (or vice-versa).
+        edited_langs = _detect_edited_file_langs(sandbox)
+
         from agent.sandbox import run_tests as _run_tests
-        test_output = _run_tests(sandbox, repo_path=repo_path, test_path=test_path)
+        test_output = _run_tests(
+            sandbox, repo_path=repo_path, test_path=test_path,
+            edited_langs=edited_langs,
+        )
         classified = _classify_sandbox_output(test_output)
+
+        # ------------------------------------------------------------------
+        # Regression filtering: strip pre-existing failures from the result.
+        # If a test was ALREADY failing before the agent's fix, it's not a
+        # regression — don't blame the agent for it.
+        # Technique from Agentless (UIUC, 2024): 32% pass rate at $0.70.
+        # ------------------------------------------------------------------
+        baseline = getattr(_tls, "baseline_test_failures", set())
+        if baseline and classified.startswith("failed"):
+            import re as _re
+            current_failures = set(_re.findall(r"FAILED\s+([\w/.:]+)", classified))
+            new_failures = current_failures - baseline
+            pre_existing = current_failures & baseline
+            if pre_existing:
+                logger.info(
+                    "Regression filter: %d pre-existing, %d new failures",
+                    len(pre_existing), len(new_failures),
+                )
+                if not new_failures:
+                    # ALL failures are pre-existing — treat as passed
+                    classified = (
+                        f"passed (with {len(pre_existing)} pre-existing failures filtered out)\n"
+                        + classified
+                    )
+                else:
+                    classified = (
+                        f"failed: {len(new_failures)} NEW failures "
+                        f"(+ {len(pre_existing)} pre-existing, filtered out)\n"
+                        + "\n".join(f"  NEW: {f}" for f in sorted(new_failures)[:10])
+                        + "\n" + classified
+                    )
+
         results.append(classified)
+
+        # If tests didn't actually run (exit 5/4, "no tests collected"), don't just
+        # move on — try the alternate runner based on edited file types.
+        if (classified.startswith("skipped") or classified.startswith("error")) \
+                and edited_langs and test_path == "":
+            logger.info("Tests skipped/errored — trying alternate runner based on edited files")
+            alt_output = _try_alternate_runner(sandbox, repo_path, edited_langs)
+            if alt_output:
+                alt_classified = _classify_sandbox_output(alt_output)
+                results.append(f"Alternate runner tried: {alt_classified}")
+                if alt_classified.startswith("passed"):
+                    return alt_classified + "\n" + "\n".join(results)
+
         return classified + "\n" + "\n".join(results)
     except Exception as e:
         return f"error: test execution failed ({e})"
+
+
+def _detect_edited_file_langs(sandbox: Path) -> set[str]:
+    """Return a set of language tags for files the agent has edited.
+
+    Tags: 'python', 'js', 'ts', 'go', 'rust' — used to pick the right test runner.
+    """
+    langs: set[str] = set()
+    try:
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=sandbox, capture_output=True, text=True, timeout=10,
+        )
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=sandbox, capture_output=True, text=True, timeout=10,
+        )
+        files = set(diff.stdout.splitlines())
+        for line in status.stdout.splitlines():
+            if len(line) > 3:
+                files.add(line[3:].strip())
+        for f in files:
+            f = f.lower()
+            if f.endswith(".py"):
+                langs.add("python")
+            elif f.endswith((".js", ".jsx", ".mjs", ".cjs")):
+                langs.add("js")
+            elif f.endswith((".ts", ".tsx")):
+                langs.add("ts")
+            elif f.endswith(".go"):
+                langs.add("go")
+            elif f.endswith(".rs"):
+                langs.add("rust")
+    except Exception:
+        pass
+    return langs
+
+
+def _try_alternate_runner(sandbox: Path, repo_path: Path, edited_langs: set[str]) -> str:
+    """Try a fallback test runner when the primary produced no results.
+
+    Useful when a repo has both Python + JS tests and the default runner
+    only covers one side. Looks for npm test / vitest / jest when JS was
+    edited, or pytest when Python was edited.
+    """
+    cwd = sandbox
+    try:
+        if "js" in edited_langs or "ts" in edited_langs:
+            # Try npm test, then vitest directly, then jest
+            for cmd in (["npm", "test", "--silent"], ["npx", "vitest", "run"], ["npx", "jest"]):
+                result = subprocess.run(
+                    cmd, cwd=cwd, capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode in (0, 1):
+                    return (result.stdout + "\n" + result.stderr).strip()[:3000]
+        elif "go" in edited_langs:
+            result = subprocess.run(
+                ["go", "test", "./..."], cwd=cwd, capture_output=True, text=True, timeout=120,
+            )
+            return (result.stdout + "\n" + result.stderr).strip()[:3000]
+        elif "rust" in edited_langs:
+            result = subprocess.run(
+                ["cargo", "test"], cwd=cwd, capture_output=True, text=True, timeout=180,
+            )
+            return (result.stdout + "\n" + result.stderr).strip()[:3000]
+    except Exception as e:
+        logger.debug("Alternate runner failed: %s", e)
+    return ""
 
 
 def _start_speculative_review(sandbox: Path) -> None:
@@ -927,6 +1194,11 @@ def run_brt() -> str:
     if not brts:
         return "No Bug Reproduction Tests were generated for this bug (non-Python repo or no confirmed BRTs). Use run_tests instead."
 
+    # Use the sandbox's venv python if available, not the agent harness's python.
+    # Without this, BRTs run with the WRONG package versions and fail with
+    # ModuleNotFoundError that masquerades as logic failure.
+    brt_python = _find_brt_python(sandbox)
+
     results = []
     pass_count = 0
 
@@ -939,14 +1211,18 @@ def run_brt() -> str:
         try:
             import tempfile
             import uuid
+            # Write the temp file INSIDE the sandbox, not /tmp, so import paths
+            # resolve the same way they did when the BRT was originally confirmed
+            # against the pre-patched code.
             tmp_fd, tmp_path = tempfile.mkstemp(
                 suffix=".py", prefix=f"brt_{i}_{uuid.uuid4().hex[:4]}_",
+                dir=str(sandbox),
             )
             os.close(tmp_fd)
             Path(tmp_path).write_text(code, encoding="utf-8")
 
             result = subprocess.run(
-                [sys.executable, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
+                [brt_python, "-m", "pytest", tmp_path, "--tb=short", "-x", "-q", "--no-header"],
                 cwd=str(sandbox),
                 capture_output=True, text=True, timeout=30,
             )
@@ -1146,6 +1422,166 @@ verdict: APPROVE if all checks pass. CHANGES_REQUESTED if any fail. ESCALATE if 
             return f"ERROR: Review failed: {e2}"
 
 
+# ---------------------------------------------------------------------------
+# verify_fix — forked subagent verification (replaces Opus in-loop review)
+# ---------------------------------------------------------------------------
+
+# Anti-rationalization probe keywords: if the verifier approves but its
+# explanation lacks ANY of these, the approval is downgraded.
+_PROBE_KEYWORDS = frozenset({
+    "boundary", "concurrency", "edge", "empty", "none", "null",
+    "probe", "checked", "verified", "tested", "confirmed",
+    "corner", "race", "overflow", "underflow", "negative",
+    "zero", "max", "min", "limit",
+})
+
+
+def _run_forked_verification(explanation: str) -> dict:
+    """Run a forked Sonnet instance to independently review the fix.
+
+    Uses the parent's prompt cache when available (via CacheSafeParams),
+    falling back to a fresh structured_call otherwise.
+
+    Returns dict with keys: verdict, confidence, explanation, regression_risk, cached, error.
+    """
+    from pydantic import BaseModel
+
+    class VerifierResult(BaseModel):
+        verdict: str          # "APPROVE" or "REJECT"
+        confidence: float     # 0.0-1.0
+        explanation: str = ""  # Why APPROVE/REJECT in 2-3 sentences
+        regression_risk: str = "MEDIUM"  # "LOW", "MEDIUM", "HIGH"
+
+    task_prompt = (
+        "You are an independent reviewer. The conversation above shows\n"
+        "an agent fixing a bug. The agent believes: {explanation}\n\n"
+        "Challenge this adversarially:\n"
+        "1. Is the root cause correct? Look for alternative explanations.\n"
+        "2. Does the fix fully address it? Check edge cases.\n"
+        "3. Were callers/importers of modified code checked?\n"
+        "4. Do the test results actually prove the fix works?\n\n"
+        "You MUST attempt to find problems. An APPROVE without specific\n"
+        "probe evidence will be downgraded."
+    ).format(explanation=explanation)
+
+    try:
+        from agent.forked_subagent import run_forked_subagent, get_last_cache_safe_params
+
+        params = get_last_cache_safe_params()
+
+        if params is not None:
+            # Cache-reusing path: fork the parent's conversation
+            result = run_forked_subagent(
+                task_prompt,
+                schema=VerifierResult,
+                max_tokens=1500,
+                timeout=60.0,
+            )
+
+            if result.get("error"):
+                logger.warning("Forked verifier error: %s — falling back to structured_call", result["error"])
+                raise RuntimeError(result["error"])
+
+            parsed = result.get("parsed")
+            if parsed is None:
+                raise RuntimeError("Forked subagent returned no parsed result")
+
+            return {
+                "verdict": parsed.verdict,
+                "confidence": parsed.confidence,
+                "explanation": parsed.explanation,
+                "regression_risk": parsed.regression_risk,
+                "cached": result.get("cached", False),
+                "error": None,
+            }
+
+        # No cache params — fall through to structured_call
+        logger.info("No cache params available for forked verifier — using structured_call fallback")
+        raise RuntimeError("no cache params")
+
+    except Exception as exc:
+        # Fallback: direct structured_call with Sonnet
+        logger.info("Forked verifier fallback to structured_call: %s", exc)
+        try:
+            from agent.llm import structured_call as _structured_call
+            parsed = _structured_call("claude-sonnet-4-6", 1500, VerifierResult, task_prompt)
+            return {
+                "verdict": parsed.verdict,
+                "confidence": parsed.confidence,
+                "explanation": parsed.explanation,
+                "regression_risk": parsed.regression_risk,
+                "cached": False,
+                "error": None,
+            }
+        except Exception as fallback_exc:
+            logger.warning("Structured call fallback also failed: %s", fallback_exc)
+            return {
+                "verdict": "REJECT",
+                "confidence": 0.0,
+                "explanation": f"Verification failed: {fallback_exc}",
+                "regression_risk": "HIGH",
+                "cached": False,
+                "error": str(fallback_exc),
+            }
+
+
+@tool
+def verify_fix(explanation: str) -> str:
+    """Fork your conversation for independent review of your fix.
+
+    A separate Sonnet instance reads your FULL conversation history
+    and judges the fix. Its reasoning stays in the fork — you only
+    receive the structured verdict.
+
+    Call AFTER editing + testing. If rejected, read feedback and adapt.
+    Can be called multiple times.
+
+    Args:
+        explanation: Why you believe this fix is correct (2-3 sentences).
+    Returns:
+        "APPROVED (confidence: 0.92): <summary>" or
+        "REJECTED (confidence: 0.85): <feedback>"
+    """
+    sandbox = getattr(_tls, "sandbox_path", None)
+    if not sandbox or not Path(sandbox).exists():
+        return "ERROR: No sandbox exists. Cannot verify without changes."
+
+    result = _run_forked_verification(explanation)
+
+    verdict = result["verdict"].upper().strip()
+    confidence = result["confidence"]
+    verifier_explanation = result["explanation"]
+    regression_risk = result["regression_risk"]
+
+    # Anti-rationalization gate: if APPROVED but the verifier's explanation
+    # lacks adversarial probe evidence, downgrade to REJECTED.
+    if verdict == "APPROVE":
+        explanation_lower = verifier_explanation.lower()
+        has_probe_evidence = any(kw in explanation_lower for kw in _PROBE_KEYWORDS)
+        if not has_probe_evidence:
+            logger.info(
+                "Anti-rationalization gate: APPROVE downgraded — no probe keywords in: %s",
+                verifier_explanation[:200],
+            )
+            verdict = "REJECT"
+            confidence = min(confidence, 0.4)
+            verifier_explanation = (
+                f"[Downgraded: verifier approved without adversarial probing] "
+                f"{verifier_explanation}"
+            )
+
+    if verdict == "APPROVE":
+        return (
+            f"APPROVED (confidence: {confidence:.2f}): {verifier_explanation}\n"
+            f"Regression risk: {regression_risk}"
+        )
+    else:
+        return (
+            f"REJECTED (confidence: {confidence:.2f}): {verifier_explanation}\n"
+            f"Regression risk: {regression_risk}"
+        )
+
+
 @tool
 def submit_fix(explanation: str) -> str:
     """
@@ -1207,8 +1643,15 @@ def submit_fix(explanation: str) -> str:
                 ["git", "add", "-A"],
                 cwd=sandbox, capture_output=True, text=True, check=True, timeout=30,
             )
+            # Build a proper commit message: subject line ≤72 chars (word-break),
+            # optional body for longer explanations. Avoids mid-word truncation
+            # that looks rushed ("fit score of exact...").
+            commit_subject, commit_body = _format_commit_message(explanation)
+            commit_args = ["git", "commit", "--no-verify", "-m", commit_subject]
+            if commit_body:
+                commit_args.extend(["-m", commit_body])
             result = subprocess.run(
-                ["git", "commit", "--no-verify", "-m", f"fix: {explanation[:200]}"],
+                commit_args,
                 cwd=sandbox, capture_output=True, text=True, timeout=30,
             )
             committed = result.returncode == 0
@@ -1383,8 +1826,17 @@ def get_blast_radius(file_path: str) -> str:
 PLAN_TOOLS = [produce_plan]
 EDIT_TOOLS = [string_replace, check_syntax, create_file, undo_last_edit]
 SANDBOX_TOOLS = [create_sandbox, run_tests, run_brt]
+# Shell tool — universal escape hatch for env diagnosis/repair.
+# Imported here (not at top) to avoid circular import: shell_tools imports _tls
+# from this file.
+from agent.shell_tools import SHELL_TOOLS  # noqa: E402
 MULTI_FILE_TOOLS = [get_callers]
 COMPLETION_TOOLS = [record_localization, request_review, submit_fix, escalate]
+# verify_fix is available but NOT wired into REACT_TOOLS yet (Task 6 will do that).
+VERIFY_TOOLS = [verify_fix]
 
 # All react-specific tools (exploration tools are added from explore_tools.py)
-REACT_TOOLS = PLAN_TOOLS + EDIT_TOOLS + SANDBOX_TOOLS + MULTI_FILE_TOOLS + COMPLETION_TOOLS
+REACT_TOOLS = (
+    PLAN_TOOLS + EDIT_TOOLS + SANDBOX_TOOLS + SHELL_TOOLS
+    + MULTI_FILE_TOOLS + COMPLETION_TOOLS
+)
