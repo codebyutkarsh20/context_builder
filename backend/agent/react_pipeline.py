@@ -699,10 +699,16 @@ def _setup_thread_repo(
                 ).strip()
                 if dirty:
                     # Auto-clean dirty repos (common in eval — previous runs
-                    # may leave changes). Reset to HEAD so worktree creation works.
-                    logger.warning("setup_thread_repo: repo has uncommitted changes — auto-resetting")
+                    # may leave changes). Use reset --hard because git checkout .
+                    # fails on repos with corrupted objects (sympy partial clone).
+                    logger.warning("setup_thread_repo: repo has uncommitted changes — hard-resetting")
                     subprocess.run(
-                        ["git", "checkout", "."],
+                        ["git", "reset", "--hard", "HEAD"],
+                        cwd=repo_path, capture_output=True, timeout=30,
+                    )
+                    # Also clean untracked files that may block worktree
+                    subprocess.run(
+                        ["git", "clean", "-fd"],
                         cwd=repo_path, capture_output=True, timeout=30,
                     )
 

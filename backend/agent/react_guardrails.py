@@ -170,9 +170,16 @@ def check_tool_call(
             "Call string_replace() first to apply your fix, THEN run tests."
         )
 
-    # Nudge: shell calls — if the agent is grinding on env diagnosis, force forward.
-    # 6 calls is generous (3 to investigate, 3 to install/verify). Beyond that,
-    # the env is likely truly broken and the agent should submit anyway.
+    # Shell calls: soft nudge at 6, HARD BLOCK at 12.
+    # Data: failed bugs average 22.8 shell calls vs 4.9 for passes.
+    # The agent gets stuck in shell loops reading partial output instead
+    # of using read_file/grep_repo. Hard cap prevents budget burn.
+    if tool_name == "run_shell" and gs.run_shell_count >= 12:
+        return (
+            f"ERROR: run_shell BLOCKED — {gs.run_shell_count} calls is excessive. "
+            "Use read_file, grep_repo, and get_file_structure for code exploration. "
+            "Use run_tests for testing. run_shell is for env diagnosis only."
+        )
     if tool_name == "run_shell" and gs.run_shell_count >= 6:
         return (
             f"WARNING: run_shell called {gs.run_shell_count} times. "
