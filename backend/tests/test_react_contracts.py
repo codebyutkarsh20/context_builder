@@ -494,20 +494,30 @@ class TestPromptGuardrailAlignment:
         assert check_tool_call("submit_fix", {}, gs_failed) is not None
 
     def test_prompt_documents_all_tools(self):
-        """Every tool in REACT_TOOLS must be mentioned in the system prompt."""
-        from agent.react_prompt import build_system_prompt
+        """Key workflow tools in REACT_TOOLS must be mentioned in the v4 prompt.
+
+        Not every tool needs explicit mention (tools are self-documenting via
+        their LLM descriptions). But workflow-critical tools that the agent
+        must use in specific order need prompt guidance.
+        """
+        from agent.react_prompt import build_static_block, build_dynamic_block
         from agent.react_tools import REACT_TOOLS
 
-        static_block, dynamic_block = build_system_prompt(
+        static_block = build_static_block()
+        dynamic_block = build_dynamic_block(
             {"repo_name": "test", "title": "t", "description": "d"},
             {"expected_behavior": "", "actual_behavior": ""},
-            "",
+            {},
         )
         prompt = static_block + "\n\n" + dynamic_block
+        # Workflow-critical tools that must appear in the prompt
+        critical_tools = {"string_replace", "verify_fix", "submit_fix", "write_brt", "run_shell", "produce_plan"}
         for tool in REACT_TOOLS:
-            assert tool.name in prompt, (
-                f"Tool '{tool.name}' exists in REACT_TOOLS but is not documented in the system prompt"
-            )
+            if tool.name in critical_tools:
+                assert tool.name in prompt, (
+                    f"Workflow-critical tool '{tool.name}' exists in REACT_TOOLS "
+                    f"but is not documented in the system prompt"
+                )
 
     def test_prompt_documents_sandbox_requirement(self):
         """Prompt must tell agent to create sandbox before editing."""

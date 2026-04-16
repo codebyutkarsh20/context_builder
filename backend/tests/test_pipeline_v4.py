@@ -862,10 +862,10 @@ class TestVerifyFix:
         from agent.react_tools import VERIFY_TOOLS, verify_fix
         assert verify_fix in VERIFY_TOOLS
 
-    def test_verify_fix_not_in_react_tools(self):
-        """verify_fix is NOT yet in REACT_TOOLS (wired in Task 6)."""
+    def test_verify_fix_in_react_tools(self):
+        """verify_fix IS in REACT_TOOLS (wired in Task 6)."""
         from agent.react_tools import REACT_TOOLS, verify_fix
-        assert verify_fix not in REACT_TOOLS
+        assert verify_fix in REACT_TOOLS
 
     def test_anti_rationalization_gate_keywords(self, tmp_path):
         """Anti-rationalization gate recognizes various probe keywords."""
@@ -1475,11 +1475,11 @@ class TestWriteBrt:
         assert write_brt in BRT_TOOLS
         assert len(BRT_TOOLS) == 1
 
-    def test_write_brt_not_in_react_tools(self):
-        """write_brt must NOT be in REACT_TOOLS yet (Task 6 wires it in)."""
+    def test_write_brt_in_react_tools(self):
+        """write_brt IS in REACT_TOOLS (wired in Task 6)."""
         from agent.react_tools import REACT_TOOLS, write_brt
         tool_names = [t.name for t in REACT_TOOLS]
-        assert "write_brt" not in tool_names
+        assert "write_brt" in tool_names
 
     # ── set_guardrail_state setter ────────────────────────────────────────
 
@@ -2076,3 +2076,269 @@ class TestLocalizationHitV4Fallback:
         }
         bug = {"expected_files": ["flask/wrappers.py"]}
         assert _score_localization_hit(result, bug) is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: Task 6 — Tool list, pipeline wiring, thinking switch, metadata
+# ---------------------------------------------------------------------------
+
+class TestTask6ToolCollections:
+    """Verify v4 tool collections have exactly the right tools."""
+
+    def test_react_tools_has_10_tools(self):
+        """REACT_TOOLS should have exactly 10 tools."""
+        from agent.react_tools import REACT_TOOLS
+        assert len(REACT_TOOLS) == 10
+
+    def test_edit_tools_composition(self):
+        """EDIT_TOOLS: string_replace, create_file, undo_last_edit."""
+        from agent.react_tools import EDIT_TOOLS
+        names = [t.name for t in EDIT_TOOLS]
+        assert names == ["string_replace", "create_file", "undo_last_edit"]
+
+    def test_plan_tools_composition(self):
+        """PLAN_TOOLS: produce_plan only."""
+        from agent.react_tools import PLAN_TOOLS
+        names = [t.name for t in PLAN_TOOLS]
+        assert names == ["produce_plan"]
+
+    def test_test_tools_composition(self):
+        """TEST_TOOLS: run_tests, run_shell, write_brt."""
+        from agent.react_tools import TEST_TOOLS
+        names = [t.name for t in TEST_TOOLS]
+        assert names == ["run_tests", "run_shell", "write_brt"]
+
+    def test_completion_tools_composition(self):
+        """COMPLETION_TOOLS: verify_fix, submit_fix, escalate."""
+        from agent.react_tools import COMPLETION_TOOLS
+        names = [t.name for t in COMPLETION_TOOLS]
+        assert names == ["verify_fix", "submit_fix", "escalate"]
+
+    def test_removed_tools_not_in_react_tools(self):
+        """Tools removed in v4 must NOT be in REACT_TOOLS."""
+        from agent.react_tools import REACT_TOOLS
+        tool_names = {t.name for t in REACT_TOOLS}
+        removed = {
+            "create_sandbox",
+            "check_syntax",
+            "get_blast_radius",
+            "request_review",
+            "run_brt",
+            "record_localization",
+        }
+        overlap = tool_names & removed
+        assert not overlap, f"Removed tools still in REACT_TOOLS: {overlap}"
+
+    def test_removed_tool_functions_still_exist(self):
+        """Removed tool functions still exist (not deleted, just not in REACT_TOOLS)."""
+        import agent.react_tools as rt
+        for name in ["create_sandbox", "check_syntax", "run_brt", "record_localization"]:
+            assert hasattr(rt, name), f"Function {name} should still exist in react_tools"
+
+    def test_legacy_collections_preserved(self):
+        """Legacy collections (SANDBOX_TOOLS, MULTI_FILE_TOOLS, etc.) still exist."""
+        from agent.react_tools import SANDBOX_TOOLS, MULTI_FILE_TOOLS, VERIFY_TOOLS, BRT_TOOLS
+        assert len(SANDBOX_TOOLS) > 0
+        assert len(MULTI_FILE_TOOLS) > 0
+        assert len(VERIFY_TOOLS) == 1
+        assert len(BRT_TOOLS) == 1
+
+    def test_verify_fix_in_react_tools_and_completion(self):
+        """verify_fix is in both REACT_TOOLS and COMPLETION_TOOLS."""
+        from agent.react_tools import REACT_TOOLS, COMPLETION_TOOLS, verify_fix
+        assert verify_fix in REACT_TOOLS
+        assert verify_fix in COMPLETION_TOOLS
+
+    def test_write_brt_in_react_tools_and_test_tools(self):
+        """write_brt is in both REACT_TOOLS and TEST_TOOLS."""
+        from agent.react_tools import REACT_TOOLS, TEST_TOOLS, write_brt
+        assert write_brt in REACT_TOOLS
+        assert write_brt in TEST_TOOLS
+
+
+class TestTask6PipelineWiring:
+    """Verify run_ticket_react uses the v4 3-stage pipeline."""
+
+    def test_pipeline_calls_setup_node(self):
+        """run_ticket_react should call setup_node (not intake_node)."""
+        from unittest.mock import patch, MagicMock
+        from agent.react_pipeline import run_ticket_react
+        from agent.types import PipelineStatus
+
+        mock_state = _minimal_state()
+        mock_state["status"] = PipelineStatus.DONE
+        mock_state["submitted"] = True
+
+        with patch("agent.react_pipeline.setup_node", return_value=mock_state) as mock_setup, \
+             patch("agent.react_pipeline.react_agent_node", return_value=mock_state), \
+             patch("agent.react_pipeline.finalize_node", return_value=mock_state), \
+             patch("agent.react_pipeline._report_progress"), \
+             patch("agent.react_pipeline._emit_failure_diagnosis"), \
+             patch("agent.react_pipeline._safe_record_lesson"), \
+             patch("agent.react_pipeline._cleanup_sandbox"):
+            run_ticket_react(mock_state["work_order"])
+
+        mock_setup.assert_called_once()
+
+    def test_pipeline_does_not_call_intake_node(self):
+        """run_ticket_react should NOT call intake_node anymore."""
+        from unittest.mock import patch, MagicMock
+        from agent.react_pipeline import run_ticket_react
+        from agent.types import PipelineStatus
+
+        mock_state = _minimal_state()
+        mock_state["status"] = PipelineStatus.DONE
+        mock_state["submitted"] = True
+
+        with patch("agent.react_pipeline.setup_node", return_value=mock_state), \
+             patch("agent.react_pipeline.react_agent_node", return_value=mock_state), \
+             patch("agent.react_pipeline.finalize_node", return_value=mock_state), \
+             patch("agent.react_pipeline.intake_node") as mock_intake, \
+             patch("agent.react_pipeline._report_progress"), \
+             patch("agent.react_pipeline._emit_failure_diagnosis"), \
+             patch("agent.react_pipeline._safe_record_lesson"), \
+             patch("agent.react_pipeline._cleanup_sandbox"):
+            run_ticket_react(mock_state["work_order"])
+
+        mock_intake.assert_not_called()
+
+    def test_pipeline_does_not_call_verifier_node(self):
+        """run_ticket_react should NOT call verifier_node anymore (verify_fix in-loop)."""
+        from unittest.mock import patch, MagicMock
+        from agent.react_pipeline import run_ticket_react
+        from agent.types import PipelineStatus
+
+        mock_state = _minimal_state()
+        mock_state["status"] = PipelineStatus.DONE
+        mock_state["submitted"] = True
+
+        with patch("agent.react_pipeline.setup_node", return_value=mock_state), \
+             patch("agent.react_pipeline.react_agent_node", return_value=mock_state), \
+             patch("agent.react_pipeline.finalize_node", return_value=mock_state), \
+             patch("agent.react_pipeline.verifier_node") as mock_verifier, \
+             patch("agent.react_pipeline._report_progress"), \
+             patch("agent.react_pipeline._emit_failure_diagnosis"), \
+             patch("agent.react_pipeline._safe_record_lesson"), \
+             patch("agent.react_pipeline._cleanup_sandbox"):
+            run_ticket_react(mock_state["work_order"])
+
+        mock_verifier.assert_not_called()
+
+    def test_pipeline_does_not_call_brt_node(self):
+        """run_ticket_react should NOT call brt_node anymore (write_brt in-loop)."""
+        from unittest.mock import patch, MagicMock
+        from agent.react_pipeline import run_ticket_react
+        from agent.types import PipelineStatus
+
+        mock_state = _minimal_state()
+        mock_state["status"] = PipelineStatus.DONE
+        mock_state["submitted"] = True
+
+        with patch("agent.react_pipeline.setup_node", return_value=mock_state), \
+             patch("agent.react_pipeline.react_agent_node", return_value=mock_state), \
+             patch("agent.react_pipeline.finalize_node", return_value=mock_state), \
+             patch("agent.react_pipeline.brt_node") as mock_brt, \
+             patch("agent.react_pipeline._report_progress"), \
+             patch("agent.react_pipeline._emit_failure_diagnosis"), \
+             patch("agent.react_pipeline._safe_record_lesson"), \
+             patch("agent.react_pipeline._cleanup_sandbox"):
+            run_ticket_react(mock_state["work_order"])
+
+        mock_brt.assert_not_called()
+
+
+class TestTask6FinalizeNodeSimplified:
+    """Verify finalize_node no longer has retry logic."""
+
+    def test_finalize_no_retry_on_needs_retry(self):
+        """finalize_node should NOT re-enter react_agent_node even with needs_retry."""
+        from unittest.mock import patch
+        from agent.react_pipeline import finalize_node
+        from agent.types import PipelineStatus
+
+        state = _minimal_state()
+        state["needs_retry"] = True
+        state["retry_count"] = 0
+        state["submitted"] = True
+        state["status"] = PipelineStatus.DONE
+
+        with patch("agent.react_pipeline.react_agent_node") as mock_react, \
+             patch("agent.react_pipeline.verifier_node") as mock_verify, \
+             patch("agent.react_pipeline._report_progress"), \
+             patch("agent.react_pipeline._emit_failure_diagnosis"), \
+             patch("agent.react_pipeline._safe_record_lesson"), \
+             patch("agent.react_pipeline._cleanup_sandbox"), \
+             patch("agent.react_pipeline._get_trace", return_value=None), \
+             patch("agent.react_pipeline._push_and_create_pr", return_value={}), \
+             patch("agent.react_pipeline._populate_repair_and_localization", return_value=state):
+            result = finalize_node(state)
+
+        mock_react.assert_not_called()
+        mock_verify.assert_not_called()
+
+
+class TestTask6ToolMetadata:
+    """Verify tool_metadata.py has entries for verify_fix and write_brt."""
+
+    def test_verify_fix_metadata_exists(self):
+        """verify_fix should have metadata registered."""
+        from agent.tool_metadata import get_tool_meta
+        meta = get_tool_meta("verify_fix")
+        assert meta.name == "verify_fix"
+        assert meta.is_read_only is True
+        assert meta.phase == "review"
+        assert meta.max_output_chars == 1000
+
+    def test_write_brt_metadata_exists(self):
+        """write_brt should have metadata registered."""
+        from agent.tool_metadata import get_tool_meta
+        meta = get_tool_meta("write_brt")
+        assert meta.name == "write_brt"
+        assert meta.is_read_only is False
+        assert meta.phase == "test"
+        assert meta.max_output_chars == 4000
+
+
+class TestTask6ContextManager:
+    """Verify context_manager.py compactable tools are correct."""
+
+    def test_write_brt_is_compactable(self):
+        """write_brt should be in COMPACTABLE_TOOLS."""
+        from agent.context_manager import COMPACTABLE_TOOLS
+        assert "write_brt" in COMPACTABLE_TOOLS
+
+    def test_get_blast_radius_not_compactable(self):
+        """get_blast_radius should NOT be in COMPACTABLE_TOOLS (removed)."""
+        from agent.context_manager import COMPACTABLE_TOOLS
+        assert "get_blast_radius" not in COMPACTABLE_TOOLS
+
+
+class TestTask6ReactAgentNodeUsesV4Prompt:
+    """Verify react_agent_node uses v4 prompt functions."""
+
+    def test_react_agent_node_calls_build_static_block(self):
+        """react_agent_node should call build_static_block (not build_system_prompt)."""
+        from unittest.mock import patch, MagicMock
+        from agent.react_pipeline import react_agent_node
+        from agent.types import PipelineStatus
+
+        state = _minimal_state()
+        state["intent"] = {"fix_type": "bug_fix"}
+        state["_dynamic_context"] = {
+            "sandbox_path": "/tmp/test",
+            "branch_name": "fix/test",
+            "base_branch": "main",
+        }
+
+        with patch("agent.react_pipeline._resolve_repo_path", return_value=Path("/tmp/test")), \
+             patch("agent.explore_tools.set_context"), \
+             patch("agent.react_tools.set_react_context"), \
+             patch("agent.react_prompt.build_static_block", return_value="static") as mock_static, \
+             patch("agent.react_prompt.build_dynamic_block", return_value="dynamic") as mock_dynamic, \
+             patch("agent.react_prompt.build_task_message_v4", return_value="task") as mock_task, \
+             patch("agent.react_loop.react_loop", return_value=state):
+            result = react_agent_node(state)
+
+        mock_static.assert_called_once()
+        mock_dynamic.assert_called_once()
+        mock_task.assert_called_once()

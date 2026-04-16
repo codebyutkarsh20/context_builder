@@ -47,7 +47,12 @@ COMPACTABLE_TOOLS = frozenset({
     "get_function_info",
     "get_file_summary",
     "get_callers",
-    "get_blast_radius",
+    # run_shell: diagnostic output (pip list, which pytest, ...) becomes
+    # stale within turns. Agent doesn't need to re-read 10-turn-old `pip list`.
+    "run_shell",
+    # write_brt: BRT diagnostic output (test code + reasoning) is ephemeral.
+    # The agent only needs the latest BRT results, not historical ones.
+    "write_brt",
 })
 
 MICROCOMPACT_KEEP_RECENT = 12  # Keep last N tool results in full
@@ -63,7 +68,10 @@ MASK_TEMPLATE = "[{tool_name}: {summary}]"
 # This gives 40K headroom for the LLM response + safety margin.
 SUMMARIZATION_TRIGGER = 120_000  # tokens (not 80K — we have 160K available)
 SUMMARIZATION_MODEL = "claude-haiku-4-5-20251001"
-TOKEN_ESTIMATE_RATIO = 0.25  # Rough chars-to-tokens for code
+# Fallback ratio when real token counts aren't available yet.
+# Conservative: 1 token ≈ 2 chars for code (Anthropic tokenizer averages ~1.3 chars/token
+# for English, higher for code). Old value 0.25 was 4-5x too low.
+TOKEN_ESTIMATE_RATIO = 0.50
 
 # Layer 1: Per-tool output caps — now sourced from tool_metadata.py registry.
 # Kept as fallback constant only; actual caps come from ToolMeta.max_output_chars.
@@ -278,7 +286,7 @@ def _extract_summary(content: str) -> str:
     return first_line[:100] + ("..." if len(first_line) > 100 else "")
 
 
-def maybe_summarize(messages: list, *, force: bool = False) -> list:
+def maybe_summarize(messages: list, *, force: bool = False, real_token_count: int = 0) -> list:
     """Layer 3: If token count exceeds threshold, summarize older turns via Haiku.
 
     Returns the (possibly compressed) message list. Only triggers when
@@ -287,8 +295,11 @@ def maybe_summarize(messages: list, *, force: bool = False) -> list:
     Args:
         force: If True, skip the threshold check and always summarize.
                Used for recovery from prompt-too-long errors.
+        real_token_count: Actual input_tokens from last API response. When > 0,
+               used instead of the char-based estimate for accurate triggering.
     """
-    token_count = count_tokens_approx(messages)
+    # Prefer real token count from API when available
+    token_count = real_token_count if real_token_count > 0 else count_tokens_approx(messages)
 
     if not force and token_count < SUMMARIZATION_TRIGGER:
         return messages

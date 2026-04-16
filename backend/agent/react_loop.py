@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
@@ -205,19 +206,15 @@ def react_loop(
         "fix_type": getattr(_react_tls_local, "fix_type", "bug_fix"),
     }
 
-    # Two LLM instances — one with extended thinking for early "hard thinking"
-    # turns (intake / plan production / before first edit), one without for
-    # fast iteration once the agent is in the edit-test-review loop.
-    #
-    # Extended thinking helps when the model is deciding:
-    #   - what the root cause is (before any edits)
-    #   - what target files / approach to put in the plan
-    #   - whether to revise the plan after new observations
-    # It's much less valuable during edit-test loops where decisions are
-    # tactical ("retry this grep with a different pattern").
-    #
-    # Threshold: enable thinking until the first successful string_replace.
-    # After that, switch to the non-thinking LLM to keep cost bounded.
+    # Two LLM instances — fast (no thinking) for exploration, thinking for
+    # editing/recovery. v4 inverts the switch: start fast, switch to thinking
+    # on first string_replace. Rationale:
+    #   - Early turns are mechanical exploration (grep, read_file, list_files).
+    #     Thinking adds cost without quality gain here.
+    #   - Once the agent starts editing, decisions get hard: "is this the right
+    #     fix?", "should I revert?", "what edge case am I missing?"
+    #     Extended thinking helps during editing/recovery.
+    #   - Once ON, thinking stays ON for the rest of the run.
     # Budget: 2048 tokens of thinking per turn, capped by the model.
     _THINKING_BUDGET = int(os.environ.get("REACT_THINKING_BUDGET", "2048"))
     _THINKING_ENABLED = os.environ.get("DISABLE_REACT_THINKING", "") not in ("1", "true", "True")
@@ -226,7 +223,7 @@ def react_loop(
         kwargs: dict = {
             "model": REACT_MODEL,
             "max_tokens": 16000,
-            "timeout": 120.0,
+            "timeout": 180.0,  # 3 min per call — generous for large prompts with thinking
         }
         if with_thinking and _THINKING_ENABLED:
             kwargs["thinking"] = {"type": "enabled", "budget_tokens": _THINKING_BUDGET}
@@ -249,8 +246,9 @@ def react_loop(
 
     llm_thinking = _build_llm(with_thinking=True)
     llm_fast = _build_llm(with_thinking=False)
-    # Start with the thinking LLM — switches to fast once first edit lands
-    llm = llm_thinking
+    # v4: Start with fast LLM (exploration is mechanical), switch to thinking
+    # on first string_replace (editing/recovery benefits from thinking). Once ON, stays ON.
+    llm = llm_fast
 
     # Two-block prompt caching strategy:
     #   Block 1 (static_block): workflow, tools, rules, strategy — same for all bugs of the
@@ -325,118 +323,56 @@ def react_loop(
                 gs.sandbox_created, current_phase,
             )
 
-        # PHASE NUDGE: if past halfway with sandbox but 0 edits, force a fix attempt.
-        # Threshold scales with the budget: half of max_tool_calls, min 15.
-        _nudge_at = max(15, gs.max_tool_calls // 2)
-        if (gs.tool_call_count == _nudge_at
-                and gs.sandbox_created
-                and gs.string_replace_count == 0):
-            _remaining = gs.max_tool_calls - _nudge_at
-            nudge = (
-                f"SYSTEM: You are halfway through your budget ({_nudge_at}/{gs.max_tool_calls} calls) "
-                "with a sandbox but ZERO edits. The function names in the bug description may not match the code. "
-                "STOP GREPPING. Based on what you've read so far:\n"
-                "1. Pick the most likely function to fix\n"
-                "2. Call string_replace with your best fix attempt\n"
-                "3. Even an imperfect fix you can iterate on beats more searching\n"
-                f"You have {_remaining} calls left — use them for editing, testing, and submitting."
-            )
-            messages.append(HumanMessage(content=nudge))
-            logger.info("PHASE NUDGE injected at call %d: forcing edit phase", _nudge_at)
+        # Phase nudge removed — was adding constraint without helping. If the agent
+        # needs more exploration, let it explore. Force-escalation below is the only
+        # hard stop, and it's been loosened to 90% of budget (was 75%).
 
-        # P3: DIMINISHING-RETURNS DETECTION + AUTO-REPLAN.
-        # Ported from Claude Code's checkTokenBudget (query/tokenBudget.ts).
-        # If 3 consecutive turns add < 500 tokens AND no new edits/tests,
-        # the agent is in a non-productive loop (re-reading same files,
-        # re-grepping the same patterns). Inject a forced REPLAN nudge
-        # instead of escalating — the agent gets a chance to revise the plan
-        # with a fresh hypothesis BEFORE we give up.
-        _DIMINISHING_TOKEN_DELTA = 500   # tokens — Claude Code's threshold
-        _DIMINISHING_RUNS_REQUIRED = 3   # consecutive checks
-        _CHECK_EVERY = 4                 # check every N tool calls
-
-        if (gs.tool_call_count > 0
-                and gs.tool_call_count % _CHECK_EVERY == 0
-                and gs.tool_call_count not in _replan_injected_at):
-            current_tokens = count_tokens_approx(messages)
-            checkpoint = {
-                "call": gs.tool_call_count,
-                "tokens": current_tokens,
-                "edits": gs.string_replace_count,
-                "tests": gs.run_tests_count,
-                "reviews": gs.review_count,
-            }
-            _stuck_history.append(checkpoint)
-            # Keep last 4 checkpoints (we look at the last 3 deltas)
-            if len(_stuck_history) > 4:
-                _stuck_history.pop(0)
-
-            # Need at least 4 checkpoints to compute 3 deltas
-            if len(_stuck_history) >= 4:
-                deltas = []
-                for i in range(1, len(_stuck_history)):
-                    deltas.append({
-                        "tokens": _stuck_history[i]["tokens"] - _stuck_history[i - 1]["tokens"],
-                        "new_edits": _stuck_history[i]["edits"] - _stuck_history[i - 1]["edits"],
-                        "new_tests": _stuck_history[i]["tests"] - _stuck_history[i - 1]["tests"],
-                    })
-                last3 = deltas[-_DIMINISHING_RUNS_REQUIRED:]
-                all_diminishing = all(
-                    d["tokens"] < _DIMINISHING_TOKEN_DELTA
-                    and d["new_edits"] == 0
-                    and d["new_tests"] == 0
-                    for d in last3
+        # Stuck detector v2 — tool-repetition-based (soft hint, not force).
+        # Detects: same tool with identical args called 3x in a row, OR
+        # same file grep'd repeatedly without reading it. Emits a GENTLE
+        # suggestion — doesn't force a replan, doesn't escalate.
+        # Design principle: agent is trusted; nudge is a helpful peer review.
+        if gs.tool_call_count >= 6 and gs.tool_call_count % 3 == 0 \
+                and gs.tool_call_count not in _replan_injected_at:
+            recent = gs.tool_history[-6:] if len(gs.tool_history) >= 6 else []
+            # Signal 1: same tool name 4+ times in last 6 calls
+            hint = ""
+            if recent:
+                from collections import Counter
+                tool_freq = Counter(recent)
+                most_used, most_n = tool_freq.most_common(1)[0]
+                if most_n >= 4 and most_used in ("grep_repo", "read_file", "list_files"):
+                    hint = (
+                        f"💡 Gentle reminder: you've called `{most_used}` {most_n} times in the last 6 turns. "
+                        f"If the info you want isn't emerging, try:\n"
+                        f"  - `delegate_explore(\"your question\")` — a Haiku subagent answers broad queries in one turn\n"
+                        f"  - `read_function(file, function_name)` — full function instead of grep snippets\n"
+                        f"  - `get_file_structure(file)` — function signatures + line numbers\n"
+                        "You're not being cut off — just pointing out cheaper options."
+                    )
+            # Signal 2: sandbox created but no edits after 15+ calls
+            if (not hint and gs.sandbox_created and gs.string_replace_count == 0
+                    and gs.tool_call_count >= 15):
+                hint = (
+                    f"💡 Observation: you've done {gs.tool_call_count} exploration calls in the sandbox "
+                    "but no edits yet. If you have a reasonable hypothesis, an imperfect fix you can "
+                    "iterate on often beats more exploration. Your call though — keep exploring if needed."
                 )
 
-                if all_diminishing:
-                    # Lazy-import to avoid circular import
-                    from agent.react_tools import get_current_plan
-                    cur_plan = get_current_plan() or {}
-                    replan_nudge = (
-                        f"⚠ STUCK DETECTOR: For the last {len(last3)} checkpoints, "
-                        f"context grew by < {_DIMINISHING_TOKEN_DELTA} tokens per turn AND "
-                        "you've made no new edits or run no new tests. You appear to be "
-                        "re-exploring without progress.\n\n"
-                        "**REQUIRED NEXT ACTION**: Call produce_plan() with a REVISED "
-                        "hypothesis. Your current plan was:\n"
-                        f"  root_cause: {cur_plan.get('root_cause', '(none)')[:160]}\n"
-                        f"  target_files: {cur_plan.get('target_files', [])}\n\n"
-                        "Ask yourself:\n"
-                        "1. What does the EVIDENCE you've gathered actually show?\n"
-                        "2. Is the original root_cause still consistent with that evidence?\n"
-                        "3. If not, what's a different hypothesis that fits better?\n\n"
-                        "Do NOT just keep grepping. Either produce_plan() with a new "
-                        "hypothesis, or commit to your current plan and start editing."
-                    )
-                    messages.append(HumanMessage(content=replan_nudge))
-                    _replan_injected_at.add(gs.tool_call_count)
-                    logger.warning(
-                        "REPLAN NUDGE injected at call %d: 3 consecutive turns with no progress",
-                        gs.tool_call_count,
-                    )
-                    if trace:
-                        trace.emit("auto_replan_nudge", "react_loop", {
-                            "at_call": gs.tool_call_count,
-                            "deltas": last3,
-                            "current_plan": cur_plan,
-                        })
+            if hint:
+                messages.append(HumanMessage(content=hint))
+                _replan_injected_at.add(gs.tool_call_count)
+                logger.info("Soft hint injected at call %d", gs.tool_call_count)
+                if trace:
+                    trace.emit("auto_replan_nudge", "react_loop", {
+                        "at_call": gs.tool_call_count,
+                        "hint_type": "tool_repetition" if most_used in recent else "no_edits_yet",
+                        "recent_tools": recent,
+                    })
 
-        # FORCE ESCALATION: 75% of budget, sandbox exists, still 0 edits = stuck
-        _escalate_at = max(20, int(gs.max_tool_calls * 0.75))
-        if (gs.tool_call_count >= _escalate_at
-                and gs.sandbox_created
-                and gs.string_replace_count == 0):
-            logger.warning(
-                "Force escalation: %d calls with sandbox but 0 edits — agent is stuck",
-                gs.tool_call_count,
-            )
-            state["escalated"] = True
-            state["escalate_reason"] = (
-                f"Agent explored for {gs.tool_call_count} calls with a sandbox but never attempted an edit. "
-                "The bug description may not match the code's naming conventions. "
-                "Human review needed to identify the correct fix location."
-            )
-            break
+        # Force-escalation removed — was cutting off agents mid-exploration.
+        # The budget limit alone (hit on `while` condition) is the only hard stop.
+        # Agent is trusted to spend its full budget productively.
 
         # Check time limit
         if gs.elapsed >= MAX_WALL_TIME:
@@ -451,7 +387,8 @@ def react_loop(
             break
 
         # Emit llm_request BEFORE calling LLM — captures what the model sees
-        context_tokens = count_tokens_approx(messages)
+        # Use real input_tokens from last API call (accurate), fall back to estimate for first call
+        context_tokens = gs.real_input_tokens if gs.real_input_tokens > 0 else count_tokens_approx(messages)
         if trace:
             # Capture full message contents for replay/debugging
             messages_snapshot = []
@@ -477,29 +414,28 @@ def react_loop(
                 "messages": messages_snapshot,
             })
 
-        # Switch from thinking-LLM to fast-LLM once the first edit lands.
-        # Before any edit, the agent is doing root-cause analysis + plan
-        # production — extended thinking helps it get the hypothesis right.
-        # After the first edit, decisions are tactical (which test to run,
-        # which file to re-read) — thinking adds cost without commensurate
-        # quality gain.
-        if llm is llm_thinking and gs.string_replace_count >= 1:
-            llm = llm_fast
+        # v4: Switch from fast-LLM to thinking-LLM once the first edit lands.
+        # Before any edit, the agent is doing mechanical exploration (grep,
+        # read_file) — fast LLM is sufficient.  Once editing starts, decisions
+        # get hard (right fix? revert? edge cases?) — thinking helps.
+        # Once ON, stays ON for the rest of the run.
+        if llm is llm_fast and gs.string_replace_count >= 1:
+            llm = llm_thinking
             logger.info(
-                "Switched main loop to fast LLM (no thinking) after first edit at call %d",
+                "Switched main loop to thinking LLM after first edit at call %d",
                 gs.tool_call_count,
             )
             if trace:
                 trace.emit("llm_mode_switch", "react_loop", {
-                    "from": "thinking",
-                    "to": "fast",
+                    "from": "fast",
+                    "to": "thinking",
                     "at_call": gs.tool_call_count,
                     "reason": "first_edit_landed",
                 })
 
-        # Call the LLM — with multi-stage recovery for context overflow
+        # Call the LLM — with multi-stage recovery for context overflow + transient errors
         response = None
-        for _recovery_attempt in range(3):
+        for _recovery_attempt in range(5):  # raised from 3 to 5 for transient retries
             try:
                 response = llm.invoke(messages)
                 break
@@ -508,6 +444,31 @@ def react_loop(
                 is_prompt_too_long = "prompt is too long" in err_str or "413" in err_str or "context_length" in err_str
                 is_output_limit = "max_tokens" in err_str or "output" in err_str
                 is_thinking_unsupported = "thinking" in err_str and "unexpected keyword" in err_str
+                # Transient errors: timeouts, rate limits, dropped connections, 5xx
+                is_transient = any(kw in err_str for kw in (
+                    "timed out", "timeout", "long-requests", "connection",
+                    "rate limit", "429", "overloaded", "529",
+                    "internal server", "500", "502", "503", "bad gateway",
+                    "request timed out", "interrupted",
+                ))
+
+                # Retry transient errors with exponential backoff BEFORE other recovery.
+                # Agent was fine — network blip shouldn't kill the run.
+                if is_transient and _recovery_attempt < 4:
+                    backoff = min(60, 5 * (2 ** _recovery_attempt))  # 5s, 10s, 20s, 40s, 60s
+                    logger.warning(
+                        "Transient LLM error (attempt %d/5) — retrying in %ds: %s",
+                        _recovery_attempt + 1, backoff, err_str[:150],
+                    )
+                    import time as _time
+                    _time.sleep(backoff)
+                    if trace:
+                        trace.emit("llm_transient_retry", "react_loop", {
+                            "attempt": _recovery_attempt + 1,
+                            "backoff_sec": backoff,
+                            "error": err_str[:200],
+                        })
+                    continue
 
                 # Recovery: SDK rejects the `thinking` parameter (older anthropic
                 # SDK or a server change). Permanently switch to the fast LLM
@@ -525,7 +486,13 @@ def react_loop(
                             "at_call": gs.tool_call_count,
                             "reason": "thinking_unsupported_by_sdk",
                         })
-                    continue
+                    # Retry immediately with the new LLM — don't burn more attempts
+                    try:
+                        response = llm.invoke(messages)
+                    except Exception as e2:
+                        logger.error("Fast LLM also failed after thinking switch: %s", e2)
+                        state["error"] = f"LLM call failed: {e2}"
+                    break  # Exit recovery loop (either succeeded or failed definitively)
 
                 if is_prompt_too_long and _recovery_attempt == 0:
                     # Recovery level 1: Force aggressive summarization
@@ -554,7 +521,7 @@ def react_loop(
         if response is None:
             break
 
-        # Track token usage (including Anthropic prompt caching)
+        # Track token usage from API response (real counts, not estimates)
         usage = getattr(response, "response_metadata", {}).get("usage", {})
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
@@ -562,6 +529,11 @@ def react_loop(
         cache_read = usage.get("cache_read_input_tokens", 0)
         call_cost = _estimate_cost(REACT_MODEL, input_tokens, output_tokens, cache_creation, cache_read)
         gs.cost_usd += call_cost
+        # Store real token counts — used for summarization triggers + stuck detection
+        gs.real_input_tokens = input_tokens
+        gs.real_output_tokens = output_tokens
+        gs.cumulative_input_tokens += input_tokens
+        gs.cumulative_output_tokens += output_tokens
 
         if trace:
             # Capture full response content for replay/debugging —
@@ -692,7 +664,13 @@ def react_loop(
 
             is_concurrent_batch = len(batch) > 1 and all(b.get("_concurrent") for b in batch)
 
-            # Pre-execution: guardrail checks + phase tracking for all tools in batch
+            # Pre-execution: guardrail checks + phase tracking for all tools in batch.
+            # Pre-scan: if produce_plan is in this batch, temporarily mark plan as
+            # produced so create_sandbox in the same batch isn't blocked by the gate.
+            _batch_has_plan = any(tc["name"] == "produce_plan" for tc in batch)
+            if _batch_has_plan and not gs.plan_produced:
+                gs.plan_produced = True  # tentative — reverted if produce_plan fails
+                gs._plan_tentative = True
             checked: list[tuple[dict, str | None]] = []  # (tc, guardrail_error_or_None)
             for tc in batch:
                 tool_name = tc["name"]
@@ -721,7 +699,7 @@ def react_loop(
                     })
 
                 guardrail_error = check_tool_call(tool_name, tool_args, gs)
-                if guardrail_error and guardrail_error.startswith("WARNING:"):
+                if guardrail_error and (guardrail_error.startswith("WARNING:") or guardrail_error.startswith("SUGGESTION:")):
                     logger.info("Guardrail warning for %s: %s", tool_name, guardrail_error[:100])
                     if trace:
                         trace.emit("guardrail_event", "react_loop", {
@@ -766,6 +744,16 @@ def react_loop(
                     else:
                         _, result_str = _execute_one_tool(tc)
                         results.append((tc, result_str))
+
+            # Revert tentative plan flag if produce_plan was in batch but failed
+            if getattr(gs, "_plan_tentative", False):
+                plan_ok = any(
+                    tc["name"] == "produce_plan" and str(rs).startswith("OK:")
+                    for tc, rs in results
+                )
+                if not plan_ok:
+                    gs.plan_produced = False
+                gs._plan_tentative = False
 
             # Post-execution: update state, check terminal, append messages
             for tc, result_str in results:
@@ -821,7 +809,14 @@ def react_loop(
 
                 if tool_name == "request_review":
                     result_text = str(result_str)
-                    review_dict = {"verdict": "UNKNOWN", "confidence": 0.0}
+                    # Parse confidence from text like "REVIEW VERDICT: APPROVE (confidence: 97%)"
+                    conf_match = re.search(r"confidence:\s*(\d+(?:\.\d+)?)\s*%?", result_text, re.IGNORECASE)
+                    if conf_match:
+                        raw = float(conf_match.group(1))
+                        conf = raw / 100.0 if raw > 1.0 else raw
+                    else:
+                        conf = 0.0
+                    review_dict = {"verdict": "UNKNOWN", "confidence": conf}
                     if "APPROVE" in result_text:
                         review_dict["verdict"] = "APPROVE"
                     elif "CHANGES_REQUESTED" in result_text:
@@ -853,8 +848,9 @@ def react_loop(
             })
 
         if gs.tool_call_count > 0 and gs.tool_call_count % 20 == 0:
-            pre_summarize = count_tokens_approx(messages)
-            messages = maybe_summarize(messages)
+            # Use real token count from last API response for accurate trigger
+            pre_summarize = gs.real_input_tokens if gs.real_input_tokens > 0 else count_tokens_approx(messages)
+            messages = maybe_summarize(messages, real_token_count=gs.real_input_tokens)
             post_summarize = count_tokens_approx(messages)
             if pre_summarize != post_summarize and trace:
                 trace.emit("context_compaction", "react_loop", {

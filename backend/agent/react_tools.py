@@ -2109,25 +2109,32 @@ def write_brt() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool collections
+# v4 Tool collections
 # ---------------------------------------------------------------------------
+# 10 react tools total. Exploration tools are added separately in react_loop.py
+# from explore_tools.py. Tools removed from REACT_TOOLS (functions still exist):
+#   create_sandbox   — setup_node creates it now
+#   check_syntax     — auto-runs after string_replace
+#   get_blast_radius — in dynamic block already, redundant with get_callers
+#   request_review   — replaced by verify_fix
+#   run_brt          — replaced by write_brt
+#   record_localization — auto-inferred from edits
 
-PLAN_TOOLS = [produce_plan]
-EDIT_TOOLS = [string_replace, check_syntax, create_file, undo_last_edit]
-SANDBOX_TOOLS = [create_sandbox, run_tests, run_brt]
 # Shell tool — universal escape hatch for env diagnosis/repair.
 # Imported here (not at top) to avoid circular import: shell_tools imports _tls
 # from this file.
-from agent.shell_tools import SHELL_TOOLS  # noqa: E402
-MULTI_FILE_TOOLS = [get_callers]
-COMPLETION_TOOLS = [record_localization, request_review, submit_fix, escalate]
-# verify_fix is available but NOT wired into REACT_TOOLS yet (Task 6 will do that).
+from agent.shell_tools import SHELL_TOOLS, run_shell  # noqa: E402
+
+EDIT_TOOLS = [string_replace, create_file, undo_last_edit]
+PLAN_TOOLS = [produce_plan]
+TEST_TOOLS = [run_tests, run_shell, write_brt]
+COMPLETION_TOOLS = [verify_fix, submit_fix, escalate]
+
+# Legacy collections kept for backward compat (tests, old code paths)
 VERIFY_TOOLS = [verify_fix]
-# write_brt is available but NOT wired into REACT_TOOLS yet (Task 6 will do that).
 BRT_TOOLS = [write_brt]
+SANDBOX_TOOLS = [create_sandbox, run_tests, run_brt]
+MULTI_FILE_TOOLS = [get_callers]
 
 # All react-specific tools (exploration tools are added from explore_tools.py)
-REACT_TOOLS = (
-    PLAN_TOOLS + EDIT_TOOLS + SANDBOX_TOOLS + SHELL_TOOLS
-    + MULTI_FILE_TOOLS + COMPLETION_TOOLS
-)
+REACT_TOOLS = EDIT_TOOLS + PLAN_TOOLS + TEST_TOOLS + COMPLETION_TOOLS

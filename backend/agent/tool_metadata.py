@@ -134,6 +134,12 @@ def _register_all() -> None:
         ToolMeta("run_brt", is_read_only=True, is_concurrent_safe=False,
                  max_output_chars=4000, activity_description="Running BRT",
                  phase="test"),
+        # Shell tool — read_only=False (pip install, mkdir, etc. mutate state).
+        # concurrent_safe=False (one process per shell call).
+        # 8000 char cap matches grep_repo (head+tail truncation in the tool).
+        ToolMeta("run_shell", is_read_only=False, is_concurrent_safe=False,
+                 max_output_chars=8000, activity_description="Running shell",
+                 phase="test"),
     ]:
         register_tool_meta(meta)
 
@@ -152,6 +158,12 @@ def _register_all() -> None:
         ToolMeta("request_review", is_read_only=True, is_concurrent_safe=False,
                  max_output_chars=3000, activity_description="Requesting review",
                  phase="review"),
+        ToolMeta("verify_fix", is_read_only=True, is_concurrent_safe=False,
+                 max_output_chars=1000, activity_description="Verifying fix",
+                 phase="review"),
+        ToolMeta("write_brt", is_read_only=False, is_concurrent_safe=False,
+                 max_output_chars=4000, activity_description="Generating BRTs",
+                 phase="test"),
         ToolMeta("submit_fix", is_read_only=False, is_concurrent_safe=False,
                  max_output_chars=500, activity_description="Submitting fix",
                  phase="submit"),

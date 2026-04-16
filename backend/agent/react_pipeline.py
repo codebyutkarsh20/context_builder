@@ -1157,185 +1157,23 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
     # Make BRTs accessible to the run_brt tool via thread-local
     _react_tls.brts = state.get("brts", [])
 
-    # Build orientation context
-    from agent.graph_utils import build_kickstart_context, load_business_rules
-    kickstart = build_kickstart_context(repo_name, str(repo_path), intent, DATA_DIR)
+    # v4 prompt build: use build_static_block / build_dynamic_block / build_task_message_v4.
+    # setup_node already assembled _dynamic_context with all the pieces
+    # (scout, graph, lessons, repo tree, concept mappings, baseline failures).
+    from agent.react_prompt import build_static_block, build_dynamic_block, build_task_message_v4
 
-    # Learn-from-fix: prepend lessons from past runs on this repo. The
-    # learn_from_fix module reads {DATA_DIR}/{repo_name}/agent_lessons.md
-    # (populated by record_lesson in finalize_node on previous runs).
-    # Returns "" if no lessons exist or feature is disabled.
-    try:
-        from agent.learn_from_fix import load_lessons
-        lessons_section = load_lessons(repo_name)
-        if lessons_section:
-            # Prepend so it's among the first things the agent sees
-            kickstart = lessons_section + "\n\n" + kickstart
-            logger.info(
-                "Injected %d chars of past-run lessons for %s",
-                len(lessons_section), repo_name,
-            )
-    except Exception as e:
-        logger.debug("load_lessons failed (non-fatal): %s", e)
+    dynamic_ctx = state.get("_dynamic_context", {})
+    static_block = build_static_block()
+    dynamic_block = build_dynamic_block(work_order, intent, dynamic_ctx)
+    task_message = build_task_message_v4()
 
-    # BUILD STRUCTURED CODE MAP for localized files — gives the agent a compact
-    # overview (function signatures + line numbers) instead of dumping whole files.
-    # Research: Composio FQDN maps use ~500 tokens vs 25K for whole files.
-    # The agent reads specific sections via read_file when it needs the actual code.
-    hint_files_for_map = intent.get("likely_affected_modules", [])[:5]
-    code_map_sections = []
-    for hf in hint_files_for_map:
-        try:
-            fpath = repo_path / hf
-            if not fpath.exists():
-                continue
-            content = fpath.read_text(encoding="utf-8", errors="replace")
-            lines = content.split("\n")
-            # Extract function/class signatures with line numbers
-            # Multi-language: Python, JavaScript, TypeScript, Go, Rust
-            import re
-            sigs = []
-            ext = fpath.suffix.lower()
-            for i, line in enumerate(lines):
-                stripped = line.rstrip()
-                lineno = i + 1
-                # Python patterns
-                if re.match(r"^\s*(class\s+\w+|(?:async\s+)?def\s+\w+)", stripped):
-                    sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
-                # Python decorators (show what the function does)
-                elif re.match(r"^\s*@(router|app)\.", stripped):
-                    sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
-                # JS/TS patterns (function, class, export, arrow functions)
-                elif ext in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue"):
-                    if re.match(r"^\s*(export\s+)?(default\s+)?(async\s+)?function\s+\w+", stripped):
-                        sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
-                    elif re.match(r"^\s*(export\s+)?(default\s+)?class\s+\w+", stripped):
-                        sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
-                    elif re.match(r"^\s*(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s+)?\(", stripped):
-                        sigs.append(f"  L{lineno:4d}: {stripped.strip()[:120]}")
-                    elif re.match(r"^\s*(export\s+)?(interface|type|enum)\s+\w+", stripped):
-                        sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
-                # Go patterns
-                elif ext == ".go":
-                    if re.match(r"^func\s+(\(\w+\s+\*?\w+\)\s+)?\w+", stripped):
-                        sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
-                    elif re.match(r"^type\s+\w+\s+(struct|interface)", stripped):
-                        sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
-                # Rust patterns
-                elif ext == ".rs":
-                    if re.match(r"^\s*(pub\s+)?(async\s+)?fn\s+\w+", stripped):
-                        sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
-                    elif re.match(r"^\s*(pub\s+)?(struct|enum|trait|impl)\s+", stripped):
-                        sigs.append(f"  L{lineno:4d}: {stripped.strip()}")
-            if sigs:
-                code_map_sections.append(
-                    f"{hf} ({len(lines)} lines):\n" + "\n".join(sigs)
-                )
-                logger.info("Code map for %s: %d signatures from %d lines", hf, len(sigs), len(lines))
-        except Exception as e:
-            logger.debug("Could not build code map for %s: %s", hf, e)
-
-    if code_map_sections:
-        kickstart += (
-            "\n\n## CODE MAP (function signatures + line numbers for localized files)\n"
-            "Use read_file(file, start_line, end_line) to read the specific section you need.\n\n"
-            + "\n\n".join(code_map_sections)
-        )
-        logger.info("Code map: %d files, %d total chars", len(code_map_sections), sum(len(s) for s in code_map_sections))
-    else:
-        # No code map — scout paths didn't match real files. Give the agent a directory listing instead.
-        logger.warning("No code map built — hint files don't exist. Adding directory listing as fallback.")
-        try:
-            routers_dir = repo_path / "backend" / "app" / "routers"
-            if routers_dir.exists():
-                py_files = sorted(routers_dir.glob("*.py"))
-                listing = "\n".join(f"  {f.relative_to(repo_path)} ({f.stat().st_size // 1000}KB)" for f in py_files)
-                kickstart += f"\n\n## REPO FILES (no code map available — start with get_file_structure)\n{listing}"
-            else:
-                # Generic fallback — list top-level Python files
-                py_files = sorted(repo_path.rglob("*.py"))[:20]
-                listing = "\n".join(f"  {f.relative_to(repo_path)}" for f in py_files)
-                kickstart += f"\n\n## REPO FILES (no code map available — start with get_file_structure)\n{listing}"
-        except Exception:
-            pass
-
-    # Inject concept-to-code section into kickstart if present (set during intake)
-    concept_section = intent.get("_concept_section", "")
-    if concept_section:
-        kickstart += f"\n\n{concept_section}"
-        logger.info("Injected concept-to-code section (%d chars) into kickstart", len(concept_section))
-
-    # Test-infra warning: preflight detected pytest can't even collect tests
-    # (usually conftest import error). Tell the agent so it doesn't waste turns
-    # debugging "test failures" that are really infra/env breakage — but ALSO
-    # actively suggest run_shell for env repair (it can install missing deps
-    # straight into the scorer's venv).
-    if work_order.get("_preflight_failed"):
-        infra_note = (
-            "\n\n## ⚠️  TEST INFRASTRUCTURE WARNING — INVESTIGATE WITH run_shell\n"
-            "The repo's test framework is currently broken (pytest cannot collect tests, "
-            "exit code 4 — usually a conftest.py import error or missing dep). "
-            "**This is FIXABLE with run_shell** — `pip install` lands in the scorer's venv.\n"
-            "\n"
-            "Recommended workflow:\n"
-            "1. `run_shell('python -c \"import <suspected-module>\"')` — find the missing import\n"
-            "2. `run_shell('pip install <missing-pkg>')` — install it (auto-targets scorer's venv)\n"
-            "3. `run_shell('python -m pytest --collect-only -q')` — verify tests can collect now\n"
-            "4. Then proceed with your fix + run_tests as usual.\n"
-            "\n"
-            "If the env truly can't be repaired (e.g. missing C extension build), submit anyway — "
-            "the verifier judges based on code reasoning, not test pass/fail.\n"
-        )
-        if work_order.get("_preflight_stderr"):
-            infra_note += f"\nPreflight stderr (first 300 chars):\n{work_order['_preflight_stderr']}\n"
-        kickstart += infra_note
-        logger.info("Injected preflight failure warning + run_shell suggestion into kickstart")
-
-    # Load conventions and business rules
-    from agent.react_prompt import (
-        build_system_prompt,
-        build_task_message,
-        load_project_conventions,
-    )
-    conventions = load_project_conventions(repo_name)
-
-    # Business rules (use hint files from intent for scoping)
-    hint_files = intent.get("likely_affected_modules", [])[:5]
-    hint_functions = intent.get("likely_affected_functions", [])[:5]
-    business_rules = load_business_rules(repo_name, hint_files) if hint_files else ""
-
-    static_block, dynamic_block = build_system_prompt(
-        work_order=work_order,
-        intent=intent,
-        kickstart_context=kickstart,
-        conventions_section=conventions,
-        business_rules_section=business_rules,
-        brts=state.get("brts", []),
-    )
-    task_message = build_task_message(work_order, intent)
-
-    # If this is a retry attempt (pass@3), prepend the failure feedback so the
-    # agent knows what didn't work last time.
-    retry_feedback = state.get("retry_feedback", "")
-    retry_count = state.get("retry_count", 0)
-    if retry_feedback and retry_count > 0:
-        task_message = (
-            f"🔁 RETRY ATTEMPT {retry_count + 1} of {int(os.environ.get('REACT_MAX_RETRIES', '2')) + 1}\n\n"
-            f"YOUR PREVIOUS ATTEMPT FAILED with this feedback:\n{retry_feedback}\n\n"
-            f"Review what went wrong, revise your hypothesis, and try a different approach. "
-            f"The sandbox from your previous attempt still exists — you can continue from it "
-            f"OR use undo_last_edit() to revert and try something new.\n\n"
-            f"---\n\n{task_message}"
-        )
-        logger.info("Retry attempt %d: injected retry feedback into task message", retry_count)
-
-    # Emit prompt_build for observability — include full prompt text for replay/iteration
+    # Emit prompt_build for observability
     if trace:
-        import subprocess
+        import subprocess as _sp
         git_sha = ""
         try:
-            git_sha = subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, stderr=subprocess.DEVNULL,
+            git_sha = _sp.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent, stderr=_sp.DEVNULL,
             ).decode().strip()[:12]
         except Exception:
             pass
@@ -1349,11 +1187,6 @@ def react_agent_node(state: ReactAgentState) -> ReactAgentState:
             "dynamic_block_chars": len(dynamic_block),
             "task_message_text": task_message,
             "task_message_chars": len(task_message),
-            "kickstart_chars": len(kickstart),
-            "conventions_chars": len(conventions),
-            "business_rules_chars": len(business_rules),
-            "hint_files": hint_files,
-            "hint_functions": hint_functions,
             "repo_name": repo_name,
             "agent_git_sha": git_sha,
         })
@@ -1660,9 +1493,9 @@ def _populate_repair_and_localization(
 def finalize_node(state: ReactAgentState) -> ReactAgentState:
     """Handle post-agent work: create PR if submitted, escalate otherwise.
 
-    Includes pass@3 retry: if verifier REJECTed the fix AND BRTs are failing,
-    re-enter the agent loop with the failure feedback as context. Max 2 retries
-    (so max 3 total attempts). This matches OpenHands/Aider's leaderboard pattern.
+    v4: No retry logic here. Retries happen in-loop via verify_fix rejection
+    (the agent gets feedback and can undo/redo within its tool budget).
+    This node handles: PR creation, learn_from_fix, cleanup, metrics.
     """
     _thread_local.current_stage = "finalize"
     trace = _get_trace()
@@ -1670,63 +1503,6 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
         trace.stage_start("finalize")
     logger.info("=== FINALIZE: %s ===",
                 "Creating PR" if state.get("submitted") else "Escalating")
-
-    # Pass@3 retry logic: if verifier flagged the fix as incomplete AND BRTs
-    # are failing, give the agent another shot with the failure feedback.
-    # Default 0 retries (disabled) — enable per-bug or by env var when there's
-    # genuine time budget. Last run had DJANGO-11630 timeout at 900s because
-    # retry burned through the whole budget.
-    retry_count = state.get("retry_count", 0)
-    MAX_RETRIES = int(os.environ.get("REACT_MAX_RETRIES", "0"))  # default off
-    # Time budget guard — don't retry if we're running low on case timeout
-    pipeline_start = state.get("_pipeline_start", time.time())
-    elapsed = time.time() - pipeline_start
-    case_timeout = state.get("_case_timeout", 900)
-    remaining_budget = case_timeout - elapsed
-    has_time_for_retry = remaining_budget >= 300  # need at least 5 min
-
-    should_retry = (
-        state.get("needs_retry")
-        and retry_count < MAX_RETRIES
-        and state.get("submitted")
-        and not state.get("dry_run_scoring_only")
-        and has_time_for_retry
-    )
-    if state.get("needs_retry") and not has_time_for_retry:
-        logger.warning(
-            "Skipping retry: only %.0fs remaining of %ds case budget", remaining_budget, case_timeout,
-        )
-    if should_retry:
-        retry_reason = state.get("retry_reason", "Fix incomplete")
-        logger.info(
-            "PASS@3 RETRY %d/%d (%.0fs remaining): %s",
-            retry_count + 1, MAX_RETRIES, remaining_budget, retry_reason[:200],
-        )
-        if trace:
-            trace.emit("retry_triggered", "finalize", {
-                "retry_count": retry_count + 1,
-                "max_retries": MAX_RETRIES,
-                "reason": retry_reason,
-                "epr_score": state.get("epr_score"),
-                "verifier_verdict": state.get("verifier_verdict"),
-            })
-        # Clear submitted + retry signal, re-enter react loop with feedback
-        state["retry_count"] = retry_count + 1
-        state["submitted"] = False
-        state["needs_retry"] = False
-        state["retry_feedback"] = retry_reason
-        # Re-enter react_agent_node. This requires the intake to have completed
-        # (it has — we got here post-verifier). Just rerun react_agent_node
-        # which uses state["work_order"] + state["intent"] already set.
-        from agent.react_pipeline import react_agent_node as _react_agent_node
-        state = _react_agent_node(state)
-        # Re-run verifier on the new fix
-        state = verifier_node(state)
-        # Fall through to normal finalize logic — recursion check via retry_count
-        if state.get("needs_retry") and state.get("retry_count", 0) < MAX_RETRIES:
-            # Will re-enter again on next finalize_node call. But since we're
-            # already IN finalize_node, just let it complete after retries exhaust.
-            pass
 
     work_order = state.get("work_order", {})
     ticket_id = work_order.get("ticket_id", "UNKNOWN")
@@ -2676,13 +2452,12 @@ def run_ticket_react(
 ) -> dict:
     """Run a bug ticket through the ReAct pipeline.
 
-    Stages:
-      1. intake_node    — translate ticket to intent + pre-localization
-      2. brt_node       — generate failing tests before fix (skipped if disable_brt)
-      3. react_agent_node — ReAct loop with tools
-      4. verifier_node  — independent fresh-context review (cavekit speculative pattern)
-      5. finalize_node  — create PR or escalate
+    Pipeline v4 stages:
+      1. setup_node       — parallel init: sandbox + scout + context assembly
+      2. react_agent_node — ReAct loop with tools (verify_fix runs in-loop)
+      3. finalize_node    — create PR, record lessons, cleanup
 
+    Legacy flags preserved for backward compat:
     disable_brt / disable_scout: v2.0 baseline flags used by eval runner for A/B.
     best_of_n > 1: runs N parallel instances, picks winner by test pass then
     review confidence (SWE-agent best-of-N pattern, +10-15pp submit rate).
@@ -2721,11 +2496,11 @@ def run_ticket_react(
     }
 
     try:
-        state = intake_node(state)
-        if not getattr(_thread_local, "disable_brt", False):
-            state = brt_node(state)    # BRT-first: generate failing tests before fix
+        # Pipeline v4: 3-stage (setup → react → finalize).
+        # verify_fix runs in-loop (not as separate verifier_node).
+        # BRTs generated on-demand via write_brt tool.
+        state = setup_node(state)
         state = react_agent_node(state)
-        state = verifier_node(state)   # Independent reviewer (speculative pattern)
         state = finalize_node(state)
 
         result_dict = dict(state)
