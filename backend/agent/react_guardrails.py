@@ -83,6 +83,8 @@ class GuardrailState:
         self.real_output_tokens: int = 0  # last LLM call's output_tokens
         self.cumulative_input_tokens: int = 0
         self.cumulative_output_tokens: int = 0
+        # Verify-fix tracking — nudge agent to call verify_fix before submit
+        self._verify_fix_called: bool = False
 
     @property
     def elapsed(self) -> float:
@@ -149,6 +151,13 @@ def check_tool_call(
 
     # ── Soft guidance (warnings only — never block exploration) ─────────
     # The agent needs freedom to explore. These are nudges, not walls.
+
+    # Nudge: verify_fix before submit — independent verification catches mistakes
+    if tool_name == "submit_fix" and not getattr(gs, "_verify_fix_called", False):
+        return (
+            "SUGGESTION: Call verify_fix(explanation) before submit_fix. "
+            "It gives you independent verification feedback you can act on."
+        )
 
     explore_tools = {"grep_repo", "read_file", "read_function", "list_files",
                      "get_file_structure", "get_function_info", "get_blast_radius"}
@@ -218,6 +227,8 @@ def update_from_tool_result(
             gs._last_edit_call = gs.tool_call_count  # Track for post-edit explore cap
     elif tool_name == "request_review":
         gs.review_count += 1
+    elif tool_name == "verify_fix":
+        gs._verify_fix_called = True
 
     if tool_name == "produce_plan" and result.startswith("OK:"):
         # First plan or revision — both update plan state

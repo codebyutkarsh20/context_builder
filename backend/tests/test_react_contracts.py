@@ -103,6 +103,7 @@ class TestGuardrailSubmitGate:
         gs.sandbox_created = True
         gs.tests_attempted = True
         gs.tests_passed = True
+        gs._verify_fix_called = True
         result = check_tool_call("submit_fix", {}, gs)
         # Should be a warning, not a hard block
         assert result is None or "WARNING" in result
@@ -126,6 +127,7 @@ class TestGuardrailSubmitGate:
         gs.tests_attempted = True
         gs.tests_passed = True
         gs.review_approved = True
+        gs._verify_fix_called = True
         result = check_tool_call("submit_fix", {}, gs)
         assert result is None
 
@@ -137,6 +139,7 @@ class TestGuardrailSubmitGate:
         gs.tests_passed = False
         gs.tests_skipped = True  # No tests ran but that's OK
         gs.review_approved = True
+        gs._verify_fix_called = True
         result = check_tool_call("submit_fix", {}, gs)
         assert result is None
 
@@ -153,6 +156,7 @@ class TestGuardrailSubmitGate:
         gs.tests_passed = False
         gs.tests_skipped = True  # error sets tests_skipped=True
         gs.review_approved = True
+        gs._verify_fix_called = True
         result = check_tool_call("submit_fix", {}, gs)
         assert result is None
 
@@ -175,6 +179,7 @@ class TestGuardrailLimits:
         gs.tests_attempted = True
         gs.tests_passed = True
         gs.review_approved = True
+        gs._verify_fix_called = True
         result = check_tool_call("submit_fix", {}, gs)
         assert result is None
 
@@ -458,6 +463,7 @@ class TestPromptGuardrailAlignment:
         gs_passed.review_approved = True
         gs_passed.tests_attempted = True
         gs_passed.tests_passed = True
+        gs_passed._verify_fix_called = True
         assert check_tool_call("submit_fix", {}, gs_passed) is None
 
         # "skipped" → can submit
@@ -466,6 +472,7 @@ class TestPromptGuardrailAlignment:
         gs_skipped.review_approved = True
         gs_skipped.tests_attempted = True
         gs_skipped.tests_skipped = True
+        gs_skipped._verify_fix_called = True
         assert check_tool_call("submit_fix", {}, gs_skipped) is None
 
         # "error" → can submit (error sets tests_skipped=True)
@@ -474,6 +481,7 @@ class TestPromptGuardrailAlignment:
         gs_error.review_approved = True
         gs_error.tests_attempted = True
         gs_error.tests_skipped = True  # error → tests_skipped
+        gs_error._verify_fix_called = True
         assert check_tool_call("submit_fix", {}, gs_error) is None
 
         # "failed" → BLOCKED
@@ -723,6 +731,7 @@ class TestEndToEndExitCodeToSubmit:
         gs = GuardrailState()
         gs.sandbox_created = True
         gs.review_approved = True
+        gs._verify_fix_called = True
         update_from_tool_result("run_tests", {}, formatted, gs)
 
         # Step 3: check if submit is allowed
