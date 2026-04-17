@@ -464,26 +464,28 @@ def react_loop(
                 })
 
         # ── Conversation-level prompt caching ────────────────────────────
-        # The system prompt (tools + static + dynamic) is cached (~8K tokens).
-        # But without this, the CONVERSATION messages (growing 350 → 50K+)
-        # are sent fresh every call. By marking the last message with
-        # cache_control, we cache the entire prefix: tools + system + all
-        # prior conversation turns. Each new call only processes the newest
-        # tool results (~500 tokens fresh instead of ~10K+).
+        # Anthropic allows max 4 cache_control breakpoints per request.
+        # We use: 1 on static_block, 1 on dynamic_block (in system msg),
+        # and 1 on the last conversation message (moving breakpoint).
+        # = 3 total, under the 4 limit.
         #
-        # From Anthropic docs: "Cache writes happen only at your breakpoint."
-        # We move the breakpoint forward each turn, caching more of the
-        # conversation as it grows. This turns 46% cache ratio at call 17
-        # into ~90%+ cache ratio.
-        #
-        # The last message should be a ToolMessage or HumanMessage.
-        # We convert its content to block format with cache_control.
-        if len(messages) >= 3:  # system + at least 1 exchange
+        # Each turn: remove the PREVIOUS conversation breakpoint, add one
+        # to the NEW last message. This progressively caches more of the
+        # conversation prefix.
+        if len(messages) >= 3:
+            # Step 1: Remove previous conversation-level cache_control
+            # (skip messages[0] which is the system message)
+            for msg in messages[1:-1]:
+                if isinstance(msg.content, list):
+                    for block in msg.content:
+                        if isinstance(block, dict):
+                            block.pop("cache_control", None)
+
+            # Step 2: Add cache_control to the LAST message
             last_msg = messages[-1]
             if isinstance(last_msg, (ToolMessage, HumanMessage)):
                 content = last_msg.content
                 if isinstance(content, str):
-                    # Convert string content to block format with cache_control
                     last_msg.content = [
                         {
                             "type": "text",
@@ -492,9 +494,8 @@ def react_loop(
                         }
                     ]
                 elif isinstance(content, list) and content:
-                    # Already block format — add cache_control to last block
                     last_block = content[-1]
-                    if isinstance(last_block, dict) and "cache_control" not in last_block:
+                    if isinstance(last_block, dict):
                         last_block["cache_control"] = {"type": "ephemeral"}
 
         # Call the LLM — with multi-stage recovery for context overflow + transient errors
