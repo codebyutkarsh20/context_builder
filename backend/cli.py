@@ -32,6 +32,20 @@ from rich import print as rprint
 app = typer.Typer(help="Build and query knowledge graphs for any code repository.")
 console = Console()
 
+
+def _data_root() -> Path:
+    """Return the data directory, honoring DATA_DIR env var.
+
+    Default `/tmp/context_builder` is ephemeral on macOS — users should set
+    DATA_DIR to a persistent location (e.g. ~/.context_builder_data).
+    """
+    return Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
+
+
+def _repo_data_dir(repo_name: str) -> Path:
+    """Data directory for a specific repo (knowledge graph, summaries, lessons)."""
+    return _data_root() / repo_name
+
 # ---------------------------------------------------------------------------
 # Eval subcommand group
 # ---------------------------------------------------------------------------
@@ -673,7 +687,7 @@ def build(
                           + (f" +{len(communities)-6} more" if len(communities) > 6 else ""))
             # Store communities alongside graph.json for community classifier
             import json as _json_c
-            _comm_out = Path(f"/tmp/context_builder/{repo_name}")
+            _comm_out = _repo_data_dir(repo_name)
             _comm_out.mkdir(parents=True, exist_ok=True)
             (_comm_out / "communities.json").write_text(_json_c.dumps(communities, default=str))
         except Exception as e:
@@ -681,7 +695,7 @@ def build(
             communities = []
 
         # Write graph.json for agent kickstart and dashboard fallback
-        _graph_out = Path(f"/tmp/context_builder/{repo_name}")
+        _graph_out = _repo_data_dir(repo_name)
         _graph_out.mkdir(parents=True, exist_ok=True)
         import json as _json2; (_graph_out / "graph.json").write_text(_json2.dumps(graph_data, default=str))
 
@@ -794,7 +808,7 @@ def build(
             rules_count = extractor.extract()
             rules = extractor.extract_all()  # get rules for file persistence
         # Always write to business_rules.json so the pipeline can read them
-        out_dir_br = Path(f"/tmp/context_builder/{repo_name}")
+        out_dir_br = _repo_data_dir(repo_name)
         out_dir_br.mkdir(parents=True, exist_ok=True)
         persist_rules_to_file(rules, out_dir_br / "business_rules.json")
         console.print(f"  [green]✓[/green] {rules_count} business rules extracted")
@@ -815,7 +829,7 @@ def build(
         from embeddings.embedder import build_enriched_nodes
         enriched = build_enriched_nodes(parsed, graph_data, decision_points, domain_concepts, rules if no_neo4j else [])
         import json as _json
-        enriched_path = Path(f"/tmp/context_builder/{repo_name}/enriched_nodes.json")
+        enriched_path = _repo_data_dir(repo_name) / "enriched_nodes.json"
         enriched_path.parent.mkdir(parents=True, exist_ok=True)
         enriched_path.write_text(_json.dumps(enriched, default=str))
         console.print(f"  [green]✓[/green] Enriched node cache: {len(enriched)} nodes")
@@ -835,7 +849,7 @@ def build(
 
         progress.update(task, description="[green]Done!", completed=100)
 
-    out = Path(f"/tmp/context_builder/{repo_name}")
+    out = _repo_data_dir(repo_name)
     console.print(Panel(
         f"[bold green]Context built successfully![/bold green]\n\n"
         f"[cyan]context.md[/cyan]  → {out}/context.md\n"
@@ -861,7 +875,7 @@ def query(
         python cli.py query django-shop "What happens when a payment fails?"
     """
     import anthropic
-    out = Path(f"/tmp/context_builder/{repo_name}")
+    out = _repo_data_dir(repo_name)
     context_path = out / "context.md"
 
     if not context_path.exists():
@@ -902,7 +916,7 @@ def query(
 @app.command("list")
 def list_repos():
     """List all repos that have been analyzed."""
-    base = Path("/tmp/context_builder")
+    base = _data_root()
     if not base.exists() or not any(base.iterdir()):
         console.print("[yellow]No repos analyzed yet.[/yellow] Run: python cli.py build /path/to/repo")
         return
@@ -937,7 +951,7 @@ def _compile_without_neo4j(
 ):
     """Write context.md and summary.md directly from in-memory data (no Neo4j)."""
     from datetime import datetime, timezone
-    out = Path(out_dir) if out_dir else Path(f"/tmp/context_builder/{repo_name}")
+    out = Path(out_dir) if out_dir else _repo_data_dir(repo_name)
     out.mkdir(parents=True, exist_ok=True)
 
     tech = ", ".join(structure.get("tech_stack", []))
@@ -1275,6 +1289,23 @@ def fix(
     Examples:
         python cli.py fix PROJ-1234 --title "Bug title" --desc "description" --repo /path/to/repo
     """
+    # Preflight checks — fail early with clear messages, not deep in the SDK.
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        console.print("[red]✗ ANTHROPIC_API_KEY not set.[/red]")
+        console.print("  Set it in [cyan].env[/cyan] or export it:")
+        console.print("    [dim]export ANTHROPIC_API_KEY=sk-ant-...[/dim]")
+        console.print("  Get a key at https://console.anthropic.com")
+        raise typer.Exit(1)
+
+    if repo_path and not Path(repo_path).is_dir():
+        console.print(f"[red]✗ Repo path does not exist:[/red] {repo_path}")
+        raise typer.Exit(1)
+
+    if repo_path and not (Path(repo_path) / ".git").exists():
+        console.print(f"[yellow]⚠ No .git directory at {repo_path}[/yellow]")
+        console.print("  The agent needs a git repo to create a sandbox worktree.")
+        raise typer.Exit(1)
+
     from agent.trace import RunTrace
 
     work_order = {
@@ -1377,7 +1408,7 @@ def update(
         raise typer.Exit(1)
 
     repo_name = name or path.name
-    data_dir = Path(f"/tmp/context_builder/{repo_name}")
+    data_dir = _repo_data_dir(repo_name)
 
     graph_path = data_dir / "graph.json"
     if not graph_path.exists():

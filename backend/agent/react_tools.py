@@ -486,12 +486,19 @@ def _find_brt_python(sandbox: Path) -> str:
     m = re.match(r"agent_sandbox_(.+)_[a-f0-9]{6,}$", sandbox_name)
     if m:
         repo_stem = m.group(1)
-        # Search common eval repo parents
-        for parent in (
-            Path("eval/repos"),
-            Path("/Users/utkarshpatidar/Projects/personal/context_builder/backend/eval/repos"),
-            Path("/Users/utkarshpatidar/Projects/personal/context_builder/eval/repos"),
-        ):
+        # Search common eval repo parents — relative to cwd, then env, then
+        # project root detection (walk up from this file looking for eval/repos).
+        _candidates = [Path("eval/repos"), Path("backend/eval/repos")]
+        if os.environ.get("EVAL_REPOS_DIR"):
+            _candidates.insert(0, Path(os.environ["EVAL_REPOS_DIR"]))
+        # Walk up from this file to find project root
+        _here = Path(__file__).resolve()
+        for ancestor in _here.parents[:5]:
+            for sub in ("eval/repos", "backend/eval/repos"):
+                p = ancestor / sub
+                if p.is_dir() and p not in _candidates:
+                    _candidates.append(p)
+        for parent in _candidates:
             venv_py = parent / f"{repo_stem}_venv" / "bin" / "python"
             if venv_py.exists():
                 return str(venv_py.resolve())
