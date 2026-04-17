@@ -309,23 +309,59 @@ class RepoManager:
         except subprocess.SubprocessError:
             logger.warning("Failed to reset repo at %s", repo_dir)
 
-    @staticmethod
-    def _find_compat_python() -> str:
-        """Return path to Python 3.10.x if available via pyenv, else sys.executable.
+    # SWE-bench repo → required Python version (from official harness constants).
+    # Source: github.com/swe-bench/SWE-bench/blob/main/swebench/harness/constants/python.py
+    # Without this mapping, sympy (needs 3.9) gets 3.10 → collections.Mapping removed → import fails.
+    _REPO_PYTHON_VERSION = {
+        "sympy": "3.9",
+        "astropy": "3.9",
+        "matplotlib": "3.9",  # older matplotlib versions
+        "scikit-learn": "3.9",
+        "django": "3.9",      # works on 3.9 and 3.10
+        "flask": "3.9",
+        "pytest": "3.9",
+        "sphinx": "3.9",
+        "requests": "3.9",
+        "pylint": "3.9",
+        "xarray": "3.9",
+        "seaborn": "3.9",
+    }
 
-        Most SWE-bench instances target Python 3.8-3.10. Running them on Python 3.12+
-        causes failures (greenlet build errors, werkzeug API removals, py==1.10.0
-        incompatibility with Python 3.13). Using 3.10 avoids these issues.
+    @staticmethod
+    def _find_compat_python(repo_name: str = "") -> str:
+        """Return path to the correct Python version for this repo.
+
+        Uses the SWE-bench version mapping to pick the right Python.
+        Sympy needs 3.9 (collections.Mapping removed in 3.10).
+        Falls back to 3.10, then 3.9, then sys.executable.
         """
+        # Normalize repo_name: "sympy_abc123" → "sympy"
+        base_repo = repo_name.split("_")[0].lower() if repo_name else ""
+
+        # Look up required version
+        required = RepoManager._REPO_PYTHON_VERSION.get(base_repo, "3.10")
+
         pyenv_root = Path.home() / ".pyenv" / "versions"
         if pyenv_root.exists():
+            # Try exact required version first
             for candidate in sorted(pyenv_root.iterdir(), reverse=True):
-                if candidate.name.startswith("3.10."):
+                if candidate.name.startswith(f"{required}."):
                     python = candidate / "bin" / "python"
                     if python.exists():
-                        logger.info("Using pyenv Python %s for SWE-bench venv", candidate.name)
+                        logger.info("Using pyenv Python %s for %s (required: %s)",
+                                    candidate.name, repo_name, required)
                         return str(python)
-        logger.warning("Python 3.10.x not found in pyenv — falling back to %s", sys.executable)
+            # Fallback: try 3.10, then 3.9
+            for fallback in ["3.10.", "3.9."]:
+                for candidate in sorted(pyenv_root.iterdir(), reverse=True):
+                    if candidate.name.startswith(fallback):
+                        python = candidate / "bin" / "python"
+                        if python.exists():
+                            logger.warning("Required Python %s not found — using %s for %s",
+                                           required, candidate.name, repo_name)
+                            return str(python)
+
+        logger.warning("No suitable Python found in pyenv — falling back to %s", sys.executable)
         return sys.executable
 
     def setup_venv(self, repo_dir: Path, bug: dict) -> Path | None:
@@ -395,7 +431,7 @@ class RepoManager:
         # Prefer Python 3.10 for SWE-bench repos — most SWE-bench instances target
         # Python 3.8-3.10 and have deps that are incompatible with Python 3.12+
         # (e.g., old greenlet, py==1.10.0, werkzeug api removals).
-        python_bin = self._find_compat_python()
+        python_bin = self._find_compat_python(repo_dir.name)
 
         # Create venv
         try:
