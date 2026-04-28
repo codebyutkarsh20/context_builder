@@ -9,6 +9,7 @@ Verifies:
   - Error handling (404, concurrent access)
 """
 
+import os
 import sys
 import threading
 import time
@@ -20,6 +21,8 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 BASE = "http://localhost:8001"
+SAMPLE_REPO_NAME = os.environ.get("E2E_REPO_NAME", "example-repo")
+SAMPLE_REPO_PATH = os.environ.get("E2E_REPO_PATH", "/tmp/example-repo")
 
 
 def api(method, path, **kwargs):
@@ -35,7 +38,7 @@ class TestJobSubmission:
         resp = api("post", "/api/agent/run", json={
             "title": "Test bug",
             "description": "Something is broken",
-            "repo_name": "crest-be",
+            "repo_name": SAMPLE_REPO_NAME,
         })
         assert resp.status_code == 200
         data = resp.json()
@@ -46,8 +49,8 @@ class TestJobSubmission:
         resp = api("post", "/api/agent/run", json={
             "title": "Test with path",
             "description": "Test repo_path passthrough",
-            "repo_name": "crest-be",
-            "repo_path": "/Users/utkarshpatidar/work/crest-work/crest-be",
+            "repo_name": SAMPLE_REPO_NAME,
+            "repo_path": SAMPLE_REPO_PATH,
         })
         assert resp.status_code == 200
         assert "job_id" in resp.json()
@@ -57,7 +60,7 @@ class TestJobSubmission:
             "ticket_id": "PROJ-999",
             "title": "Full field test",
             "description": "All fields populated",
-            "repo_name": "crest-be",
+            "repo_name": SAMPLE_REPO_NAME,
             "repo_path": "/some/path",
             "priority": "critical",
             "comments": ["urgent", "prod down"],
@@ -68,7 +71,7 @@ class TestJobSubmission:
         resp = api("post", "/api/agent/run", json={
             "title": "No ticket ID",
             "description": "Auto-generate ticket ID",
-            "repo_name": "crest-be",
+            "repo_name": SAMPLE_REPO_NAME,
         })
         data = resp.json()
         assert data["job_id"]  # Should have auto-generated ID
@@ -88,7 +91,7 @@ class TestJobStatus:
         submit = api("post", "/api/agent/run", json={
             "title": "Status test",
             "description": "Check status",
-            "repo_name": "crest-be",
+            "repo_name": SAMPLE_REPO_NAME,
         })
         job_id = submit.json()["job_id"]
 

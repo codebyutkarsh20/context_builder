@@ -8,9 +8,13 @@ Tests all 4 phases:
   Phase 4: UX Polish (empty state, past runs, jobs endpoint)
 
 NOTE: These are integration/E2E tests that require live infrastructure:
-  - Backend server running at localhost:8000
+  - Backend server running at localhost:8001
   - Frontend dev server running at localhost:5173
-  - Real crest-be repo at /Users/utkarshpatidar/work/crest-work/crest-be
+  - A previously-analyzed repository to point the agent at
+
+Configure the target repo via environment variables:
+  E2E_REPO_NAME  – name as shown in /api/repos (e.g. "my-project")
+  E2E_REPO_PATH  – absolute path on disk (e.g. "/tmp/my-project")
 
 Run with: python tests/test_hardening_e2e.py  (not via pytest)
 Or:       pytest tests/test_hardening_e2e.py -m e2e  (after starting servers)
@@ -37,6 +41,8 @@ pytestmark = pytest.mark.skipif(
 
 BASE = "http://localhost:8001"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
+SAMPLE_REPO_NAME = os.environ.get("E2E_REPO_NAME", "example-repo")
+SAMPLE_REPO_PATH = os.environ.get("E2E_REPO_PATH", "/tmp/example-repo")
 
 # ──────────────────────────────────────────────────────────────────────
 # Helpers
@@ -95,7 +101,7 @@ def test_phase1():
             resp = api("post", "/api/agent/run", json={
                 "title": f"Thread safety test {idx}",
                 "description": f"Concurrent job {idx}",
-                "repo_name": "crest-be",
+                "repo_name": SAMPLE_REPO_NAME,
             })
             results[idx] = resp.json()
         except Exception as e:
@@ -167,8 +173,8 @@ def test_phase2():
 
     # 2.1 repo_path in graph.json and GET /api/repos
     print("\n--- 2.1 repo_path Storage & Exposure ---")
-    graph_path = DATA_DIR / "crest-be" / "graph.json"
-    check(graph_path.exists(), "crest-be graph.json exists")
+    graph_path = DATA_DIR / SAMPLE_REPO_NAME / "graph.json"
+    check(graph_path.exists(), f"{SAMPLE_REPO_NAME} graph.json exists")
 
     if graph_path.exists():
         data = json.loads(graph_path.read_text())
@@ -178,25 +184,18 @@ def test_phase2():
     repos = api("get", "/api/repos").json()
     check(len(repos) >= 1, f"GET /api/repos returns repos", f"count={len(repos)}")
 
-    crest = next((r for r in repos if r["name"] == "crest-be"), None)
-    check(crest is not None, "crest-be in repos list")
-    if crest:
-        check("repo_path" in crest, "repo_path returned in repos response", crest.get("repo_path", ""))
-
-    # Check shopify repo (should NOT have repo_path since it was analyzed before our change)
-    shopify = next((r for r in repos if r["name"] == "shopify-analytics-agent"), None)
-    if shopify:
-        # shopify graph.json was written before our change, so no repo_path
-        has_rp = "repo_path" in shopify and shopify["repo_path"]
-        print(f"  ℹ️  shopify-analytics-agent repo_path: {'present' if has_rp else 'absent (expected for pre-change analysis)'}")
+    target = next((r for r in repos if r["name"] == SAMPLE_REPO_NAME), None)
+    check(target is not None, f"{SAMPLE_REPO_NAME} in repos list")
+    if target:
+        check("repo_path" in target, "repo_path returned in repos response", target.get("repo_path", ""))
 
     # 2.2 Accept repo_path in Agent API
     print("\n--- 2.2 repo_path in Agent API ---")
     resp = api("post", "/api/agent/run", json={
         "title": "Test repo_path",
         "description": "Verify repo_path flows through",
-        "repo_name": "crest-be",
-        "repo_path": "/Users/utkarshpatidar/work/crest-work/crest-be",
+        "repo_name": SAMPLE_REPO_NAME,
+        "repo_path": SAMPLE_REPO_PATH,
     })
     check(resp.status_code == 200, "Agent accepts repo_path param", resp.json().get("job_id", "")[:8])
 
@@ -354,7 +353,7 @@ def test_phase4():
 # ======================================================================
 
 def test_full_pipeline_run():
-    section("FULL PIPELINE: Real Agent Run on crest-be")
+    section(f"FULL PIPELINE: Real Agent Run on {SAMPLE_REPO_NAME}")
     print("  ℹ️  This calls the LLM — may take 1-3 minutes\n")
 
     # Submit a real ticket
@@ -363,8 +362,8 @@ def test_full_pipeline_run():
         "description": "GET /api/users/:id returns 500 when user.email is null. "
                        "Expected: return user data with email as empty string. "
                        "Actual: NoneType has no attribute 'lower' in normalize_email().",
-        "repo_name": "crest-be",
-        "repo_path": "/Users/utkarshpatidar/work/crest-work/crest-be",
+        "repo_name": SAMPLE_REPO_NAME,
+        "repo_path": SAMPLE_REPO_PATH,
         "priority": "high",
     })
     check(resp.status_code == 200, "Job submitted successfully")

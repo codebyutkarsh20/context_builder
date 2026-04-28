@@ -1,11 +1,11 @@
-# AI Deploy Agent — Primathon (v3.5)
+# AI Deploy Agent (v3.5)
 
 Autonomous bug-fix agent: ticket → localize → plan → fix → test → submit PR.
-**80% pass rate on sentinel, $0.37/bug avg, 16 tool calls avg.**
+**44% pass rate on SWE-bench Lite, $0.50–$0.60/bug avg.** Internal sentinel (5 bugs): 80% / $0.37 / 16 tool calls — fast smoke test, not a benchmark claim.
 
 ## Commands
 ```bash
-python -m pytest backend/tests/ -q              # 837 tests, run from project root
+python -m pytest backend/tests/ -q              # ~1180 tests, run from project root
 cd backend && python cli.py eval run             # Full 35-bug eval
 cd backend && python cli.py eval run --sentinel  # Fast 5-bug check
 cd backend && python cli.py eval run --bug X     # Single bug

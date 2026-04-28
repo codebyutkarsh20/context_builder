@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "context-builder"
+version = "3.5.0"
+description = "Autonomous bug-fix agent: ticket → localize → plan → fix → test → submit PR"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Utkarsh Patidar" }
+]
+keywords = ["llm", "agent", "code-review", "knowledge-graph", "swe-bench", "anthropic", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+dependencies = [
+    "fastapi==0.115.0",
+    "uvicorn[standard]==0.30.6",
+    "pydantic==2.9.2",
+    "python-dotenv==1.0.1",
+    "tree-sitter==0.23.1",
+    "tree-sitter-python==0.23.2",
+    "tree-sitter-javascript==0.23.1",
+    "tree-sitter-typescript==0.23.2",
+    "tree-sitter-go==0.23.4",
+    "tree-sitter-java==0.23.5",
+    "networkx==3.3",
+    "scipy>=1.11.0",
+    "neo4j==5.24.0",
+    "anthropic>=0.49.0",
+    "langchain-anthropic>=0.3.0",
+    "langchain-core>=0.3.0",
+    "langgraph>=0.2.0",
+    "gitpython==3.1.43",
+    "aiofiles==24.1.0",
+    "httpx==0.27.2",
+    "rich==13.8.1",
+    "typer==0.12.5",
+    "click<8.2",
+    "python-igraph>=1.0.0",
+    "leidenalg>=0.10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.6",
+]
+
+# [project.urls]
+# Add these once the GitHub repo exists:
+# Homepage = "https://github.com/<owner>/context-builder"
+# Issues   = "https://github.com/<owner>/context-builder/issues"
+# Changelog = "https://github.com/<owner>/context-builder/blob/main/CHANGELOG.md"
+
+[project.scripts]
+context-builder = "cli:app"
+
+[tool.setuptools]
+package-dir = { "" = "backend" }
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["agent*", "analyzer*", "api*", "compiler*", "embeddings*", "enricher*", "eval*", "graph*", "rag*"]
+exclude = ["tests*", "venv*", "data*"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+- `LICENSE` (Apache 2.0), `CONTRIBUTING.md`, `SECURITY.md` for open-source readiness.
+- `pyproject.toml` with `context-builder` console script and pinned dependency set.
+
+### Changed
+- Reconciled headline metrics across README and CLAUDE.md (44% SWE-bench Lite, ~1180 tests).
+- E2E tests (`test_hardening_e2e.py`, `test_api_agent.py`) now read target repo from `E2E_REPO_NAME` / `E2E_REPO_PATH` env vars instead of hardcoded private paths.
+
+### Removed
+- Untracked internal-only docs: `agent_docs/`, `docs/superpowers/` planning specs, research artifacts. Now gitignored — local copies kept, but no longer shipped to consumers.
+
 ## [3.5.0] - 2026-04-13
 
 ### Added

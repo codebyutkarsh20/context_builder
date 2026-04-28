@@ -64,3 +64,14 @@ eval/sympy_only.json
 # Temporary analysis docs (not project docs)
 REMAINING_BUGS.md
 SWE_BENCH_UI_TEST_BUGS.md
+
+# Internal planning / research / manifest docs (not for end users)
+agent_docs/
+docs/superpowers/
+docs/coding-agents-research-*.md
+
+# Agent runtime config (auto-generated per repo)
+.agent_config.json
+
+# Eval one-off retry artifacts
+eval/*_retry.json

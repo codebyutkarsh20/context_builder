@@ -2,7 +2,7 @@
 
 Autonomous bug-fix agent: give it a ticket → it reads your codebase → finds the bug → writes a fix → tests it → submits a PR.
 
-**44% pass rate on SWE-bench Lite, $0.50–$0.60/bug average.** [v4 architecture](docs/v4-complete-agent-reference.md)
+**44% pass rate on SWE-bench Lite, $0.50–$0.60/bug average, ~1180 unit tests.** [v4 architecture](docs/v4-complete-agent-reference.md)
 
 ---
 
@@ -154,10 +154,10 @@ Results are written to `backend/eval/results/`. See current scores in the [agent
 
 ## Contributing
 
-- Tests: `python -m pytest backend/tests/ -q` (1170 tests)
+- Tests: `python -m pytest backend/tests/ -q` (~1180 tests)
 - Lint: `ruff check backend/`
 - Docs: Main reference at `docs/v4-complete-agent-reference.md`
 
 ## License
 
-See `LICENSE`.
+Apache License 2.0 — see [`LICENSE`](LICENSE) for the full text.
