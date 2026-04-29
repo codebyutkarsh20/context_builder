@@ -4,6 +4,8 @@ Autonomous bug-fix agent: give it a ticket → it reads your codebase → finds 
 
 **44% pass rate on SWE-bench Lite, $0.50–$0.60/bug average, ~1180 unit tests.** [v4 architecture](docs/v4-complete-agent-reference.md)
 
+> **How this is different from code-search tools.** Sourcegraph, Sourcebot, Cody, and grep.app help you *understand* your codebase — they answer questions and link to citations. AI Deploy Agent *modifies* it. The output is a pull request, not an answer. It uses a Neo4j knowledge graph (callers, blast radius, tests) to localize, then a verified ReAct loop with sandboxed shell, an independent verifier subagent, and per-repo learning to actually land the fix.
+
 ---
 
 ## Quickstart (Docker — 5 minutes)
@@ -128,6 +130,7 @@ See `.env.example` for all options. Key ones:
 | `DATA_DIR` | `/data` (docker) | Where lessons + graphs are stored |
 | `USER_REPOS_HOST` | `$HOME` | Host dir mounted into backend container |
 | `GH_TOKEN` | (optional) | For PR creation |
+| `API_TOKEN` | (optional) | Bearer token gating `/api/*`. Unset = open. **Set this before exposing the backend on any non-loopback interface.** Generate via `openssl rand -hex 32`. The frontend reads the same value from `VITE_API_TOKEN`. |
 
 ## Running the evaluation
 

@@ -1,6 +1,20 @@
 // Empty string = use Vite proxy (/api → http://localhost:8000). Set VITE_API_BASE_URL only for production.
 const BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? ''
 
+// Optional bearer token. Set VITE_API_TOKEN to match the backend's API_TOKEN env var
+// when running the backend in authenticated mode. Empty/undefined = unauthenticated.
+const API_TOKEN = ((import.meta.env.VITE_API_TOKEN as string | undefined) ?? '').trim()
+
+function authHeaders(): Record<string, string> {
+  return API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}
+}
+
+function withTokenQuery(url: string): string {
+  if (!API_TOKEN) return url
+  const sep = url.includes('?') ? '&' : '?'
+  return `${url}${sep}token=${encodeURIComponent(API_TOKEN)}`
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface Repo {
@@ -59,7 +73,7 @@ async function request<T>(path: string, options?: RequestOptions): Promise<T> {
 
   try {
     const res = await fetch(url, {
-      headers: { 'Content-Type': 'application/json', ...fetchOptions.headers },
+      headers: { 'Content-Type': 'application/json', ...authHeaders(), ...fetchOptions.headers },
       signal: controller.signal,
       ...fetchOptions,
     })
@@ -294,7 +308,7 @@ export function subscribeToTrace(
   onDone: () => void,
   onError?: (err: Event) => void,
 ): () => void {
-  const url = `${BASE_URL}/api/agent/trace/${jobId}`
+  const url = withTokenQuery(`${BASE_URL}/api/agent/trace/${jobId}`)
   const eventSource = new EventSource(url)
 
   eventSource.onmessage = (e) => {

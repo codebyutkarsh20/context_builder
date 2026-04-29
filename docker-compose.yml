@@ -36,6 +36,7 @@ services:
       ANONYMIZED_TELEMETRY: "False"
       GH_TOKEN: ${GH_TOKEN}
       GITHUB_TOKEN: ${GH_TOKEN}
+      API_TOKEN: ${API_TOKEN}
     volumes:
       - ./backend:/app
       - repo_mounts:/repos
@@ -63,6 +64,7 @@ services:
       - "5173:5173"
     environment:
       VITE_API_BASE_URL: http://localhost:8001
+      VITE_API_TOKEN: ${API_TOKEN}
     volumes:
       - ./frontend:/app
       - /app/node_modules

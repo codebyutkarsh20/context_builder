@@ -29,6 +29,8 @@ logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
 
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.auth import BearerTokenMiddleware
+
 # Core routers (used by the 3-page frontend: Overview, Agent, Knowledge)
 from api.repos import router as repos_router
 from api.graph import router as graph_router      # graph/stats + graph/hotspots for Overview
@@ -79,6 +81,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
 )
+# Bearer-token gate. No-op unless API_TOKEN env var is set.
+app.add_middleware(BearerTokenMiddleware)
 
 # Core routers — used by frontend + CLI
 app.include_router(repos_router, prefix="/api")

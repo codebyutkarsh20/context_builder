@@ -28,11 +28,22 @@ This project runs an autonomous LLM agent that **edits files and executes shell 
 
 ### Recommendations
 
+- **Set `API_TOKEN` before exposing the backend on any non-loopback interface.** Without it, anyone who can reach port 8001 can submit jobs that run shell commands and edit files. Generate one with `openssl rand -hex 32` and set the same value as `VITE_API_TOKEN` for the frontend. `/health` stays open for orchestrators; everything under `/api/*` is gated.
 - **Never run against a repo you have uncommitted work in** unless you've reviewed `react_guardrails.py`. The agent defends against `git reset --hard` on dirty trees but other footguns exist.
 - **Tighten `USER_REPOS_HOST`** in `.env` to a specific code directory rather than `$HOME` if you store credentials, SSH keys, or personal documents there.
 - **Change `NEO4J_PASSWORD`** before exposing port `7687`/`7474` on any network. The default in `docker-compose.yml` is `contextbuilder` and is intended for local-only use.
 - **Use a scoped GitHub token** for `GH_TOKEN` — `repo` scope on the specific target repos, not a personal `repo`-everywhere PAT.
 - **Don't forward your real Anthropic key to evaluators or shared CI.** API calls cost money and the agent makes many of them per bug.
+
+### API authentication
+
+The HTTP API ships with optional bearer-token auth (`backend/api/auth.py`). Behavior:
+
+- `API_TOKEN` unset/empty → all endpoints open (back-compat for existing local installs).
+- `API_TOKEN` set → every `/api/*` request must present `Authorization: Bearer <token>`, or `?token=<token>` for SSE clients (`EventSource` cannot set headers). `/health` and CORS preflights stay exempt.
+- Comparison uses `hmac.compare_digest` to avoid timing leaks.
+
+This is a single shared token, not per-user identity. For multi-tenant deployments, replace `BearerTokenMiddleware` with a real auth layer (OAuth, mTLS, etc.).
 
 ### Known dual-use behaviors
 
