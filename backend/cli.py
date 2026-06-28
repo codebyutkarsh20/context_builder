@@ -572,6 +572,63 @@ def eval_ab(
     console.print(format_comparison_table(comparison))
 
 
+@eval_app.command("ablate")
+def eval_ablate(
+    bug: str = typer.Option(None, "--bug", "-b", help="Run only this ticket_id"),
+    dataset: str = typer.Option("eval/bugs.json", "--dataset", "-d", help="Path to bugs JSON"),
+    components: str = typer.Option(None, "--components", "-c",
+                                   help="Comma-separated components to ablate (default: all)"),
+    timeout: int = typer.Option(600, "--timeout", help="Per-case timeout in seconds"),
+    sentinel: bool = typer.Option(False, "--sentinel", help="Run only first 5 bugs (fast check)"),
+    output: str = typer.Option("eval/results", "--output", "-o", help="Results output directory"),
+    no_build_graph: bool = typer.Option(False, "--no-build-graph",
+                                        help="Skip knowledge-graph build (graph arm becomes meaningless)"),
+):
+    """
+    Component ablation: measure each harness component's contribution to pass rate.
+
+    Runs the eval once with everything enabled (reference) and once per component
+    with that component disabled, then ranks components by how much pass rate they
+    contribute (reference − ablated). Components: scout, brt, graph, lessons, verifier.
+
+    Examples:
+        python cli.py eval ablate --sentinel                       # all components, 5 bugs
+        python cli.py eval ablate --components scout,verifier      # just these two
+        python cli.py eval ablate --dataset eval/swebench_50.json  # bigger set
+    """
+    from agent import ablation_flags
+    from agent.eval.ablation import run_ablation, format_ablation_table
+
+    comp_list = [c.strip() for c in components.split(",")] if components else list(ablation_flags.COMPONENTS)
+
+    console.print(Panel(
+        f"[bold cyan]Dataset:[/bold cyan]     {dataset}\n"
+        f"[bold cyan]Components:[/bold cyan]  {', '.join(comp_list)}\n"
+        f"[bold cyan]Arms:[/bold cyan]        reference + {len(comp_list)} ablation arm(s)\n"
+        f"[bold cyan]Graph:[/bold cyan]       {'[yellow]disabled[/yellow]' if no_build_graph else '[green]built[/green]'}\n"
+        f"[bold cyan]Sentinel:[/bold cyan]    {sentinel}\n"
+        f"[bold cyan]Timeout:[/bold cyan]     {timeout}s per case",
+        title="[bold]Component Ablation[/bold]",
+        border_style="magenta",
+    ))
+
+    def _progress(arm: str, tid: str, current: int, total: int) -> None:
+        console.print(f"  [cyan]ABLATE[/cyan] Completed {current}/{total}: {tid}")
+
+    report = run_ablation(
+        dataset_path=Path(dataset),
+        components=comp_list,
+        bug_filter=bug,
+        sentinel=sentinel,
+        timeout_per_case=timeout,
+        results_dir=Path(output),
+        build_graph=not no_build_graph,
+        progress_cb=_progress,
+    )
+
+    console.print(format_ablation_table(report))
+
+
 @eval_app.command("baseline")
 def eval_baseline(
     bug: str = typer.Option(None, "--bug", "-b", help="Run only this ticket_id"),
