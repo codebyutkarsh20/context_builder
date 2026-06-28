@@ -331,21 +331,35 @@ class EvalRunner:
             trace_summary=trace_summary,
         )
 
+    # Ablation arms: each named pipeline disables exactly one harness component
+    # so the ablation eval can attribute a pass-rate delta to it. The full
+    # "react" pipeline is the reference arm (nothing disabled).
+    ABLATION_PIPELINES: dict[str, set[str]] = {
+        "react_no_scout": {"scout"},
+        "react_no_brt": {"brt"},
+        "react_no_graph": {"graph"},
+        "react_no_lessons": {"lessons"},
+        "react_no_verifier": {"verifier"},
+    }
+
     @staticmethod
     def _invoke_pipeline(pipeline: str, work_order: dict, trace: Any) -> dict:
         """Call the ReAct pipeline entry point.
 
-        ``react``    — full v3.0 pipeline (BRT + Scout + Leiden + speculative review)
-        ``react_v2`` — v2.0 baseline (no BRT, no Scout, no Leiden, no spec review)
-                       Useful for A/B comparison: run --pipeline react react_v2
+        ``react``            — full v4 pipeline (all components enabled)
+        ``react_v2``         — v2.0 baseline (no BRT, no Scout) for A/B comparison
+        ``react_no_<comp>``  — ablation arm with one component disabled
+                               (scout / brt / graph / lessons / verifier)
         """
         from agent.react_pipeline import run_ticket_react
         # react_v2 = disable new features to simulate v2.0 baseline
         disable_new = (pipeline == "react_v2")
+        disabled_components = EvalRunner.ABLATION_PIPELINES.get(pipeline, set())
         return run_ticket_react(
             work_order, trace=trace, dry_run=True,
             disable_brt=disable_new,
             disable_scout=disable_new,
+            disabled_components=disabled_components,
         )
 
     def _build_comparison(self, report: EvalRunReport) -> dict:

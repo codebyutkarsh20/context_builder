@@ -35,6 +35,8 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/context_builder"))
 import threading
 _thread_local = threading.local()
 
+from agent import ablation_flags
+
 
 def _get_trace():
     return getattr(_thread_local, "trace", None)
@@ -432,8 +434,9 @@ def _run_localization(state: ReactAgentState, repo_name: str) -> ReactAgentState
     # Step 2: Scout FL pipeline (3-agent: Haiku extractor → Sonnet Graph-RAG → Opus re-ranker)
     # Produces top-5 suspicious locations with confidence scores.
     # Falls back gracefully to pre-localization if Scout fails.
-    # Skipped when disable_scout=True (v2.0 baseline mode for A/B eval).
-    _scout_disabled = getattr(_thread_local, "disable_scout", False)
+    # Skipped when disable_scout=True (v2.0 baseline mode for A/B eval) or when
+    # the "scout" component is ablated.
+    _scout_disabled = getattr(_thread_local, "disable_scout", False) or ablation_flags.is_disabled("scout")
     try:
         if repo_name and not _scout_disabled:
             from agent.scout import scout_localize
@@ -889,33 +892,39 @@ def _setup_thread_context(
     # --- Step 2: Load graph data via build_kickstart_context ---
     # We pass an empty intent here; the real intent merge happens in
     # react_agent_node after setup_node merges scout results into intent.
-    try:
-        from agent.graph_utils import build_kickstart_context
-        # Use a minimal intent — full intent is not yet enriched with scout files,
-        # so kickstart gets only the raw LLM hints. react_agent_node rebuilds
-        # kickstart with the merged intent anyway; this is pre-loading for speed.
-        minimal_intent: dict = {}
-        result["graph_context"] = build_kickstart_context(
-            repo_name, str(repo_path) if repo_path else None, minimal_intent, DATA_DIR,
-        )
-    except Exception as e:
-        logger.debug("setup_thread_context: kickstart context failed (non-fatal): %s", e)
+    # Skipped when the "graph" component is ablated.
+    if not ablation_flags.is_disabled("graph"):
+        try:
+            from agent.graph_utils import build_kickstart_context
+            # Use a minimal intent — full intent is not yet enriched with scout files,
+            # so kickstart gets only the raw LLM hints. react_agent_node rebuilds
+            # kickstart with the merged intent anyway; this is pre-loading for speed.
+            minimal_intent: dict = {}
+            result["graph_context"] = build_kickstart_context(
+                repo_name, str(repo_path) if repo_path else None, minimal_intent, DATA_DIR,
+            )
+        except Exception as e:
+            logger.debug("setup_thread_context: kickstart context failed (non-fatal): %s", e)
 
     # --- Step 3: Load lessons from past runs ---
-    try:
-        from agent.learn_from_fix import load_lessons
-        result["lessons"] = load_lessons(repo_name)
-    except Exception as e:
-        logger.debug("setup_thread_context: load_lessons failed (non-fatal): %s", e)
+    # Skipped when the "lessons" component is ablated.
+    if not ablation_flags.is_disabled("lessons"):
+        try:
+            from agent.learn_from_fix import load_lessons
+            result["lessons"] = load_lessons(repo_name)
+        except Exception as e:
+            logger.debug("setup_thread_context: load_lessons failed (non-fatal): %s", e)
 
     # --- Step 4: Query concept-to-code mappings ---
-    try:
-        from agent.graph_utils import query_concept_to_code
-        title = work_order.get("title", "")
-        description = work_order.get("description", "")
-        result["concept_mappings"] = query_concept_to_code(title, description, repo_name)
-    except Exception as e:
-        logger.debug("setup_thread_context: concept-to-code failed (non-fatal): %s", e)
+    # Part of the knowledge-graph component; skipped when "graph" is ablated.
+    if not ablation_flags.is_disabled("graph"):
+        try:
+            from agent.graph_utils import query_concept_to_code
+            title = work_order.get("title", "")
+            description = work_order.get("description", "")
+            result["concept_mappings"] = query_concept_to_code(title, description, repo_name)
+        except Exception as e:
+            logger.debug("setup_thread_context: concept-to-code failed (non-fatal): %s", e)
 
     return result
 
@@ -1693,7 +1702,13 @@ def finalize_node(state: ReactAgentState) -> ReactAgentState:
 
 
 def _safe_record_lesson(state: dict) -> None:
-    """Call learn_from_fix.record_lesson with all exceptions swallowed."""
+    """Call learn_from_fix.record_lesson with all exceptions swallowed.
+
+    Skipped when the "lessons" component is ablated, so an ablation arm neither
+    reads nor writes the learning loop.
+    """
+    if ablation_flags.is_disabled("lessons"):
+        return
     try:
         from agent.learn_from_fix import record_lesson
         record_lesson(state)
@@ -2517,6 +2532,7 @@ def run_ticket_react(
     best_of_n: int = 1,
     disable_brt: bool = False,
     disable_scout: bool = False,
+    disabled_components: set[str] | frozenset[str] | list[str] | None = None,
 ) -> dict:
     """Run a bug ticket through the ReAct pipeline.
 
@@ -2529,16 +2545,29 @@ def run_ticket_react(
     disable_brt / disable_scout: v2.0 baseline flags used by eval runner for A/B.
     best_of_n > 1: runs N parallel instances, picks winner by test pass then
     review confidence (SWE-agent best-of-N pattern, +10-15pp submit rate).
+
+    disabled_components: set of harness components to ablate for this run (any of
+    ablation_flags.COMPONENTS — scout, brt, graph, lessons, verifier). Used by
+    the ablation eval to measure each component's contribution. The legacy
+    disable_brt / disable_scout flags are folded into this set.
     """
     if best_of_n > 1:
         return _run_best_of_n(work_order, progress_cb, trace, dry_run, best_of_n)
+
+    # Merge legacy boolean flags into the unified ablation set.
+    disabled = {c for c in (disabled_components or set())}
+    if disable_brt:
+        disabled.add("brt")
+    if disable_scout:
+        disabled.add("scout")
+    ablation_flags.set_disabled(disabled)
 
     _thread_local.progress_callback = progress_cb
     _thread_local.trace = trace
     _thread_local.current_stage = "pending"
     # Store feature flags so nodes can read them
-    _thread_local.disable_brt = disable_brt
-    _thread_local.disable_scout = disable_scout
+    _thread_local.disable_brt = "brt" in disabled
+    _thread_local.disable_scout = "scout" in disabled
 
     state: ReactAgentState = {
         "work_order": work_order,
@@ -2583,6 +2612,7 @@ def run_ticket_react(
         if trace:
             trace.complete()
         _thread_local.trace = None
+        ablation_flags.clear()
 
 
 def _ensemble_vote(

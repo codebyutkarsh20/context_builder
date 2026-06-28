@@ -1574,6 +1574,14 @@ def verify_fix(explanation: str) -> str:
         "APPROVED (confidence: 0.92): <summary>" or
         "REJECTED (confidence: 0.85): <feedback>"
     """
+    # Ablation: when the verifier component is disabled, the protocol is kept
+    # intact (the agent still calls this tool before submit) but no independent
+    # review runs — every fix is auto-approved. This isolates the verifier's
+    # contribution to pass rate.
+    from agent import ablation_flags
+    if ablation_flags.is_disabled("verifier"):
+        return "APPROVED (confidence: 1.00): verifier ablated (auto-approve)"
+
     sandbox = getattr(_tls, "sandbox_path", None)
     if not sandbox or not Path(sandbox).exists():
         return "ERROR: No sandbox exists. Cannot verify without changes."
