@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from agent.git_auth import git_push_environment
 from agent.types import PipelineStatus, ReactAgentState
 
 if TYPE_CHECKING:
@@ -1421,7 +1422,6 @@ def _strip_url_credentials(url: str) -> str:
       https://user:token@github.com/...   → https://github.com/...
       https://x-access-token:tok@gh...    → https://github.com/...
     """
-    import re
     return re.sub(r"(https?://)([^@]+@)", r"\1", url)
 
 
@@ -1432,65 +1432,48 @@ def _push_and_create_pr(
     result_info: dict[str, str] = {}
     try:
         gh_token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
-        if gh_token:
-            subprocess.run(
-                ["git", "config", "credential.helper", ""],
-                cwd=sandbox_path, capture_output=True, timeout=10,
-            )
-            # Check if origin exists and points to GitHub
-            remote_url = ""
-            try:
-                remote_url = subprocess.run(
-                    ["git", "remote", "get-url", "origin"],
-                    cwd=sandbox_path, capture_output=True, text=True, timeout=10,
-                ).stdout.strip()
-            except Exception:
-                pass
+        remote_url = ""
+        try:
+            remote_url = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=sandbox_path, capture_output=True, text=True, timeout=10,
+            ).stdout.strip()
+        except Exception:
+            pass
 
-            if remote_url and "github.com" in remote_url:
-                # Origin exists and is GitHub — strip any existing credentials first,
-                # then add the token. Prevents double-@ when URL already has user@.
-                clean_url = _strip_url_credentials(remote_url)
-                auth_url = clean_url.replace(
-                    "https://", f"https://x-access-token:{gh_token}@"
-                )
+        if remote_url and "github.com" in remote_url:
+            clean_url = _strip_url_credentials(remote_url)
+            if clean_url != remote_url:
                 subprocess.run(
-                    ["git", "remote", "set-url", "origin", auth_url],
+                    ["git", "remote", "set-url", "origin", clean_url],
                     cwd=sandbox_path, capture_output=True, timeout=10,
                 )
-            elif not remote_url or "github.com" not in remote_url:
-                # No origin or origin is not GitHub — try to detect GitHub repo via gh CLI
-                try:
-                    gh_repo = subprocess.run(
-                        ["gh", "repo", "view", "--json", "url", "-q", ".url"],
-                        cwd=sandbox_path, capture_output=True, text=True, timeout=15,
-                    ).stdout.strip()
-                    if gh_repo and "github.com" in gh_repo:
-                        clean_url = _strip_url_credentials(gh_repo)
-                        auth_url = clean_url.replace(
-                            "https://github.com/",
-                            f"https://x-access-token:{gh_token}@github.com/"
-                        )
-                        if not auth_url.endswith(".git"):
-                            auth_url += ".git"
-                        if remote_url:
-                            subprocess.run(
-                                ["git", "remote", "set-url", "origin", auth_url],
-                                cwd=sandbox_path, capture_output=True, timeout=10,
-                            )
-                        else:
-                            subprocess.run(
-                                ["git", "remote", "add", "origin", auth_url],
-                                cwd=sandbox_path, capture_output=True, timeout=10,
-                            )
-                        logger.info("Set origin to GitHub: %s", gh_repo)
-                except Exception as gh_err:
-                    logger.debug("Could not detect GitHub repo: %s", gh_err)
+        elif gh_token:
+            # Preserve upstream repo detection, but persist only a credential-free URL.
+            try:
+                gh_repo = subprocess.run(
+                    ["gh", "repo", "view", "--json", "url", "-q", ".url"],
+                    cwd=sandbox_path, capture_output=True, text=True, timeout=15,
+                ).stdout.strip()
+                if gh_repo and "github.com" in gh_repo:
+                    clean_url = _strip_url_credentials(gh_repo)
+                    if not clean_url.endswith(".git"):
+                        clean_url += ".git"
+                    action = "set-url" if remote_url else "add"
+                    subprocess.run(
+                        ["git", "remote", action, "origin", clean_url],
+                        cwd=sandbox_path, capture_output=True, timeout=10,
+                    )
+                    logger.info("Set origin to GitHub: %s", gh_repo)
+            except Exception as gh_err:
+                logger.debug("Could not detect GitHub repo: %s", gh_err)
 
-        push_result = subprocess.run(
-            ["git", "push", "-u", "origin", branch_name],
-            cwd=sandbox_path, capture_output=True, text=True, timeout=60,
-        )
+        with git_push_environment(gh_token) as push_env:
+            push_result = subprocess.run(
+                ["git", "push", "-u", "origin", branch_name],
+                cwd=sandbox_path, capture_output=True, text=True,
+                timeout=60, env=push_env,
+            )
         if push_result.returncode != 0:
             logger.error("Push failed: %s", push_result.stderr)
             result_info["error"] = f"Push failed: {push_result.stderr[:200]}"
